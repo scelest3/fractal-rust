@@ -1,0 +1,7 @@
+[package]
+name    = "coloring"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kernel = { path = "../kernel" }

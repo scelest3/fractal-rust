@@ -1,0 +1,4 @@
+[package]
+name    = "arith"
+version.workspace = true
+edition.workspace = true
