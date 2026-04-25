@@ -10,5 +10,8 @@ crate-type = ["cdylib", "rlib"]
 wasm-bindgen = "0.2"
 kernel       = { path = "../kernel" }
 
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 [features]
 simd = []

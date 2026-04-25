@@ -68,6 +68,9 @@ jobs:
             -O3 --enable-threads \
             -o web/pkg-nosimd/wasm_bridge_bg.wasm
 
+      - name: Integration tests (Chrome headless)
+        run: wasm-pack test --chrome --headless crates/wasm-bridge
+
   web:
     name: Web
     runs-on: ubuntu-latest
