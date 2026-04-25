@@ -28,6 +28,46 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+  wasm:
+    name: WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install wasm-opt (Binaryen)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y binaryen
+
+      - name: Build SIMD bundle
+        run: |
+          wasm-pack build crates/wasm-bridge \
+            --target web --no-pack \
+            --out-dir ../../web/pkg \
+            -- --features simd
+          wasm-opt web/pkg/wasm_bridge_bg.wasm \
+            -O3 --enable-threads --enable-simd \
+            -o web/pkg/wasm_bridge_bg.wasm
+
+      - name: Build non-SIMD bundle
+        run: |
+          wasm-pack build crates/wasm-bridge \
+            --target web --no-pack \
+            --out-dir ../../web/pkg-nosimd
+          wasm-opt web/pkg-nosimd/wasm_bridge_bg.wasm \
+            -O3 --enable-threads \
+            -o web/pkg-nosimd/wasm_bridge_bg.wasm
+
   web:
     name: Web
     runs-on: ubuntu-latest
