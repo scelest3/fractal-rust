@@ -244,19 +244,26 @@ pub fn build_lut(palette: JsValue) -> Float32Array;
 
 ### 5.2 Shared Memory Model
 
-All workers share a single `WebAssembly.Memory` instance created on the main thread with `shared: true`:
+#### Target architecture (Phase 1+)
 
-```js
-const memory = new WebAssembly.Memory({
-  shared: true,
-  initial: INITIAL_PAGES,
-  maximum: MAX_PAGES,   // fixed at creation; cannot grow after sharing
-});
-```
+The target design uses a single `WebAssembly.Memory({ shared: true })` created on the main thread, structured-cloned to every worker, and injected as `importObject.env.memory` at instantiation. WASM linear memory *is* the shared buffer — tile data written by a Tile Worker is visible to the main thread's `gl.texSubImage2D` call with zero copy.
 
-The `Memory` object is **structured-cloned** (not transferred) via `postMessage` to each worker. Every worker passes it into `WebAssembly.instantiate` as `importObject.env.memory`. WASM linear memory *is* the shared buffer — tile data written by a Tile Worker is visible to the main thread's `gl.texSubImage2D` call with zero copy.
+Producing a wasm-bindgen module that *imports* memory (rather than creating and exporting its own) requires recompiling the Rust standard library with `+atomics` — i.e. `-Z build-std` on nightly. Once the toolchain constraint is lifted this architecture is fully realised.
 
-After instantiation, each worker calls `layout(n_workers, max_iter)` to obtain byte offsets for every region.
+#### Phase 0 pragmatic model
+
+Until the shared-memory build is in place, Tile Workers use two separate `SharedArrayBuffer`s managed by the main thread:
+
+| Buffer | Size | Purpose |
+|---|---|---|
+| `slotStateSab` | `4 × TOTAL_RING_SLOTS × 4` B | `Int32` per slot: `EMPTY=0 / WRITING=1 / READY=2` |
+| `tileSab` | `TOTAL_RING_SLOTS × TILE_SLOT_BYTES` B | Pixel ring data |
+
+Workers instantiate WASM via wasm-bindgen's `init()` (which manages its own module memory), write tile data into a WASM heap allocation via `alloc_tile_buf()` + `write_solid_tile()`, then copy once into `tileSab`. The main thread reads from `tileSab` for `gl.texSubImage2D`.
+
+**One copy per tile on the write path is acceptable.** The hot render loop (Phase 1+) must not copy; this constraint is enforced once WASM writes directly into the shared `tileSab` or the shared `WebAssembly.Memory`.
+
+After each worker calls `layout(n_workers, max_iter)` it obtains byte offsets used for shared orbit and BLA regions (Phase 2+).
 
 #### Memory Map (in order, from byte 0)
 

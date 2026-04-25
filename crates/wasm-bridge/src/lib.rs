@@ -106,3 +106,52 @@ pub fn layout(n_workers: u32, max_iter: u32) -> MemoryLayout {
 pub fn bytes_to_pages(total_bytes: u32) -> u32 {
     total_bytes.div_ceil(65536)
 }
+
+/// Allocate a tile-sized buffer (256×256×4 f32) on the WASM heap.
+///
+/// Returns the byte offset of the allocation in WASM linear memory.
+/// The caller must free it with `free_tile_buf(ptr)` after copying the data.
+/// Used by Tile Workers that need a safe scratch region before shared memory
+/// is available (Phase 0). Phase 1+ will write directly into the shared SAB.
+#[wasm_bindgen]
+pub fn alloc_tile_buf() -> u32 {
+    let buf: Box<[u8]> = vec![0u8; 256 * 256 * 4 * 4].into_boxed_slice();
+    Box::into_raw(buf) as *mut u8 as u32
+}
+
+/// Free a buffer previously returned by `alloc_tile_buf`.
+#[wasm_bindgen]
+pub fn free_tile_buf(ptr: u32) {
+    unsafe {
+        let slice_ptr = core::ptr::slice_from_raw_parts_mut(ptr as *mut u8, 256 * 256 * 4 * 4);
+        drop(Box::from_raw(slice_ptr));
+    }
+}
+
+/// Write a solid-color 256×256 RGBA f32 tile into the shared memory ring slot
+/// at `slot_byte_offset`.
+///
+/// Called by Tile Workers for the Phase 0 hello-world. The offset must be
+/// 4-byte-aligned; all offsets produced by `layout()` satisfy this.
+///
+/// # Safety
+/// `slot_byte_offset` must be a valid offset into WASM linear memory with at
+/// least `256 * 256 * 4 * 4` bytes available. The caller (the Tile Worker JS
+/// shell) is responsible for passing the correct value from `layout()`.
+#[wasm_bindgen]
+pub fn write_solid_tile(slot_byte_offset: u32, r: f32, g: f32, b: f32, a: f32) {
+    const PIXELS: usize = 256 * 256;
+    // Safety: slot_byte_offset is a valid 4-byte-aligned byte offset into WASM
+    // linear memory, which is the shared WebAssembly.Memory. All offsets from
+    // layout() are multiples of 4. The Tile Worker acquires the ring slot via
+    // Atomics.compareExchange before calling this function.
+    unsafe {
+        let ptr = slot_byte_offset as *mut f32;
+        for i in 0..PIXELS {
+            *ptr.add(i * 4) = r;
+            *ptr.add(i * 4 + 1) = g;
+            *ptr.add(i * 4 + 2) = b;
+            *ptr.add(i * 4 + 3) = a;
+        }
+    }
+}
