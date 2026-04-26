@@ -197,6 +197,31 @@ pub struct TileResult {
     pub glitch_count: u32,
 }
 
+/// Render a 256×256 tile into the WASM heap buffer at `ptr`.
+///
+/// `ptr` must be a byte offset returned by `alloc_tile_buf()`. After this
+/// call, the Tile Worker copies the data from WASM linear memory into the
+/// shared SAB slot using `Uint8Array.prototype.set`.
+///
+/// This is the Phase 1 entry point: it avoids the Phase 2 shared-memory path
+/// (which requires `-Z build-std` nightly to inject a `SharedArrayBuffer` as
+/// WASM linear memory) while still producing real escape-time tile data.
+#[wasm_bindgen]
+pub fn render_tile_to_ptr(
+    delta_re: f64,
+    delta_im: f64,
+    pixel_step: f64,
+    max_iter: u32,
+    ptr: u32,
+) {
+    let job = TileJob { delta_re, delta_im, pixel_step, max_iter, slot_index: 0 };
+    // Safety: ptr is from alloc_tile_buf() — a valid heap allocation of
+    // exactly TILE_PIXELS * size_of::<TilePixel>() bytes.
+    let out =
+        unsafe { core::slice::from_raw_parts_mut(ptr as *mut kernel::TilePixel, TILE_PIXELS) };
+    render_tile_impl(&job, out);
+}
+
 /// Inner implementation: render one 256×256 tile into a caller-supplied
 /// `TilePixel` slice. Separated from the wasm export so integration tests
 /// can pass a heap-allocated buffer without requiring shared memory layout.

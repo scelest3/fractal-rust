@@ -1,72 +1,106 @@
 /**
  * Tile Worker — runs in a Web Worker thread.
  *
- * Uses wasm-bindgen's generated init() via dynamic import so all internal
- * wasm-bindgen imports are satisfied automatically. Writes a solid-color tile
- * into a WASM heap allocation via write_solid_tile(), then copies it once into
- * the shared tileSab. One copy per tile (WASM heap → SAB) is acceptable for
- * Phase 0; Phase 1 will adopt a proper shared-memory build to eliminate it.
+ * Handles two message types:
+ *   init        — load WASM, build LUT, signal main thread
+ *   render_tile — render one 256×256 tile into a WASM heap buffer,
+ *                 copy into the shared SAB slot, signal main thread
+ *
+ * Phase 1 memory model: WASM writes into its own heap (alloc_tile_buf),
+ * then we copy once into the SharedArrayBuffer. Phase 2 will eliminate
+ * the copy by compiling with -Z build-std so wasm-bindgen accepts an
+ * injected SharedArrayBuffer as WASM linear memory.
  */
 
-const TILE_SLOT_BYTES = 256 * 256 * 4 * 4;
-const SLOT_EMPTY = 0;
-const SLOT_WRITING = 1;
-const SLOT_READY = 2;
+const TILE_SLOT_BYTES = 256 * 256 * 4 * 4; // 1 MiB per slot
 
-interface WorkerInit {
+interface InitMsg {
+  type: "init";
   wasmUrl: string;
   slotStateSab: SharedArrayBuffer;
   tileSab: SharedArrayBuffer;
 }
 
-// Raw exports returned by wasm-bindgen's init() — which returns instance.exports.
-interface WasmInstanceExports {
+interface RenderTileMsg {
+  type: "render_tile";
+  deltaRe: number;
+  deltaIm: number;
+  step: number;
+  maxIter?: number;
+  slotIndex: number;
+  tileX: number;
+  tileY: number;
+  generation: number;
+}
+
+type WorkerMsg = InitMsg | RenderTileMsg;
+
+interface WasmExports {
   memory: WebAssembly.Memory;
   alloc_tile_buf: () => number;
   free_tile_buf: (ptr: number) => void;
-  write_solid_tile: (ptr: number, r: number, g: number, b: number, a: number) => void;
+  render_tile_to_ptr: (
+    deltaRe: number,
+    deltaIm: number,
+    pixelStep: number,
+    maxIter: number,
+    ptr: number,
+  ) => void;
+  build_lut: (palette: null) => Float32Array;
 }
 
-self.onmessage = async (event: MessageEvent<WorkerInit>) => {
-  const { wasmUrl, slotStateSab, tileSab } = event.data;
+let wasm: WasmExports | null = null;
+let tileSab: SharedArrayBuffer | null = null;
 
-  // Derive the wasm-bindgen JS glue URL from the .wasm URL.
-  const glueUrl = wasmUrl.replace("_bg.wasm", ".js");
+self.onmessage = async (event: MessageEvent<WorkerMsg>) => {
+  const msg = event.data;
+  if (msg.type === "init") {
+    await handleInit(msg);
+  } else if (msg.type === "render_tile") {
+    handleRenderTile(msg);
+  }
+};
 
-  // Dynamic import of the wasm-bindgen glue. /* @vite-ignore */ tells Vite not
-  // to bundle this at build time — it resolves at runtime from /pkg/.
+async function handleInit(msg: InitMsg): Promise<void> {
+  tileSab = msg.tileSab;
+
+  const glueUrl = msg.wasmUrl.replace("_bg.wasm", ".js");
   const glue = await import(/* @vite-ignore */ glueUrl);
+  wasm = (await glue.default({ module_or_path: msg.wasmUrl })) as WasmExports;
 
-  // init() constructs the correct import object, instantiates the WASM module,
-  // and returns instance.exports directly (see __wbg_finalize_init in glue).
-  // Pass { module_or_path } object — the string overload is deprecated in
-  // wasm-bindgen 0.2.118+.
-  const exports = (await glue.default({ module_or_path: wasmUrl })) as WasmInstanceExports;
+  // build_lut returns a Float32Array view into WASM memory — copy it so the
+  // main thread receives an independent buffer it can hold onto safely.
+  const lutView = wasm.build_lut(null);
+  const lut = new Float32Array(lutView);
 
-  // ── Ring slot acquisition ─────────────────────────────────────────────
-  const stateArray = new Int32Array(slotStateSab);
-  const prev = Atomics.compareExchange(stateArray, 0, SLOT_EMPTY, SLOT_WRITING);
-  if (prev !== SLOT_EMPTY) {
-    console.error("[TileWorker] ring slot 0 not available (state =", prev, ")");
+  (self as unknown as Worker).postMessage({ type: "init_done", lut });
+}
+
+function handleRenderTile(msg: RenderTileMsg): void {
+  if (!wasm || !tileSab) {
+    console.error("[TileWorker] render_tile before init");
     return;
   }
 
-  // ── Tile write via WASM ───────────────────────────────────────────────
-  // alloc_tile_buf() allocates 1 MiB on the WASM heap — a safe region not
-  // used by the Rust stack or static data. write_solid_tile() fills it.
-  const ptr = exports.alloc_tile_buf();
-  exports.write_solid_tile(ptr, 1.0, 0.0, 0.0, 1.0);
+  const { deltaRe, deltaIm, step, slotIndex, tileX, tileY, generation } = msg;
+  const maxIter = msg.maxIter ?? 256;
 
-  // Copy tile from WASM heap → shared SAB.
-  // One copy per tile is the Phase 0 trade-off; Phase 1 writes directly.
-  // Re-read memory.buffer after alloc in case WASM grew its linear memory.
-  new Uint8Array(tileSab, 0, TILE_SLOT_BYTES).set(
-    new Uint8Array(exports.memory.buffer, ptr, TILE_SLOT_BYTES),
+  const ptr = wasm.alloc_tile_buf();
+  wasm.render_tile_to_ptr(deltaRe, deltaIm, step, maxIter, ptr);
+
+  // Copy WASM heap → SAB slot. Re-read memory.buffer in case WASM grew.
+  const byteOffset = slotIndex * TILE_SLOT_BYTES;
+  new Uint8Array(tileSab, byteOffset, TILE_SLOT_BYTES).set(
+    new Uint8Array(wasm.memory.buffer, ptr, TILE_SLOT_BYTES),
   );
 
-  exports.free_tile_buf(ptr);
+  wasm.free_tile_buf(ptr);
 
-  // ── Signal main thread ────────────────────────────────────────────────
-  Atomics.store(stateArray, 0, SLOT_READY);
-  self.postMessage({ type: "tile_ready", slotIndex: 0 });
-};
+  (self as unknown as Worker).postMessage({
+    type: "tile_ready",
+    slotIndex,
+    tileX,
+    tileY,
+    generation,
+  });
+}
