@@ -7,16 +7,24 @@
  *  - Receive completed tiles and upload them to the GL pipeline
  *
  * No WASM runs on the main thread. All computation is in Tile Workers.
+ *
+ * Worker count: hardwareConcurrency − 2 (min 2, max 8). Each worker owns one
+ * SAB slot — worker k always writes to slot k — so N_WORKERS === RING_SLOTS.
+ * Workers are independent WASM instances; no shared WASM memory is needed for
+ * Phase 1's copy-to-SAB approach. Phase 2 will eliminate the copy.
  */
 import { ZoomPanFSM, DEFAULT_VIEW, pixelToFractal, pixelStep } from "./viewport.ts";
 import { GlPipeline } from "./gl-pipeline.ts";
 import { wasmBundleUrl } from "./detect-simd.ts";
 
 const MAX_ITER = 256;
-const RING_SLOTS = 4;
 const TILE_SIZE = 256;
-const TILE_SLOT_BYTES = TILE_SIZE * TILE_SIZE * 4 * 4;
-const SLOT_EMPTY = 0;
+const TILE_SLOT_BYTES = TILE_SIZE * TILE_SIZE * 4 * 4; // 1 MiB per slot
+
+// Reserve 2 threads (main + one headroom) and cap at 8 to control SAB size.
+const N_WORKERS = Math.max(2, Math.min(8, (navigator.hardwareConcurrency ?? 4) - 2));
+// One slot per worker: worker k always writes to slot k.
+const RING_SLOTS = N_WORKERS;
 
 interface TileDesc {
   deltaRe: number;
@@ -48,11 +56,16 @@ function makeOverlay(): HTMLElement {
 export class FractalSession {
   private readonly fsm: ZoomPanFSM;
   private readonly gl: GlPipeline;
-  private readonly worker: Worker;
-  private readonly slotStateSab: SharedArrayBuffer;
+  private readonly workers: Worker[];
   private readonly tileSab: SharedArrayBuffer;
+
+  // Tracks workers that have been dispatched a tile and haven't yet responded.
+  // A worker is removed from this set when any tile_ready arrives from it,
+  // regardless of generation — the worker is genuinely idle at that point.
+  private readonly busyWorkers = new Set<number>();
+
+  private workerInitCount = 0;
   private pendingTiles: TileDesc[] = [];
-  private readonly activeSlots = new Set<number>();
   private generation = 0;
   private lutReady = false;
   private tilesThisGen = 0;
@@ -62,42 +75,41 @@ export class FractalSession {
 
   constructor(canvas: HTMLCanvasElement) {
     this.overlay = makeOverlay();
-    this.slotStateSab = new SharedArrayBuffer(RING_SLOTS * 4);
     this.tileSab = new SharedArrayBuffer(RING_SLOTS * TILE_SLOT_BYTES);
     this.gl = new GlPipeline(canvas);
 
     this.fsm = new ZoomPanFSM(DEFAULT_VIEW, {
-      // During pan: debounce 150 ms after the pointer stops moving.
-      // During zoom: skip — onZoomSettled handles it with its own 300 ms debounce.
       onViewChange: () => {
         this.updateOverlay();
         if (this.fsm.getState() === "PANNING") this.debouncedDispatch(150);
       },
-      // Zoom settled: dispatch (reuses the same debounce slot, replacing any
-      // pending pan debounce — zoom settle always wins).
       onZoomSettled: () => this.debouncedDispatch(0),
     });
     this.fsm.setCanvasSize(canvas.width, canvas.height);
     this.fsm.attach(canvas);
 
-    this.worker = new Worker(new URL("./tile-worker.ts", import.meta.url), { type: "module" });
-    this.worker.onerror = (e) => console.error("[FractalSession] worker error", e);
-    this.worker.onmessage = (e: MessageEvent<WorkerInMsg>) => this.onWorkerMessage(e.data);
-    this.worker.postMessage({
-      type: "init",
-      wasmUrl: wasmBundleUrl(),
-      slotStateSab: this.slotStateSab,
-      tileSab: this.tileSab,
+    const wasmUrl = wasmBundleUrl();
+    this.workers = Array.from({ length: N_WORKERS }, (_, i) => {
+      const w = new Worker(new URL("./tile-worker.ts", import.meta.url), { type: "module" });
+      w.onerror = (e) => console.error(`[FractalSession] worker ${i} error`, e);
+      w.onmessage = (e: MessageEvent<WorkerInMsg>) => this.onWorkerMessage(i, e.data);
+      w.postMessage({ type: "init", wasmUrl, tileSab: this.tileSab });
+      return w;
     });
   }
 
-  private onWorkerMessage(msg: WorkerInMsg): void {
+  private onWorkerMessage(workerIndex: number, msg: WorkerInMsg): void {
     if (msg.type === "init_done") {
-      this.gl.uploadLut(msg.lut);
-      this.lutReady = true;
-      this.scheduleDispatch();
+      // Upload LUT from the first worker that reports in; all workers produce
+      // identical LUTs so subsequent ones are discarded.
+      if (this.workerInitCount === 0) this.gl.uploadLut(msg.lut);
+      this.workerInitCount++;
+      if (this.workerInitCount === N_WORKERS) {
+        this.lutReady = true;
+        this.scheduleDispatch();
+      }
     } else if (msg.type === "tile_ready") {
-      this.onTileReady(msg);
+      this.onTileReady(workerIndex, msg);
     }
   }
 
@@ -109,7 +121,7 @@ export class FractalSession {
       `cx: ${parseFloat(v.cx).toFixed(8)}<br>` +
       `cy: ${parseFloat(v.cy).toFixed(8)}<br>` +
       `zoom: ${v.zoom_exp.toFixed(4)}<br>` +
-      `gen: ${this.generation}`;
+      `gen: ${this.generation} | workers: ${N_WORKERS}`;
   }
 
   private debouncedDispatch(delayMs: number): void {
@@ -127,13 +139,6 @@ export class FractalSession {
     this.generation++;
     const gen = this.generation;
     this.pendingTiles = [];
-    this.activeSlots.clear();
-
-    // Reset all slot states so dispatchPending can freely use them.
-    const stateArray = new Int32Array(this.slotStateSab);
-    for (let i = 0; i < RING_SLOTS; i++) {
-      Atomics.store(stateArray, i, SLOT_EMPTY);
-    }
 
     const view = this.fsm.getView();
     const canvas = this.gl.canvas;
@@ -156,7 +161,12 @@ export class FractalSession {
           W,
           H,
         );
-        this.pendingTiles.push({ deltaRe, deltaIm, step, tileX: tx, tileY: ty, slotIndex: 0, generation: gen });
+        this.pendingTiles.push({
+          deltaRe, deltaIm, step,
+          tileX: tx, tileY: ty,
+          slotIndex: 0, // overwritten by dispatchPending
+          generation: gen,
+        });
       }
     }
 
@@ -164,47 +174,34 @@ export class FractalSession {
   }
 
   private dispatchPending(): void {
-    const stateArray = new Int32Array(this.slotStateSab);
-    while (this.pendingTiles.length > 0) {
-      let slotIndex = -1;
-      for (let i = 0; i < RING_SLOTS; i++) {
-        if (!this.activeSlots.has(i) && Atomics.load(stateArray, i) === SLOT_EMPTY) {
-          slotIndex = i;
-          break;
-        }
-      }
-      if (slotIndex === -1) break;
-
+    for (let i = 0; i < this.workers.length; i++) {
+      if (this.pendingTiles.length === 0) break;
+      if (this.busyWorkers.has(i)) continue;
       const tile = this.pendingTiles.shift()!;
-      tile.slotIndex = slotIndex;
-      this.activeSlots.add(slotIndex);
-      this.worker.postMessage({ type: "render_tile", ...tile });
+      tile.slotIndex = i; // worker i owns slot i
+      this.busyWorkers.add(i);
+      this.workers[i].postMessage({ type: "render_tile", ...tile });
     }
   }
 
-  private onTileReady(msg: {
-    slotIndex: number;
-    tileX: number;
-    tileY: number;
-    generation: number;
-  }): void {
-    const { slotIndex, tileX, tileY, generation } = msg;
+  private onTileReady(
+    workerIndex: number,
+    msg: { slotIndex: number; tileX: number; tileY: number; generation: number },
+  ): void {
+    // Worker is idle regardless of generation — unblock it before anything else.
+    this.busyWorkers.delete(workerIndex);
 
-    // Stale completion: slot state was already reset in scheduleDispatch.
-    // Do not touch activeSlots or call dispatchPending — the new generation
-    // already owns this slot.
-    if (generation !== this.generation) return;
+    if (msg.generation !== this.generation) {
+      // Stale completion from a previous generation; give the worker new work.
+      this.dispatchPending();
+      return;
+    }
 
-    this.activeSlots.delete(slotIndex);
-    this.gl.uploadAndDrawTile(this.tileSab, slotIndex, tileX, tileY);
+    this.gl.uploadAndDrawTile(this.tileSab, workerIndex, msg.tileX, msg.tileY);
     this.tilesDrawnThisGen++;
 
-    const stateArray = new Int32Array(this.slotStateSab);
-    Atomics.store(stateArray, slotIndex, SLOT_EMPTY);
-
-    // Signal full-frame completion for E2E tests.
     if (this.tilesDrawnThisGen === this.tilesThisGen) {
-      (this.gl.canvas as HTMLCanvasElement).dataset.rendered = String(generation);
+      (this.gl.canvas as HTMLCanvasElement).dataset.rendered = String(msg.generation);
     }
 
     this.dispatchPending();

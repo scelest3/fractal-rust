@@ -17,7 +17,6 @@ const TILE_SLOT_BYTES = 256 * 256 * 4 * 4; // 1 MiB per slot
 interface InitMsg {
   type: "init";
   wasmUrl: string;
-  slotStateSab: SharedArrayBuffer;
   tileSab: SharedArrayBuffer;
 }
 

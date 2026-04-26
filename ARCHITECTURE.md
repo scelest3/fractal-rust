@@ -277,18 +277,17 @@ The target design uses a single `WebAssembly.Memory({ shared: true })` created o
 
 Producing a wasm-bindgen module that *imports* memory (rather than creating and exporting its own) requires recompiling the Rust standard library with `+atomics` — i.e. `-Z build-std` on nightly. Once the toolchain constraint is lifted this architecture is fully realised.
 
-#### Phase 0 pragmatic model
+#### Phase 1 pragmatic model (current)
 
-Until the shared-memory build is in place, Tile Workers use two separate `SharedArrayBuffer`s managed by the main thread:
+Until the shared-memory build is in place, Tile Workers use a single `SharedArrayBuffer` (`tileSab`) managed by the main thread. Each worker owns one slot — worker _k_ always writes to slot _k_ — so `RING_SLOTS = N_WORKERS`.
 
 | Buffer | Size | Purpose |
 |---|---|---|
-| `slotStateSab` | `4 × TOTAL_RING_SLOTS × 4` B | `Int32` per slot: `EMPTY=0 / WRITING=1 / READY=2` |
-| `tileSab` | `TOTAL_RING_SLOTS × TILE_SLOT_BYTES` B | Pixel ring data |
+| `tileSab` | `N_WORKERS × TILE_SLOT_BYTES` B | Pixel ring data; one slot per worker |
 
-Workers instantiate WASM via wasm-bindgen's `init()` (which manages its own module memory), write tile data into a WASM heap allocation via `alloc_tile_buf()` + `write_solid_tile()`, then copy once into `tileSab`. The main thread reads from `tileSab` for `gl.texSubImage2D`.
+Workers spawn `N_WORKERS = max(2, min(8, hardwareConcurrency − 2))` instances. Each independently calls `alloc_tile_buf()` + `render_tile_to_ptr()` on its own WASM heap, copies the 1 MiB tile into its SAB slot, then signals via `postMessage`. Workers run truly in parallel — no shared WASM memory is needed since each owns its slot.
 
-**One copy per tile on the write path is acceptable.** The hot render loop (Phase 1+) must not copy; this constraint is enforced once WASM writes directly into the shared `tileSab` or the shared `WebAssembly.Memory`.
+**One copy per tile (WASM heap → SAB) is accepted.** Phase 2 eliminates it once `-Z build-std` lands and wasm-bindgen can accept an injected `SharedArrayBuffer` as WASM linear memory.
 
 After each worker calls `layout(n_workers, max_iter)` it obtains byte offsets used for shared orbit and BLA regions (Phase 2+).
 
