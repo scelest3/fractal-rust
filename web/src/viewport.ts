@@ -97,7 +97,7 @@ const ZOOM_SPEED = 0.001;
  * Milliseconds of inactivity after the last wheel event before `onZoomSettled`
  * fires. This is the trigger for reference orbit recomputation in Phase 2.
  */
-const ZOOM_SETTLE_MS = 300;
+const ZOOM_SETTLE_MS = 150;
 
 export interface ZoomPanOptions {
   onViewChange?: (view: ViewState) => void;

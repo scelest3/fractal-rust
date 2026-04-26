@@ -17,7 +17,11 @@ import { ZoomPanFSM, DEFAULT_VIEW, pixelToFractal, pixelStep } from "./viewport.
 import { GlPipeline } from "./gl-pipeline.ts";
 import { wasmBundleUrl } from "./detect-simd.ts";
 
-const MAX_ITER = 256;
+/** Minimum iteration budget — enough for a clean render at the default view. */
+const BASE_ITER = 256;
+
+/** Extra iterations per decade of zoom. At zoom_exp=10 this adds 640 → 896 total. */
+const ITER_PER_DECADE = 64;
 const TILE_SIZE = 256;
 const TILE_SLOT_BYTES = TILE_SIZE * TILE_SIZE * 4 * 4; // 1 MiB per slot
 
@@ -30,6 +34,7 @@ interface TileDesc {
   deltaRe: number;
   deltaIm: number;
   step: number;
+  maxIter: number;
   tileX: number;
   tileY: number;
   slotIndex: number;
@@ -120,7 +125,7 @@ export class FractalSession {
       `state: ${state}<br>` +
       `cx: ${parseFloat(v.cx).toFixed(8)}<br>` +
       `cy: ${parseFloat(v.cy).toFixed(8)}<br>` +
-      `zoom: ${v.zoom_exp.toFixed(4)}<br>` +
+      `zoom: 10^${v.zoom_exp.toFixed(3)} (${Math.round(Math.pow(10, v.zoom_exp))}×)<br>` +
       `gen: ${this.generation} | workers: ${N_WORKERS}`;
   }
 
@@ -145,6 +150,7 @@ export class FractalSession {
     const W = canvas.width as number;
     const H = canvas.height as number;
     const step = pixelStep(view.zoom_exp, H);
+    const maxIter = Math.max(BASE_ITER, Math.round(BASE_ITER + Math.max(0, view.zoom_exp) * ITER_PER_DECADE));
     const tilesX = Math.ceil(W / TILE_SIZE);
     const tilesY = Math.ceil(H / TILE_SIZE);
 
@@ -162,7 +168,7 @@ export class FractalSession {
           H,
         );
         this.pendingTiles.push({
-          deltaRe, deltaIm, step,
+          deltaRe, deltaIm, step, maxIter,
           tileX: tx, tileY: ty,
           slotIndex: 0, // overwritten by dispatchPending
           generation: gen,
