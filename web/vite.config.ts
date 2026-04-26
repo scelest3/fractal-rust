@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from "vite";
 
 const crossOriginHeaders = {
@@ -10,5 +11,8 @@ export default defineConfig({
   preview: { headers: crossOriginHeaders },
   build: {
     target: "es2022",
+  },
+  test: {
+    environment: "node",
   },
 });
