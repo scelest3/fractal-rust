@@ -178,6 +178,24 @@ pub fn escape_time<M: IterationMap>(map: &M, c: Complex<f64>, max_iter: u32) -> 
     }
 }
 
+// ── render_tile_escape ────────────────────────────────────────────────────────
+
+/// Fill `out` with escape-time results for each coordinate in `coords`.
+///
+/// `coords` and `out` must have the same length (asserted in debug builds).
+/// Each entry in `coords` is the complex constant `c` for one pixel.
+pub fn render_tile_escape<M: IterationMap>(
+    map: &M,
+    coords: &[Complex<f64>],
+    max_iter: u32,
+    out: &mut [TilePixel],
+) {
+    debug_assert_eq!(coords.len(), out.len());
+    for (c, slot) in coords.iter().zip(out.iter_mut()) {
+        *slot = TilePixel::from(escape_time(map, *c, max_iter));
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -326,5 +344,66 @@ mod tests {
     #[test]
     fn tile_pixel_is_16_bytes_repr_c() {
         assert_eq!(core::mem::size_of::<TilePixel>(), 16);
+    }
+
+    // ── render_tile_escape ────────────────────────────────────────────────────
+
+    #[test]
+    fn render_tile_mixed_interior_and_escaped() {
+        // 4×4 grid: re ∈ [-2, 1] step 1, im ∈ [-1.5, 1.5] step 1
+        // Guaranteed interior: c = 0 + 0i (origin is in Mandelbrot set)
+        // Guaranteed escaped: c = 2 + 0i (escapes on iter 1)
+        let coords: Vec<Complex<f64>> = (-2..=1)
+            .flat_map(|re| (-2..=1).map(move |im| Complex::new(re as f64, im as f64)))
+            .collect();
+        let mut out = vec![TilePixel::default(); coords.len()];
+        render_tile_escape(&MAP, &coords, 100, &mut out);
+
+        let escaped_count = out.iter().filter(|p| p.escaped == 1.0).count();
+        let interior_count = out.iter().filter(|p| p.escaped == 0.0).count();
+        assert!(escaped_count > 0, "expected at least one escaped pixel");
+        assert!(interior_count > 0, "expected at least one interior pixel");
+    }
+
+    #[test]
+    fn render_tile_all_escaped_far_exterior() {
+        // All coords far outside the Mandelbrot set (|c| = 10)
+        let coords: Vec<Complex<f64>> = (0..16)
+            .map(|i| Complex::new(10.0 + i as f64, 0.0))
+            .collect();
+        let mut out = vec![TilePixel::default(); coords.len()];
+        render_tile_escape(&MAP, &coords, 100, &mut out);
+
+        assert!(
+            out.iter().all(|p| p.escaped == 1.0),
+            "all pixels far outside must be escaped"
+        );
+    }
+
+    #[test]
+    fn render_tile_output_length_matches_coords() {
+        let coords = vec![Complex::new(0.0_f64, 0.0); 64];
+        let mut out = vec![TilePixel::default(); 64];
+        render_tile_escape(&MAP, &coords, 50, &mut out); // must not panic
+        assert_eq!(out.len(), 64);
+    }
+
+    #[test]
+    fn render_tile_interior_smooth_t_is_zero() {
+        // Interior pixels must have smooth_t == 0.0
+        let coords = vec![Complex::new(0.0_f64, 0.0)]; // origin, always interior
+        let mut out = vec![TilePixel::default(); 1];
+        render_tile_escape(&MAP, &coords, 100, &mut out);
+        assert_eq!(out[0].escaped, 0.0);
+        assert_eq!(out[0].smooth_t, 0.0);
+    }
+
+    #[test]
+    fn render_tile_escaped_smooth_t_is_finite() {
+        let coords = vec![Complex::new(2.0_f64, 0.0)]; // known escaped
+        let mut out = vec![TilePixel::default(); 1];
+        render_tile_escape(&MAP, &coords, 100, &mut out);
+        assert_eq!(out[0].escaped, 1.0);
+        assert!(out[0].smooth_t.is_finite());
     }
 }
