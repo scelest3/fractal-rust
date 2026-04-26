@@ -3,5 +3,5 @@ name    = "coloring"
 version.workspace = true
 edition.workspace = true
 
-[dependencies]
-kernel = { path = "../kernel" }
+# No dependencies for Phase 1 — LUT generation is self-contained.
+# kernel will be added in Phase 4 when full EscapeResult-based coloring ships.
