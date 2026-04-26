@@ -170,3 +170,71 @@ pub fn build_lut(_palette: JsValue) -> Box<[f32]> {
         .to_vec()
         .into_boxed_slice()
 }
+
+// ── render_tile ────────────────────────────────────────────────────────────
+
+const TILE_SIZE: usize = 256;
+const TILE_PIXELS: usize = TILE_SIZE * TILE_SIZE;
+
+/// Parameters for one tile render job, passed from the Tile Worker.
+///
+/// `delta_re` / `delta_im` are the fractal coordinates of the tile's
+/// top-left pixel center. `pixel_step` is fractal units per pixel (same
+/// for both axes). `slot_index` selects the ring buffer slot to write into.
+#[wasm_bindgen]
+pub struct TileJob {
+    pub delta_re: f64,
+    pub delta_im: f64,
+    pub pixel_step: f64,
+    pub max_iter: u32,
+    pub slot_index: u32,
+}
+
+/// Result returned to the Tile Worker after rendering.
+#[wasm_bindgen]
+pub struct TileResult {
+    /// Number of glitched pixels detected (always 0 in Phase 1).
+    pub glitch_count: u32,
+}
+
+/// Inner implementation: render one 256×256 tile into a caller-supplied
+/// `TilePixel` slice. Separated from the wasm export so integration tests
+/// can pass a heap-allocated buffer without requiring shared memory layout.
+pub fn render_tile_impl(job: &TileJob, out: &mut [kernel::TilePixel]) -> TileResult {
+    debug_assert_eq!(out.len(), TILE_PIXELS);
+
+    let mut coords = Vec::with_capacity(TILE_PIXELS);
+    for row in 0..TILE_SIZE {
+        for col in 0..TILE_SIZE {
+            coords.push(arith::Complex::new(
+                job.delta_re + col as f64 * job.pixel_step,
+                job.delta_im + row as f64 * job.pixel_step,
+            ));
+        }
+    }
+
+    kernel::render_tile_escape(&kernel::MandelbrotMap, &coords, job.max_iter, out);
+    TileResult { glitch_count: 0 }
+}
+
+/// Render a 256×256 Mandelbrot tile into the shared memory ring slot.
+///
+/// Computes per-pixel `Complex<f64>` coordinates from `job`, calls
+/// `kernel::render_tile_escape`, and writes `TilePixel` data directly
+/// into WASM linear memory at `tile_ring_offset + slot_index * tile_slot_bytes`.
+///
+/// # Safety
+/// The caller (Tile Worker) must have acquired the ring slot via
+/// `Atomics.compareExchange` before calling this function, ensuring no
+/// concurrent writes. The slot byte range must be within the WASM linear
+/// memory that backs the shared `WebAssembly.Memory`.
+#[wasm_bindgen]
+pub fn render_tile(job: &TileJob, layout: &MemoryLayout) -> TileResult {
+    let byte_offset =
+        (layout.tile_ring_offset + job.slot_index * layout.tile_slot_bytes) as usize;
+    let ptr = byte_offset as *mut kernel::TilePixel;
+    // Safety: byte_offset is within the shared WebAssembly.Memory — the Tile
+    // Worker verified the slot is EMPTY before calling and holds WRITING state.
+    let out = unsafe { core::slice::from_raw_parts_mut(ptr, TILE_PIXELS) };
+    render_tile_impl(job, out)
+}
