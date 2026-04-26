@@ -70,29 +70,29 @@ Browser-based, high-resolution fractal explorer targeting sustained 60 fps inter
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  Browser Main Thread                                            │
-│  ┌──────────────┐   ┌──────────────────────────────────────┐   │
-│  │ TypeScript   │   │ WebGL 2 Pipeline                     │   │
-│  │ UI Shell     │──▶│ tileTexArray → accumFBO → screen     │   │
-│  └──────┬───────┘   └──────────────────────────────────────┘   │
+│  ┌──────────────┐   ┌──────────────────────────────────────┐    │
+│  │ TypeScript   │   │ WebGL 2 Pipeline                     │    │
+│  │ UI Shell     │──▶│ tileTexArray → accumFBO → screen     │    │
+│  └──────┬───────┘   └──────────────────────────────────────┘    │
 │         │ postMessage / shared WebAssembly.Memory               │
 └─────────┼───────────────────────────────────────────────────────┘
           │
 ┌─────────▼───────────────────────────────────────────────────────┐
 │  Web Workers                                                    │
-│  ┌────────────────┐  ┌─────────────────┐  ┌─────────────────┐  │
-│  │ Orbit Worker×1 │  │ Tile Workers×N  │  │ Scheduler ×1    │  │
-│  │ BigFloat ref   │  │ Perturbation    │  │ Priority queue  │  │
-│  │ orbit + BLA    │  │ loop + BLA      │  │ tile dispatch   │  │
-│  └────────┬───────┘  └────────┬────────┘  └────────┬────────┘  │
+│  ┌────────────────┐  ┌─────────────────┐  ┌─────────────────┐   │
+│  │ Orbit Worker×1 │  │ Tile Workers×N  │  │ Scheduler ×1    │   │
+│  │ BigFloat ref   │  │ Perturbation    │  │ Priority queue  │   │
+│  │ orbit + BLA    │  │ loop + BLA      │  │ tile dispatch   │   │
+│  └────────┬───────┘  └────────┬────────┘  └────────┬────────┘   │
 └───────────┼───────────────────┼────────────────────┼────────────┘
             │                   │                    │
 ┌───────────▼───────────────────▼────────────────────▼────────────┐
 │  Shared WebAssembly.Memory (created on main thread)             │
-│  orbit · BLA · secondary orbits · slot states · tile ring      │
+│  orbit · BLA · secondary orbits · slot states · tile ring       │
 └─────────────────────────────────────────────────────────────────┘
             │                   │
 ┌───────────▼───────────────────▼──────────────────────────────┐
-│  WASM Module (per worker instance, same shared Memory)        │
+│  WASM Module (per worker instance, same shared Memory)       │
 │  arith · kernel · coloring · scheduler                       │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -118,20 +118,42 @@ fractal-workspace/
 
 ### 4.1 `crate: arith`
 
-Implements numeric types for deep zoom. All types are `no_std + no alloc` — compiles identically on native and WASM targets.
+Implements numeric types and the `Precision` trait for deep zoom. All types are `no_std + no alloc` — compiles identically on native and WASM targets.
 
-| Type | Bits | Use case |
-|---|---|---|
-| `F64x2` (double-double) | 106 mantissa bits | Zoom to ~10⁻²⁸ — fast, fits in two f64 SIMD lanes |
-| `F64x4` (quad-double) | 212 mantissa bits | Reference orbit at 10⁻⁵⁰ to 10⁻⁸⁰ |
-| `BigFloat<N>` | N × 64 limbs | Arbitrary precision via software carry chains; N chosen per zoom depth |
-| `DeltaC` | f64 pair (v1) | Per-pixel relative coordinate; opaque type to allow extended-precision upgrade in v2 |
+**`arith` is the workspace-wide home for numeric primitives.** `Complex<T>` is defined here and used by every other crate — there is no parallel complex type in the codebase.
 
-> `F64x2` uses Knuth TwoSum / Veltkamp splitting. `BigFloat<N>` is a fixed-size stack array — no heap allocation — so WASM linear memory stays predictable.
+| Type / Trait | Notes |
+|---|---|
+| `Precision` | Trait implemented by `f64`, `F64x2`, `BigFloat<N>`. Provides `zero`, `one`, `from_f64`, `to_f64_lossy`, arithmetic ops, `norm_sqr`. Lets `kernel` write generic orbit code without naming a concrete precision type. |
+| `Complex<T: Precision>` | `repr(C)` generic complex number. Used identically in orbit buffers, BLA entries, `EscapeResult`, and perturbation steps. `repr(C)` means `&[Complex<f64>]` can be cast directly from shared WASM memory orbit bytes with zero copy. |
+| `F64x2` (double-double) | 106 mantissa bits. Zoom to ~10⁻²⁸. Uses Knuth TwoSum / Veltkamp splitting. |
+| `F64x4` (quad-double) | 212 mantissa bits. Reference orbit at 10⁻⁵⁰ to 10⁻⁸⁰. |
+| `BigFloat<N>` | N × 64 limbs. Arbitrary precision via software carry chains; N chosen per zoom depth. Fixed-size stack array — no heap. |
+| `DeltaC` | Opaque f64 pair in v1. Per-pixel relative coordinate. `as_complex_f64()` is the only sanctioned extraction — internals can upgrade to rescaled extended precision in v2 without touching any `kernel` call site. |
+
+**Crate boundary rule:** `arith` owns numbers; `kernel` owns fractal algorithms; `wasm-bridge` owns precision dispatch. `kernel` imports only `arith::{Complex, DeltaC, Precision}`. `wasm-bridge` is the only crate that names a concrete `BigFloat<N>` — it holds the single `match required_limbs(zoom_exp)` block that selects N and calls the right `kernel` monomorphization.
 
 ### 4.2 `crate: kernel`
 
 Contains the core iteration engines. Each fractal type implements a decomposed set of three traits (see [§10](#10-adding-new-fractal-types) for the full trait design).
+
+`kernel` imports `arith::{Complex, DeltaC, Precision}`. `Complex<f64>` (from `arith`) is the currency for all f64 iteration arithmetic. `kernel` never names `BigFloat<N>` directly — reference orbit computation is generic over `T: Precision`, and `wasm-bridge` provides the concrete N at the call site.
+
+Key `kernel` entry points:
+
+```rust
+// Phase 1: plain escape-time render for one tile
+pub fn render_tile_escape<M: IterationMap>(map: &M, coords: &[Complex<f64>], max_iter: u32, out: &mut [TilePixel]);
+
+// Phase 2: compute reference orbit at precision T (generic; wasm-bridge monomorphizes for N=2,4,8)
+pub fn compute_ref_orbit<T: Precision, M: PerturbationSupport>(c: Complex<T>, max_iter: u32, out: &mut [Complex<f64>]) -> u32;
+
+// Phase 2: per-pixel perturbation hot path
+pub fn perturb_pixel<M: PerturbationSupport>(map: &M, orbit: &[Complex<f64>], bla: &[BlaEntry], dc: DeltaC, max_iter: u32) -> EscapeResult;
+
+// Phase 2: build BLA table from f64 orbit (called once by Orbit Worker after compute_ref_orbit)
+pub fn build_bla_table(orbit: &[Complex<f64>], out: &mut [BlaEntry]) -> usize;
+```
 
 #### 4.2.1 Mandelbrot / Julia Kernel
 
@@ -141,7 +163,7 @@ Standard `z ← z² + c` iteration. The perturbation equation for probe point `z
 δₙ₊₁ = 2·Zₙ·δₙ + δₙ² + Δc
 ```
 
-The reference orbit is computed once per zoom event at full `BigFloat<N>` precision, stored in the shared `WebAssembly.Memory` orbit region as `Complex<f64>` entries for the perturbation loop. Glitch detection follows the Pauldelbrot criterion: `|δ| > ε·|Z|`. Glitched pixels are re-seeded with a secondary reference orbit (see §9.4).
+The reference orbit is computed once per zoom event at full `BigFloat<N>` precision via `compute_ref_orbit`, stored in the shared `WebAssembly.Memory` orbit region as `Complex<f64>` entries for the perturbation loop. Glitch detection follows the Pauldelbrot criterion: `|δ| > ε·|Z|`. Glitched pixels are re-seeded with a secondary reference orbit (see §9.4).
 
 #### 4.2.2 Newton Fractal Kernel
 
@@ -221,6 +243,11 @@ pub fn layout(n_workers: u32, max_iter: u32) -> MemoryLayout;
 
 /// Orbit Worker: compute reference orbit + BLA table into shared memory.
 /// Returns { orbit_len, bla_len } on completion.
+///
+/// wasm-bridge owns the single precision-dispatch match. It calls
+/// kernel::compute_ref_orbit::<BigFloat<N>, M> for N = 2, 4, or 8
+/// (selected by arith::required_limbs(zoom_exp)), then kernel::build_bla_table.
+/// kernel is generic over T: Precision; wasm-bridge supplies the concrete N.
 #[wasm_bindgen]
 pub fn compute_reference_orbit(
     kind: FractalKind,
@@ -590,7 +617,7 @@ Adding a new fractal type touches three independent axes. Conflating them is the
 
 ### 10.2 Trait Decomposition
 
-Rather than one monolithic `FractalKernel`, three focused traits:
+Rather than one monolithic `FractalKernel`, three focused traits. All `Complex<f64>` references below are `arith::Complex<f64>` — the single workspace-wide complex type.
 
 ```rust
 /// Axis 1: The iteration map itself.
