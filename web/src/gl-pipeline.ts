@@ -48,11 +48,14 @@ export class GlPipeline {
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
-    const gl = canvas.getContext("webgl2");
+    const gl = canvas.getContext("webgl2", { preserveDrawingBuffer: true });
     if (!gl) throw new Error("WebGL2 not available");
     this.gl = gl;
     this.program = this.buildProgram(VERT_SRC, FRAG_SRC);
-    this.tileTexture = this.makeTexture(gl.LINEAR);
+    // NEAREST required for RGBA32F tiles — LINEAR needs OES_texture_float_linear.
+    this.tileTexture = this.makeTexture(gl.NEAREST);
+    // Enable float-texture linear filtering for the LUT if available.
+    gl.getExtension("OES_texture_float_linear");
     this.lutTexture = this.makeTexture(gl.LINEAR);
 
     gl.useProgram(this.program);
@@ -89,11 +92,16 @@ export class GlPipeline {
   ): void {
     const { gl } = this;
     const byteOffset = slotIndex * 256 * 256 * 4 * 4;
-    const data = new Float32Array(tileSab, byteOffset, 256 * 256 * 4);
+    // Copy out of the SharedArrayBuffer — texImage2D may silently ignore SAB-backed arrays.
+    const data = new Float32Array(new Float32Array(tileSab, byteOffset, 256 * 256 * 4));
 
-    // Upload tile data.
+    // Flip Y so that tile row 0 (top of screen) maps to UV y=1 (texture top).
+    // Without this, each tile renders upside-down relative to its neighbours,
+    // causing a 511-step fractal jump at every tile boundary.
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.bindTexture(gl.TEXTURE_2D, this.tileTexture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 256, 256, 0, gl.RGBA, gl.FLOAT, data);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
 
     // WebGL Y is bottom-up; tileY=0 is the top row, so flip.
     const canvasH = gl.canvas.height as number;

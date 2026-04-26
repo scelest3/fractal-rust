@@ -32,6 +32,19 @@ type WorkerInMsg =
   | { type: "init_done"; lut: Float32Array }
   | { type: "tile_ready"; slotIndex: number; tileX: number; tileY: number; generation: number };
 
+function makeOverlay(): HTMLElement {
+  const el = document.createElement("div");
+  Object.assign(el.style, {
+    position: "fixed", top: "8px", left: "8px",
+    color: "white", fontFamily: "monospace", fontSize: "12px",
+    background: "rgba(0,0,0,0.55)", padding: "6px 10px",
+    borderRadius: "4px", pointerEvents: "none", zIndex: "999",
+    lineHeight: "1.6",
+  });
+  document.body.appendChild(el);
+  return el;
+}
+
 export class FractalSession {
   private readonly fsm: ZoomPanFSM;
   private readonly gl: GlPipeline;
@@ -44,15 +57,25 @@ export class FractalSession {
   private lutReady = false;
   private tilesThisGen = 0;
   private tilesDrawnThisGen = 0;
+  private dispatchDebounceId: ReturnType<typeof setTimeout> | null = null;
+  private readonly overlay: HTMLElement;
 
   constructor(canvas: HTMLCanvasElement) {
+    this.overlay = makeOverlay();
     this.slotStateSab = new SharedArrayBuffer(RING_SLOTS * 4);
     this.tileSab = new SharedArrayBuffer(RING_SLOTS * TILE_SLOT_BYTES);
     this.gl = new GlPipeline(canvas);
 
     this.fsm = new ZoomPanFSM(DEFAULT_VIEW, {
-      onViewChange: () => this.scheduleDispatch(),
-      onZoomSettled: () => this.scheduleDispatch(),
+      // During pan: debounce 150 ms after the pointer stops moving.
+      // During zoom: skip — onZoomSettled handles it with its own 300 ms debounce.
+      onViewChange: () => {
+        this.updateOverlay();
+        if (this.fsm.getState() === "PANNING") this.debouncedDispatch(150);
+      },
+      // Zoom settled: dispatch (reuses the same debounce slot, replacing any
+      // pending pan debounce — zoom settle always wins).
+      onZoomSettled: () => this.debouncedDispatch(0),
     });
     this.fsm.setCanvasSize(canvas.width, canvas.height);
     this.fsm.attach(canvas);
@@ -76,6 +99,26 @@ export class FractalSession {
     } else if (msg.type === "tile_ready") {
       this.onTileReady(msg);
     }
+  }
+
+  private updateOverlay(): void {
+    const v = this.fsm.getView();
+    const state = this.fsm.getState();
+    this.overlay.innerHTML =
+      `state: ${state}<br>` +
+      `cx: ${parseFloat(v.cx).toFixed(8)}<br>` +
+      `cy: ${parseFloat(v.cy).toFixed(8)}<br>` +
+      `zoom: ${v.zoom_exp.toFixed(4)}<br>` +
+      `gen: ${this.generation}`;
+  }
+
+  private debouncedDispatch(delayMs: number): void {
+    if (!this.lutReady) return;
+    if (this.dispatchDebounceId !== null) clearTimeout(this.dispatchDebounceId);
+    this.dispatchDebounceId = setTimeout(() => {
+      this.dispatchDebounceId = null;
+      this.scheduleDispatch();
+    }, delayMs);
   }
 
   private scheduleDispatch(): void {
@@ -102,7 +145,7 @@ export class FractalSession {
 
     this.tilesThisGen = tilesX * tilesY;
     this.tilesDrawnThisGen = 0;
-    this.gl.clear();
+    this.updateOverlay();
 
     for (let ty = 0; ty < tilesY; ty++) {
       for (let tx = 0; tx < tilesX; tx++) {
@@ -147,12 +190,10 @@ export class FractalSession {
   }): void {
     const { slotIndex, tileX, tileY, generation } = msg;
 
-    // Discard stale completions from a superseded generation.
-    if (generation !== this.generation) {
-      const stateArray = new Int32Array(this.slotStateSab);
-      Atomics.store(stateArray, slotIndex, SLOT_EMPTY);
-      return;
-    }
+    // Stale completion: slot state was already reset in scheduleDispatch.
+    // Do not touch activeSlots or call dispatchPending — the new generation
+    // already owns this slot.
+    if (generation !== this.generation) return;
 
     this.activeSlots.delete(slotIndex);
     this.gl.uploadAndDrawTile(this.tileSab, slotIndex, tileX, tileY);

@@ -35,6 +35,7 @@ interface RenderTileMsg {
 
 type WorkerMsg = InitMsg | RenderTileMsg;
 
+// Raw WASM instance exports (alloc/free/render are primitive-typed, available on InitOutput).
 interface WasmExports {
   memory: WebAssembly.Memory;
   alloc_tile_buf: () => number;
@@ -46,10 +47,15 @@ interface WasmExports {
     maxIter: number,
     ptr: number,
   ) => void;
+}
+
+// build_lut returns a boxed slice and lives on the JS glue module, not on InitOutput.
+interface WasmGlue {
   build_lut: (palette: null) => Float32Array;
 }
 
 let wasm: WasmExports | null = null;
+let glueModule: WasmGlue | null = null;
 let tileSab: SharedArrayBuffer | null = null;
 
 self.onmessage = async (event: MessageEvent<WorkerMsg>) => {
@@ -67,10 +73,11 @@ async function handleInit(msg: InitMsg): Promise<void> {
   const glueUrl = msg.wasmUrl.replace("_bg.wasm", ".js");
   const glue = await import(/* @vite-ignore */ glueUrl);
   wasm = (await glue.default({ module_or_path: msg.wasmUrl })) as WasmExports;
+  glueModule = glue as WasmGlue;
 
-  // build_lut returns a Float32Array view into WASM memory — copy it so the
-  // main thread receives an independent buffer it can hold onto safely.
-  const lutView = wasm.build_lut(null);
+  // build_lut is a JS glue wrapper (handles boxed-slice memory), not a raw
+  // WASM export — call it on the glue module, not on the InitOutput object.
+  const lutView = glueModule.build_lut(null);
   const lut = new Float32Array(lutView);
 
   (self as unknown as Worker).postMessage({ type: "init_done", lut });
