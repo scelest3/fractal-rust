@@ -1,0 +1,119 @@
+/**
+ * BoxZoom — right-click drag to zoom into a selected region.
+ *
+ * The user draws a free-form rectangle; on release the shorter dimension is
+ * expanded to match the canvas aspect ratio so the result fills the viewport.
+ * A minimum box size of 8×8 px is enforced to prevent accidental zooms on
+ * right-click without drag.
+ */
+import { pixelToFractal, type ViewState } from "./viewport.ts";
+
+const MIN_BOX_PX = 8;
+
+export class BoxZoom {
+  private readonly box: HTMLDivElement;
+  private startOffset = { x: 0, y: 0 };
+  private startClient = { x: 0, y: 0 };
+  private active = false;
+
+  constructor(
+    private readonly canvas: HTMLCanvasElement,
+    private readonly getView: () => ViewState,
+    private readonly onZoom: (view: ViewState) => void,
+  ) {
+    this.box = this.makeBox();
+
+    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+    canvas.addEventListener("pointerdown", (e) => this.onDown(e));
+    canvas.addEventListener("pointermove", (e) => this.onMove(e));
+    canvas.addEventListener("pointerup", (e) => this.onUp(e));
+    canvas.addEventListener("pointercancel", () => this.cancel());
+  }
+
+  private makeBox(): HTMLDivElement {
+    const el = document.createElement("div");
+    Object.assign(el.style, {
+      position: "fixed",
+      display: "none",
+      border: "2px dashed rgba(255,255,255,0.85)",
+      background: "rgba(255,255,255,0.08)",
+      boxSizing: "border-box",
+      pointerEvents: "none",
+      zIndex: "998",
+    });
+    document.body.appendChild(el);
+    return el;
+  }
+
+  private onDown(e: PointerEvent): void {
+    if (e.button !== 2) return;
+    e.preventDefault();
+    this.canvas.setPointerCapture(e.pointerId);
+    this.startOffset = { x: e.offsetX, y: e.offsetY };
+    this.startClient = { x: e.clientX, y: e.clientY };
+    this.active = true;
+  }
+
+  private onMove(e: PointerEvent): void {
+    if (!this.active) return;
+    const x = Math.min(this.startClient.x, e.clientX);
+    const y = Math.min(this.startClient.y, e.clientY);
+    const w = Math.abs(e.clientX - this.startClient.x);
+    const h = Math.abs(e.clientY - this.startClient.y);
+    Object.assign(this.box.style, {
+      display: "block",
+      left: `${x}px`,
+      top: `${y}px`,
+      width: `${w}px`,
+      height: `${h}px`,
+    });
+  }
+
+  private onUp(e: PointerEvent): void {
+    if (e.button !== 2 || !this.active) return;
+    this.cancel();
+    this.commit({ x: e.offsetX, y: e.offsetY });
+  }
+
+  private cancel(): void {
+    this.active = false;
+    this.box.style.display = "none";
+  }
+
+  private commit(end: { x: number; y: number }): void {
+    const { x: ex, y: ey } = end;
+    const { x: sx, y: sy } = this.startOffset;
+
+    if (Math.abs(ex - sx) < MIN_BOX_PX || Math.abs(ey - sy) < MIN_BOX_PX) return;
+
+    const W = this.canvas.width;
+    const H = this.canvas.height;
+    const view = this.getView();
+
+    const x1 = Math.min(sx, ex);
+    const y1 = Math.min(sy, ey);
+    const x2 = Math.max(sx, ex);
+    const y2 = Math.max(sy, ey);
+
+    const { fx: fx1, fy: fy1 } = pixelToFractal(x1, y1, view, W, H);
+    const { fx: fx2, fy: fy2 } = pixelToFractal(x2, y2, view, W, H);
+
+    const cx = (fx1 + fx2) / 2;
+    const cy = (fy1 + fy2) / 2;
+
+    // Expand the shorter fractal dimension to match the canvas aspect ratio.
+    let fWidth = Math.abs(fx2 - fx1);
+    let fHeight = Math.abs(fy2 - fy1);
+    const aspect = W / H;
+    if (fWidth / fHeight > aspect) {
+      fHeight = fWidth / aspect;
+    } else {
+      fWidth = fHeight * aspect;
+    }
+
+    // zoom_exp = log10(default_height / new_height), where default_height = 4.
+    const zoom_exp = Math.log10(4 / fHeight);
+
+    this.onZoom({ cx: cx.toString(), cy: cy.toString(), zoom_exp });
+  }
+}

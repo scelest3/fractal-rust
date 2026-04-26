@@ -14,6 +14,7 @@
  * Phase 1's copy-to-SAB approach. Phase 2 will eliminate the copy.
  */
 import { ZoomPanFSM, DEFAULT_VIEW, pixelToFractal, pixelStep } from "./viewport.ts";
+import { BoxZoom } from "./box-zoom.ts";
 import { GlPipeline } from "./gl-pipeline.ts";
 import { wasmBundleUrl } from "./detect-simd.ts";
 
@@ -92,6 +93,11 @@ export class FractalSession {
     });
     this.fsm.setCanvasSize(canvas.width, canvas.height);
     this.fsm.attach(canvas);
+
+    new BoxZoom(canvas, () => this.fsm.getView(), (view) => {
+      this.fsm.setView(view);
+      this.scheduleDispatch();
+    });
 
     const wasmUrl = wasmBundleUrl();
     this.workers = Array.from({ length: N_WORKERS }, (_, i) => {

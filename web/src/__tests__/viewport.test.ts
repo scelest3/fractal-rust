@@ -217,7 +217,7 @@ describe("ZoomPanFSM", () => {
 
   // ── Zoom-settle debounce ────────────────────────────────────────────────────
 
-  it("onZoomSettled fires after 300 ms of quiet", () => {
+  it("onZoomSettled fires after 150 ms of quiet", () => {
     const onSettled = vi.fn();
     fsm = new ZoomPanFSM({ cx: "0.0", cy: "0.0", zoom_exp: 0 }, { onZoomSettled: onSettled });
     fsm.setCanvasSize(W, H);
@@ -225,32 +225,32 @@ describe("ZoomPanFSM", () => {
     fsm.handleWheel(-100, W / 2, H / 2);
     expect(onSettled).not.toHaveBeenCalled();
 
-    vi.advanceTimersByTime(299);
+    vi.advanceTimersByTime(149);
     expect(onSettled).not.toHaveBeenCalled();
 
-    vi.advanceTimersByTime(1); // 300 ms total
+    vi.advanceTimersByTime(1); // 150 ms total
     expect(onSettled).toHaveBeenCalledOnce();
   });
 
   it("ZOOMING → IDLE after zoom settles", () => {
     fsm.handleWheel(-100, W / 2, H / 2);
-    vi.advanceTimersByTime(300);
+    vi.advanceTimersByTime(150);
     expect(fsm.getState()).toBe("IDLE");
   });
 
-  it("debounce resets on each wheel event — settles 300 ms after the last one", () => {
+  it("debounce resets on each wheel event — settles 150 ms after the last one", () => {
     const onSettled = vi.fn();
     fsm = new ZoomPanFSM({ cx: "0.0", cy: "0.0", zoom_exp: 0 }, { onZoomSettled: onSettled });
     fsm.setCanvasSize(W, H);
 
     fsm.handleWheel(-100, W / 2, H / 2);
-    vi.advanceTimersByTime(200);
+    vi.advanceTimersByTime(100);
 
     fsm.handleWheel(-100, W / 2, H / 2); // restart debounce
-    vi.advanceTimersByTime(200); // only 200 ms since last wheel
+    vi.advanceTimersByTime(100); // only 100 ms since last wheel
     expect(onSettled).not.toHaveBeenCalled();
 
-    vi.advanceTimersByTime(100); // 300 ms since last wheel
+    vi.advanceTimersByTime(50); // 150 ms since last wheel
     expect(onSettled).toHaveBeenCalledOnce();
   });
 

@@ -149,6 +149,20 @@ export class ZoomPanFSM {
     return { ...this.view };
   }
 
+  /**
+   * Overwrite the view from an external source (e.g. box-zoom or URL restore).
+   * Cancels any active pan or zoom debounce and returns to IDLE.
+   */
+  setView(view: ViewState): void {
+    this.view = { ...view };
+    this.state = "IDLE";
+    if (this.zoomDebounceId !== null) {
+      clearTimeout(this.zoomDebounceId);
+      this.zoomDebounceId = null;
+    }
+    this.notifyChange(this.view);
+  }
+
   /** Set canvas dimensions (required before any handle* calls). */
   setCanvasSize(width: number, height: number): void {
     this.canvasWidth = width;
@@ -167,14 +181,18 @@ export class ZoomPanFSM {
       this.handleWheel(e.deltaY, e.offsetX, e.offsetY);
     };
     const onPointerDown = (e: PointerEvent) => {
+      if (e.button !== 0) return; // ignore right-click (used by BoxZoom)
       canvas.setPointerCapture(e.pointerId);
       this.handlePointerDown(e.offsetX, e.offsetY);
     };
     const onPointerMove = (e: PointerEvent) => {
-      if (e.buttons === 0) return;
+      if ((e.buttons & 1) === 0) return; // only track primary button
       this.handlePointerMove(e.offsetX, e.offsetY);
     };
-    const onPointerUp = () => this.handlePointerUp();
+    const onPointerUp = (e: PointerEvent) => {
+      if (e.button !== 0) return;
+      this.handlePointerUp();
+    };
 
     canvas.addEventListener("wheel", onWheel, { passive: false });
     canvas.addEventListener("pointerdown", onPointerDown);
