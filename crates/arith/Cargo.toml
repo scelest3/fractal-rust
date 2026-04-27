@@ -2,3 +2,7 @@
 name    = "arith"
 version.workspace = true
 edition.workspace = true
+
+[dev-dependencies]
+rug      = { version = "1", features = ["float"] }
+proptest = "1"

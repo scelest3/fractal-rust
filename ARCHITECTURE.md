@@ -127,8 +127,7 @@ Implements numeric types and the `Precision` trait for deep zoom. All types are 
 | `Precision` | Trait implemented by `f64`, `F64x2`, `BigFloat<N>`. Provides `zero`, `one`, `from_f64`, `to_f64_lossy`, arithmetic ops, `norm_sqr`. Lets `kernel` write generic orbit code without naming a concrete precision type. |
 | `Complex<T: Precision>` | `repr(C)` generic complex number. Used identically in orbit buffers, BLA entries, `EscapeResult`, and perturbation steps. `repr(C)` means `&[Complex<f64>]` can be cast directly from shared WASM memory orbit bytes with zero copy. |
 | `F64x2` (double-double) | 106 mantissa bits. Zoom to ~10⁻²⁸. Uses Knuth TwoSum / Veltkamp splitting. |
-| `F64x4` (quad-double) | 212 mantissa bits. Reference orbit at 10⁻⁵⁰ to 10⁻⁸⁰. |
-| `BigFloat<N>` | N × 64 limbs. Arbitrary precision via software carry chains; N chosen per zoom depth. Fixed-size stack array — no heap. |
+| `BigFloat<N>` | Fixed-point in `[−8, 8]`, N × 64-bit limbs, carry-chain arithmetic. N chosen by `required_limbs(zoom_exp)`. Fixed-size stack array — no heap. **Not a general-purpose float** — the `[−8, 8]` range is sufficient for all Mandelbrot orbit values and intermediate `z² + c` arithmetic. To generalise to arbitrary reals, add an explicit `exponent: i32` field and adjust the carry-chain to account for it. |
 | `DeltaC` | Opaque f64 pair in v1. Per-pixel relative coordinate. `as_complex_f64()` is the only sanctioned extraction — internals can upgrade to rescaled extended precision in v2 without touching any `kernel` call site. |
 
 **Crate boundary rule:** `arith` owns numbers; `kernel` owns fractal algorithms; `wasm-bridge` owns precision dispatch. `kernel` imports only `arith::{Complex, DeltaC, Precision}`. `wasm-bridge` is the only crate that names a concrete `BigFloat<N>` — it holds the single `match required_limbs(zoom_exp)` block that selects N and calls the right `kernel` monomorphization.
@@ -289,6 +288,12 @@ Workers spawn `N_WORKERS = max(2, min(8, hardwareConcurrency − 2))` instances.
 
 **One copy per tile (WASM heap → SAB) is accepted.** Phase 2 eliminates it once `-Z build-std` lands and wasm-bindgen can accept an injected `SharedArrayBuffer` as WASM linear memory.
 
+#### Phase 2 orbit SAB
+
+Phase 2 adds a second `SharedArrayBuffer` (`orbitSab`) for the reference orbit and BLA table. It is created on the main thread, sized by `layout()`, and structured-cloned to all workers at startup — the same pattern as `tileSab`. The Orbit Worker writes the orbit and BLA data into `orbitSab`; Tile Workers read from it. The `postMessage` from the Orbit Worker on completion acts as the memory fence. No nightly Rust toolchain is required.
+
+When `-Z build-std` eventually lands, `orbitSab` merges into a single shared `WebAssembly.Memory` with no logic changes — the `layout()` offsets already describe the unified layout.
+
 After each worker calls `layout(n_workers, max_iter)` it obtains byte offsets used for shared orbit and BLA regions (Phase 2+).
 
 #### Memory Map (in order, from byte 0)
@@ -296,14 +301,14 @@ After each worker calls `layout(n_workers, max_iter)` it obtains byte offsets us
 | Region | Size | Notes |
 |---|---|---|
 | **Primary orbit** | 8 B header + `MAX_ITER × 32` B | Header: `{ entry_bytes: u32, orbit_len: u32 }`. Max entry = 32 B (`(Complex<f64>, Complex<f64>)` for Phoenix) |
-| **BLA table** | `MAX_ITER × 40` B | `BlaEntry` = `{ a, b: Complex<f64>, skip: u32, valid_radius: f64 }` |
+| **BLA table** | `MAX_ITER × 48` B | `BlaEntry` = `{ a, b: Complex<f64>, skip: u32, _pad: u32, valid_radius: f64 }` — `repr(C)` with 4 B padding before `valid_radius` for f64 alignment |
 | **Secondary orbit ×3** | 3 × (8 B header + `MAX_ITER × 16` B) | f64 perturbation-speed orbits; no BigFloat |
 | **Slot state array** | `4 × MAX_WORKERS × 4` B | `Int32` per slot: `EMPTY=0 / WRITING=1 / READY=2` |
 | **Tile ring** | `4 × MAX_WORKERS × 256 × 256 × 4` B | RGBA f32 per pixel; 4× slots per worker absorbs burst latency |
 
 **Approximate totals** (100 K iter, 8 Tile Workers):
-- Primary orbit: ~3.2 MB · BLA: ~4 MB · Secondary orbits: ~4.8 MB · Tile ring: ~32 MB
-- **Total: ~44 MB**
+- Primary orbit: ~3.2 MB · BLA: ~4.8 MB · Secondary orbits: ~4.8 MB · Tile ring: ~32 MB
+- **Total: ~44.8 MB**
 
 #### Tile slot lifecycle
 
@@ -468,8 +473,7 @@ Standard `f64` gives ~15–16 significant decimal digits. The strategy at each d
 |---|---|---|---|
 | zoom_exp < 10 | Native f64 | `Complex<f64>` | Baseline |
 | zoom_exp 10–20 | Double-double | `Complex<F64x2>` | ~3× f64 |
-| zoom_exp 20–50 | Quad-double | `Complex<F64x4>` | ~10× f64 |
-| zoom_exp 50–300 | Perturbation + BigFloat<N> | `BigFloat<N>` ref, `DeltaC` probe | Ref once; probes at f64 speed |
+| zoom_exp 20–300 | Perturbation + BigFloat<N> | `BigFloat<N>` ref, `DeltaC` probe | Ref once; probes at f64 speed |
 | zoom_exp > 300 | v2: rescaled `DeltaC` | extended `DeltaC` internals | `DeltaC` opaque type is the upgrade path |
 
 Precision tier is selected automatically at runtime. `zoom_exp` is the log₁₀ of the magnification (e.g. `zoom_exp = 100` for 10⁻¹⁰⁰ depth):
@@ -508,6 +512,17 @@ Every pixel `C = C_ref + ΔC`. The perturbation `δₙ = Zₙ − Z_ref,n` evolv
 
 ### 9.2 Implementation
 
+// EscapeResult is an enum — three mutually exclusive outcomes:
+//
+//   Escaped  { iter, smooth_t, orbit_min_r, orbit_min_z, angle_final }
+//   Interior { orbit_min_r, orbit_min_z }
+//   Glitched
+//
+// orbit_min_r / orbit_min_z are tracked for both Escaped and Interior so
+// the coloring crate can apply orbit-trap overlays to all pixels.
+// From<EscapeResult> for TilePixel panics on Glitched — glitched pixels
+// are re-rendered via a secondary orbit before GPU upload.
+
 ```rust
 pub fn perturb_pixel(
     ref_orbit: &[Complex<f64>],
@@ -515,29 +530,39 @@ pub fn perturb_pixel(
     max_iter: u32,
 ) -> EscapeResult {
     let mut delta = Complex::new(0.0, 0.0);
+    let mut orbit_min_r = f64::MAX;
+    let mut orbit_min_z = Complex::<f64>::zero();
 
     for (n, &z_ref) in ref_orbit.iter().enumerate() {
         delta = 2.0 * z_ref * delta + delta * delta + delta_c.as_complex_f64();
 
         let z_approx = z_ref + delta;
 
-        // Glitch detection (Pauldelbrot criterion)
+        // Track orbit minimum for orbit-trap coloring.
+        let r = z_approx.norm_sqr().sqrt();
+        if r < orbit_min_r { orbit_min_r = r; orbit_min_z = z_approx; }
+
+        // Glitch detection (Pauldelbrot criterion: |δ| > 1e-3 · |Z_ref|,
+        // equivalently |δ|² > 1e-6 · |Z_ref|²).
         if delta.norm_sqr() > 1e-6 * z_ref.norm_sqr() {
             return EscapeResult::Glitched;
         }
 
-        // Escape test on approximated full orbit
+        // Escape test on approximated full orbit.
         if z_approx.norm_sqr() > 4.0 {
             let smooth_t = (n as f64 + 1.0)
-                - (z_approx.norm().ln().ln() / std::f64::consts::LN_2);
-            return EscapeResult::Escaped { iter: n as u32, smooth_t };
+                - (z_approx.norm_sqr().sqrt().ln().ln() / core::f64::consts::LN_2);
+            return EscapeResult::Escaped {
+                iter: n as u32, smooth_t, orbit_min_r, orbit_min_z,
+                angle_final: z_approx.im.atan2(z_approx.re),
+            };
         }
 
         if n == ref_orbit.len() - 1 {
-            return EscapeResult::Interior;
+            return EscapeResult::Interior { orbit_min_r, orbit_min_z };
         }
     }
-    EscapeResult::Interior
+    EscapeResult::Interior { orbit_min_r, orbit_min_z }
 }
 ```
 
@@ -843,7 +868,7 @@ This runs before `fetch`, so non-SIMD browsers never request the SIMD bundle. Sh
 |---|---|---|
 | 0 — Scaffold | Workspace, CI, shared-memory WASM hello-world renders to canvas | `wasm-bridge` (stub), shared memory init |
 | 1 — Mandelbrot f64 | Basic escape-time Mandelbrot, smooth coloring, pan/zoom | `kernel`, `coloring`, `gl-pipeline`, `viewport.ts` |
-| 2 — Deep Zoom | F64x2 / F64x4 / BigFloat; perturbation theory; BLA (with validation); glitch correction | `arith`, `kernel` (perturb), `scheduler` |
+| 2 — Deep Zoom | F64x2 / BigFloat; perturbation theory; BLA (with validation); glitch correction | `arith`, `kernel` (perturb), `scheduler` |
 | 3 — Newton | Newton fractal with polynomial config UI and root-index coloring | `kernel` (newton), `coloring` (root) |
 | 4 — Color Editor | Full palette editor, orbit trap, LUT, preset library | `coloring`, `color-editor.ts` |
 | 5 — Export | PNG / JPEG / EXR export pipeline; PBO readback; large-image stitching | `export.ts`, `openexr-wasm` |
