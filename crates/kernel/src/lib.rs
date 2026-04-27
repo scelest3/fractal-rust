@@ -6,7 +6,7 @@
 //! `BigFloat<N>` types; `kernel` is generic over `T: Precision` for the cold
 //! reference orbit path (Phase 2).
 
-use arith::Complex;
+use arith::{Complex, Precision};
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
@@ -20,23 +20,31 @@ pub struct StepResult {
 }
 
 /// Escape-time result for one pixel. Consumed by the `coloring` crate.
-/// All fields are in f64; `TilePixel` provides the lossy f32 form for GPU upload.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct EscapeResult {
-    /// Iteration at which the orbit escaped (0-indexed). `max_iter` if interior.
-    pub iter: u32,
-    /// True if the orbit escaped within `max_iter` steps.
-    pub escaped: bool,
-    /// Smooth iteration count for band-free coloring.
-    /// Formula (from ARCHITECTURE.md §9.2): `(iter + 1) − ln(ln(|z|)) / ln(2)`
-    /// where `|z|` is the magnitude at escape. Zero for interior pixels.
-    pub smooth_t: f64,
-    /// Minimum `|z|` reached over the orbit `{z₁, z₂, …}`. Used by orbit traps.
-    pub orbit_min_r: f64,
-    /// The z at which `orbit_min_r` was attained.
-    pub orbit_min_z: Complex<f64>,
-    /// `arg(z)` at escape (in radians). Used for angle-domain coloring.
-    pub angle_final: f64,
+#[derive(Copy, Clone, Debug)]
+pub enum EscapeResult {
+    /// Orbit escaped within `max_iter` steps.
+    Escaped {
+        /// Iteration index at which escape was detected (0-indexed).
+        iter: u32,
+        /// Smooth iteration count: `(iter + 1) − ln(ln(|z|)) / ln(2)`.
+        smooth_t: f64,
+        /// Minimum `|z|` over the orbit `{z₁, z₂, …}`. For orbit traps.
+        orbit_min_r: f64,
+        /// z at which `orbit_min_r` was attained.
+        orbit_min_z: Complex<f64>,
+        /// `arg(z)` at escape (radians). For angle-domain coloring.
+        angle_final: f64,
+    },
+    /// Orbit did not escape within `max_iter` steps (interior or convergent).
+    Interior {
+        /// Minimum `|z|` over the orbit.
+        orbit_min_r: f64,
+        /// z at which `orbit_min_r` was attained.
+        orbit_min_z: Complex<f64>,
+    },
+    /// Pixel requires glitch correction; must not be converted to `TilePixel`
+    /// directly. Only produced by the perturbation path (Phase 2).
+    Glitched,
 }
 
 /// Raw per-pixel data written into the tile ring slot.
@@ -53,11 +61,22 @@ pub struct TilePixel {
 
 impl From<EscapeResult> for TilePixel {
     fn from(r: EscapeResult) -> Self {
-        Self {
-            smooth_t: r.smooth_t as f32,
-            orbit_min_r: r.orbit_min_r as f32,
-            angle: r.angle_final as f32,
-            escaped: if r.escaped { 1.0 } else { 0.0 },
+        match r {
+            EscapeResult::Escaped { smooth_t, orbit_min_r, angle_final, .. } => Self {
+                smooth_t: smooth_t as f32,
+                orbit_min_r: orbit_min_r as f32,
+                angle: angle_final as f32,
+                escaped: 1.0,
+            },
+            EscapeResult::Interior { orbit_min_r, orbit_min_z } => Self {
+                smooth_t: 0.0,
+                orbit_min_r: orbit_min_r as f32,
+                angle: (orbit_min_z.im.atan2(orbit_min_z.re)) as f32,
+                escaped: 0.0,
+            },
+            EscapeResult::Glitched => {
+                panic!("Glitched pixel must not be converted to TilePixel — apply glitch correction first")
+            }
         }
     }
 }
@@ -91,9 +110,6 @@ pub trait IterationMap {
 // ── MandelbrotMap ─────────────────────────────────────────────────────────────
 
 /// Standard Mandelbrot / filled-Julia iteration: z ← z² + c.
-///
-/// Phase 2 will add `PerturbationSupport` for deep-zoom rendering. Phase 1
-/// uses plain f64 escape time only.
 pub struct MandelbrotMap;
 
 impl IterationMap for MandelbrotMap {
@@ -110,6 +126,104 @@ impl IterationMap for MandelbrotMap {
     fn escape_radius_sq(&self) -> f64 {
         4.0
     }
+}
+
+// ── PerturbationSupport trait ─────────────────────────────────────────────────
+
+/// Extension of `IterationMap` for fractal types that support deep-zoom via
+/// perturbation theory.
+///
+/// The reference orbit is computed once in high precision T; per-pixel work
+/// uses cheap f64 arithmetic on small perturbation deltas δz.
+pub trait PerturbationSupport: IterationMap {
+    /// One entry in the reference orbit buffer (downcast to f64).
+    /// `Complex<f64>` for most maps; `(Complex<f64>, Complex<f64>)` for Phoenix.
+    type RefOrbitEntry: Copy;
+
+    /// Per-step auxiliary state for the perturbation recurrence.
+    /// `()` for Mandelbrot; sign bits for Burning Ship.
+    type RefState: Copy;
+
+    /// One step of the reference orbit in high-precision T.
+    fn ref_step<T: Precision>(&self, z: Complex<T>, c: Complex<T>) -> Complex<T>;
+
+    /// One step of the perturbation recurrence (always f64).
+    ///
+    /// `dz` is the current perturbation delta, `dc` the per-pixel ΔC,
+    /// `ref_z` is Z_n from the reference orbit at step n.
+    fn perturb_step(
+        &self,
+        dz: Complex<f64>,
+        dc: Complex<f64>,
+        ref_z: Complex<f64>,
+    ) -> Complex<f64>;
+
+    /// Glitch threshold: a pixel is glitched when `|dz_n| > threshold × |Z_n|`.
+    fn glitch_threshold(&self) -> f64;
+
+    /// Extract per-step reference state from a reference orbit value.
+    fn ref_state(&self, z: Complex<f64>) -> Self::RefState;
+}
+
+impl PerturbationSupport for MandelbrotMap {
+    type RefOrbitEntry = Complex<f64>;
+    type RefState = ();
+
+    #[inline(always)]
+    fn ref_step<T: Precision>(&self, z: Complex<T>, c: Complex<T>) -> Complex<T> {
+        z * z + c
+    }
+
+    #[inline(always)]
+    fn perturb_step(
+        &self,
+        dz: Complex<f64>,
+        dc: Complex<f64>,
+        ref_z: Complex<f64>,
+    ) -> Complex<f64> {
+        // δz_{n+1} = 2·Z_n·δz_n + δz_n² + δc
+        2.0 * ref_z * dz + dz * dz + dc
+    }
+
+    #[inline(always)]
+    fn glitch_threshold(&self) -> f64 {
+        1e-3
+    }
+
+    #[inline(always)]
+    fn ref_state(&self, _z: Complex<f64>) -> Self::RefState {}
+}
+
+// ── compute_ref_orbit ─────────────────────────────────────────────────────────
+
+/// Compute the reference orbit in precision T, storing downcast f64 entries.
+///
+/// Returns the number of entries written to `out` (≤ `max_iter`, ≤ `out.len()`).
+/// `out[n]` = Z_n (the value before the n-th step). The loop stops early if the
+/// reference point escapes; the escaped value is not stored.
+///
+/// # Arguments
+/// * `map`      — controls the high-precision step and escape radius
+/// * `c`        — reference point in precision T
+/// * `max_iter` — upper bound on orbit length
+/// * `out`      — caller-supplied buffer; length sets an independent upper bound
+pub fn compute_ref_orbit<T: Precision, M: PerturbationSupport>(
+    map: &M,
+    c: Complex<T>,
+    max_iter: u32,
+    out: &mut [Complex<f64>],
+) -> usize {
+    let mut z = Complex::<T>::zero();
+    let limit = (max_iter as usize).min(out.len());
+    for (i, slot) in out[..limit].iter_mut().enumerate() {
+        *slot = Complex::new(z.re.to_f64_lossy(), z.im.to_f64_lossy());
+        let z_next = map.ref_step(z, c);
+        if z_next.norm_sqr().to_f64_lossy() > map.escape_radius_sq() {
+            return i + 1;
+        }
+        z = z_next;
+    }
+    limit
 }
 
 // ── escape_time ───────────────────────────────────────────────────────────────
@@ -146,9 +260,8 @@ pub fn escape_time<M: IterationMap>(map: &M, c: Complex<f64>, max_iter: u32) -> 
             let norm = z.norm_sqr().sqrt();
             let smooth_t =
                 (iter as f64 + 1.0) - (norm.ln().ln() / core::f64::consts::LN_2);
-            return EscapeResult {
+            return EscapeResult::Escaped {
                 iter,
-                escaped: true,
                 smooth_t,
                 orbit_min_r,
                 orbit_min_z,
@@ -157,25 +270,11 @@ pub fn escape_time<M: IterationMap>(map: &M, c: Complex<f64>, max_iter: u32) -> 
         }
 
         if map.converged(z, z_prev) {
-            return EscapeResult {
-                iter,
-                escaped: false,
-                smooth_t: 0.0,
-                orbit_min_r,
-                orbit_min_z,
-                angle_final: z.im.atan2(z.re),
-            };
+            return EscapeResult::Interior { orbit_min_r, orbit_min_z };
         }
     }
 
-    EscapeResult {
-        iter: max_iter,
-        escaped: false,
-        smooth_t: 0.0,
-        orbit_min_r,
-        orbit_min_z,
-        angle_final: 0.0,
-    }
+    EscapeResult::Interior { orbit_min_r, orbit_min_z }
 }
 
 // ── render_tile_escape ────────────────────────────────────────────────────────
@@ -201,7 +300,7 @@ pub fn render_tile_escape<M: IterationMap>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arith::Complex;
+    use arith::{Complex, F64x2};
 
     const MAP: MandelbrotMap = MandelbrotMap;
 
@@ -228,118 +327,143 @@ mod tests {
 
     #[test]
     fn step_does_not_escape_at_exactly_four() {
-        // z = 2 + 0i, c = 0: z² = 4, |z²|² = 16... wait, escape checks z_next.norm_sq > 4
-        // z = 0, c = 2: z_next = 2, norm_sq = 4, NOT > 4
+        // z = 0, c = 2: z_next = 2, norm_sq = 4, NOT > 4 (strictly >)
         let z = Complex::new(0.0_f64, 0.0);
         let c = Complex::new(2.0_f64, 0.0);
         let s = MAP.step(z, c);
         assert!(!s.escaped, "norm_sq == 4.0 should not escape (strictly >)");
     }
 
+    // ── EscapeResult enum ─────────────────────────────────────────────────────
+
+    #[test]
+    fn tile_pixel_from_escaped_has_escaped_one() {
+        let r = EscapeResult::Escaped {
+            iter: 5,
+            smooth_t: 1.5,
+            orbit_min_r: 0.3,
+            orbit_min_z: Complex::new(0.1_f64, 0.2),
+            angle_final: 0.7,
+        };
+        let p = TilePixel::from(r);
+        assert_eq!(p.escaped, 1.0);
+        assert!((p.smooth_t - 1.5_f32).abs() < 1e-6);
+        assert!((p.orbit_min_r - 0.3_f32).abs() < 1e-6);
+        assert!((p.angle - 0.7_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tile_pixel_from_interior_has_escaped_zero() {
+        let r = EscapeResult::Interior {
+            orbit_min_r: 0.4,
+            orbit_min_z: Complex::new(0.0_f64, 0.0),
+        };
+        let p = TilePixel::from(r);
+        assert_eq!(p.escaped, 0.0);
+        assert_eq!(p.smooth_t, 0.0);
+        assert!((p.orbit_min_r - 0.4_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "Glitched pixel")]
+    fn tile_pixel_from_glitched_panics() {
+        let _ = TilePixel::from(EscapeResult::Glitched);
+    }
+
     // ── escape_time: interior points ──────────────────────────────────────────
 
     #[test]
     fn origin_is_interior() {
-        // c = 0: z stays at 0 forever
         let r = escape_time(&MAP, Complex::new(0.0_f64, 0.0), 100);
-        assert!(!r.escaped);
-        assert_eq!(r.iter, 100);
-        assert_eq!(r.smooth_t, 0.0);
+        assert!(matches!(r, EscapeResult::Interior { .. }));
     }
 
     #[test]
     fn minus_half_is_interior() {
-        // c = -0.5 is inside the main cardioid
         let r = escape_time(&MAP, Complex::new(-0.5_f64, 0.0), 1000);
-        assert!(!r.escaped);
+        assert!(matches!(r, EscapeResult::Interior { .. }));
     }
 
     #[test]
     fn interior_orbit_min_r_is_non_negative() {
         let r = escape_time(&MAP, Complex::new(-0.5_f64, 0.0), 100);
-        assert!(r.orbit_min_r >= 0.0);
+        if let EscapeResult::Interior { orbit_min_r, .. } = r {
+            assert!(orbit_min_r >= 0.0);
+        } else {
+            panic!("expected Interior");
+        }
     }
 
     // ── escape_time: exterior points ──────────────────────────────────────────
 
     #[test]
     fn c_equals_2_escapes_at_iter_1() {
-        // Manual trace: z₀=0, step→z₁=2 (not escaped), step→z₂=6 (escaped at iter=1)
         let r = escape_time(&MAP, Complex::new(2.0_f64, 0.0), 1000);
-        assert!(r.escaped, "c=2 must escape");
-        assert_eq!(r.iter, 1, "c=2 must escape at iteration 1");
+        if let EscapeResult::Escaped { iter, .. } = r {
+            assert_eq!(iter, 1, "c=2 must escape at iteration 1");
+        } else {
+            panic!("c=2 must escape");
+        }
     }
 
     #[test]
-    fn c_equals_2_exit_z_is_6() {
-        // At escape, z = 2² + 2 = 6
+    fn c_equals_2_exit_angle_is_zero() {
         let r = escape_time(&MAP, Complex::new(2.0_f64, 0.0), 1000);
-        // angle_final should be 0 since z is real and positive
-        assert!(r.angle_final.abs() < 1e-10, "exit angle should be ~0 for z=6+0i");
+        if let EscapeResult::Escaped { angle_final, .. } = r {
+            assert!(angle_final.abs() < 1e-10, "exit angle should be ~0 for z=6+0i");
+        } else {
+            panic!("c=2 must escape");
+        }
     }
 
     #[test]
     fn smooth_t_matches_formula_for_c_equals_2() {
-        // Manual trace: iter=1, z_escape = 6+0i, |z| = 6.0
+        // iter=1, z_escape = 6+0i, |z| = 6.0
         // smooth_t = 2 - ln(ln(6)) / ln(2)
         let r = escape_time(&MAP, Complex::new(2.0_f64, 0.0), 1000);
-        assert!(r.escaped);
-        let expected_norm = 6.0_f64;
-        let expected =
-            2.0 - f64::ln(f64::ln(expected_norm)) / core::f64::consts::LN_2;
-        assert!(
-            (r.smooth_t - expected).abs() < 1e-10,
-            "smooth_t = {}, expected ≈ {} (formula: 2 - ln(ln(6))/ln(2))",
-            r.smooth_t,
-            expected
-        );
+        if let EscapeResult::Escaped { smooth_t, .. } = r {
+            let expected = 2.0 - f64::ln(f64::ln(6.0)) / core::f64::consts::LN_2;
+            assert!(
+                (smooth_t - expected).abs() < 1e-10,
+                "smooth_t = {smooth_t}, expected ≈ {expected}"
+            );
+        } else {
+            panic!("c=2 must escape");
+        }
     }
 
     #[test]
-    fn far_exterior_escapes_early() {
-        // c = 10 + 0i: escapes on the very first step
+    fn far_exterior_escapes_at_iter_0() {
         let r = escape_time(&MAP, Complex::new(10.0_f64, 0.0), 1000);
-        assert!(r.escaped);
-        assert_eq!(r.iter, 0);
+        if let EscapeResult::Escaped { iter, .. } = r {
+            assert_eq!(iter, 0);
+        } else {
+            panic!("c=10 must escape");
+        }
     }
 
     #[test]
     fn smooth_t_is_finite_for_escaped_pixel() {
         let r = escape_time(&MAP, Complex::new(2.0_f64, 0.0), 1000);
-        assert!(r.smooth_t.is_finite(), "smooth_t must be finite");
+        if let EscapeResult::Escaped { smooth_t, .. } = r {
+            assert!(smooth_t.is_finite(), "smooth_t must be finite");
+        } else {
+            panic!("c=2 must escape");
+        }
     }
 
     #[test]
     fn orbit_min_r_tracks_minimum() {
-        // For any escaped point, orbit_min_r should be non-negative and ≤ first z norm.
         let r = escape_time(&MAP, Complex::new(0.5_f64, 0.0), 1000);
-        assert!(r.orbit_min_r >= 0.0);
-        assert!(r.orbit_min_r < f64::MAX);
+        if let EscapeResult::Escaped { orbit_min_r, .. } = r {
+            assert!(orbit_min_r >= 0.0);
+            assert!(orbit_min_r < f64::MAX);
+        } else {
+            panic!("c=0.5 must escape");
+        }
     }
 
-    // ── TilePixel conversion ──────────────────────────────────────────────────
-
-    #[test]
-    fn tile_pixel_escaped_flag_is_one_for_escaped() {
-        let e = EscapeResult {
-            escaped: true,
-            smooth_t: 1.5,
-            orbit_min_r: 0.3,
-            angle_final: 0.7,
-            ..Default::default()
-        };
-        let p = TilePixel::from(e);
-        assert_eq!(p.escaped, 1.0);
-        assert!((p.smooth_t - 1.5_f32).abs() < 1e-6);
-        assert!((p.orbit_min_r - 0.3_f32).abs() < 1e-6);
-    }
-
-    #[test]
-    fn tile_pixel_escaped_flag_is_zero_for_interior() {
-        let e = EscapeResult { escaped: false, ..Default::default() };
-        let p = TilePixel::from(e);
-        assert_eq!(p.escaped, 0.0);
-    }
+    // ── TilePixel ─────────────────────────────────────────────────────────────
 
     #[test]
     fn tile_pixel_is_16_bytes_repr_c() {
@@ -350,9 +474,6 @@ mod tests {
 
     #[test]
     fn render_tile_mixed_interior_and_escaped() {
-        // 4×4 grid: re ∈ [-2, 1] step 1, im ∈ [-1.5, 1.5] step 1
-        // Guaranteed interior: c = 0 + 0i (origin is in Mandelbrot set)
-        // Guaranteed escaped: c = 2 + 0i (escapes on iter 1)
         let coords: Vec<Complex<f64>> = (-2..=1)
             .flat_map(|re| (-2..=1).map(move |im| Complex::new(re as f64, im as f64)))
             .collect();
@@ -367,31 +488,24 @@ mod tests {
 
     #[test]
     fn render_tile_all_escaped_far_exterior() {
-        // All coords far outside the Mandelbrot set (|c| = 10)
-        let coords: Vec<Complex<f64>> = (0..16)
-            .map(|i| Complex::new(10.0 + i as f64, 0.0))
-            .collect();
+        let coords: Vec<Complex<f64>> =
+            (0..16).map(|i| Complex::new(10.0 + i as f64, 0.0)).collect();
         let mut out = vec![TilePixel::default(); coords.len()];
         render_tile_escape(&MAP, &coords, 100, &mut out);
-
-        assert!(
-            out.iter().all(|p| p.escaped == 1.0),
-            "all pixels far outside must be escaped"
-        );
+        assert!(out.iter().all(|p| p.escaped == 1.0));
     }
 
     #[test]
     fn render_tile_output_length_matches_coords() {
         let coords = vec![Complex::new(0.0_f64, 0.0); 64];
         let mut out = vec![TilePixel::default(); 64];
-        render_tile_escape(&MAP, &coords, 50, &mut out); // must not panic
+        render_tile_escape(&MAP, &coords, 50, &mut out);
         assert_eq!(out.len(), 64);
     }
 
     #[test]
     fn render_tile_interior_smooth_t_is_zero() {
-        // Interior pixels must have smooth_t == 0.0
-        let coords = vec![Complex::new(0.0_f64, 0.0)]; // origin, always interior
+        let coords = vec![Complex::new(0.0_f64, 0.0)];
         let mut out = vec![TilePixel::default(); 1];
         render_tile_escape(&MAP, &coords, 100, &mut out);
         assert_eq!(out[0].escaped, 0.0);
@@ -400,10 +514,121 @@ mod tests {
 
     #[test]
     fn render_tile_escaped_smooth_t_is_finite() {
-        let coords = vec![Complex::new(2.0_f64, 0.0)]; // known escaped
+        let coords = vec![Complex::new(2.0_f64, 0.0)];
         let mut out = vec![TilePixel::default(); 1];
         render_tile_escape(&MAP, &coords, 100, &mut out);
         assert_eq!(out[0].escaped, 1.0);
         assert!(out[0].smooth_t.is_finite());
+    }
+
+    // ── PerturbationSupport: MandelbrotMap ────────────────────────────────────
+
+    #[test]
+    fn mandelbrot_glitch_threshold_is_1e_3() {
+        assert_eq!(MAP.glitch_threshold(), 1e-3);
+    }
+
+    #[test]
+    fn mandelbrot_perturb_step_at_zero_ref() {
+        // ref_z = 0, dz = 0, dc = (0.1, 0): dz_next = 0 + 0 + dc = (0.1, 0)
+        let dz = Complex::new(0.0_f64, 0.0);
+        let dc = Complex::new(0.1_f64, 0.0);
+        let ref_z = Complex::new(0.0_f64, 0.0);
+        let result = MAP.perturb_step(dz, dc, ref_z);
+        assert!((result.re - 0.1).abs() < 1e-15);
+        assert!(result.im.abs() < 1e-15);
+    }
+
+    #[test]
+    fn mandelbrot_perturb_step_matches_formula() {
+        // δz_{n+1} = 2·Z_n·δz_n + δz_n² + δc
+        // Z = (1, 0.5), dz = (0.01, 0.02), dc = (0.001, 0.002)
+        let ref_z = Complex::new(1.0_f64, 0.5);
+        let dz = Complex::new(0.01_f64, 0.02);
+        let dc = Complex::new(0.001_f64, 0.002);
+
+        let two_z_dz = 2.0 * ref_z * dz;
+        let dz_sq = dz * dz;
+        let expected = two_z_dz + dz_sq + dc;
+        let result = MAP.perturb_step(dz, dc, ref_z);
+
+        assert!((result.re - expected.re).abs() < 1e-14);
+        assert!((result.im - expected.im).abs() < 1e-14);
+    }
+
+    // ── compute_ref_orbit ─────────────────────────────────────────────────────
+
+    #[test]
+    fn ref_orbit_at_origin_never_escapes() {
+        // c = 0: z stays at 0, never escapes
+        let c = Complex::new(0.0_f64, 0.0);
+        let mut out = vec![Complex::<f64>::zero(); 10];
+        let len = compute_ref_orbit(&MAP, c, 10, &mut out);
+        assert_eq!(len, 10);
+        assert!(out.iter().all(|z| z.re == 0.0 && z.im == 0.0));
+    }
+
+    #[test]
+    fn ref_orbit_c_equals_2_escapes_after_two_entries() {
+        // z_0=0, z_1=2 (not escaped, norm_sq=4 not > 4), z_2=6 (escaped)
+        // out = [0, 2], returns 2
+        let c = Complex::new(2.0_f64, 0.0);
+        let mut out = vec![Complex::<f64>::zero(); 20];
+        let len = compute_ref_orbit(&MAP, c, 20, &mut out);
+        assert_eq!(len, 2);
+        assert_eq!(out[0].re, 0.0);
+        assert_eq!(out[0].im, 0.0);
+        assert_eq!(out[1].re, 2.0);
+        assert_eq!(out[1].im, 0.0);
+    }
+
+    #[test]
+    fn ref_orbit_respects_max_iter() {
+        let c = Complex::new(0.0_f64, 0.0); // never escapes
+        let mut out = vec![Complex::<f64>::zero(); 100];
+        let len = compute_ref_orbit(&MAP, c, 5, &mut out);
+        assert_eq!(len, 5);
+    }
+
+    #[test]
+    fn ref_orbit_respects_output_buffer_len() {
+        let c = Complex::new(0.0_f64, 0.0);
+        let mut out = vec![Complex::<f64>::zero(); 5];
+        let len = compute_ref_orbit(&MAP, c, 100, &mut out);
+        assert_eq!(len, 5);
+    }
+
+    #[test]
+    fn ref_orbit_f64x2_matches_f64_for_simple_point() {
+        // Verify generic dispatch: F64x2 and f64 give identical orbit entries
+        // for a simple escaped point (c = 2 + 0i).
+        let c_f64 = Complex::new(2.0_f64, 0.0);
+        let c_f64x2 = Complex::new(F64x2::from_f64(2.0), F64x2::from_f64(0.0));
+
+        let mut out_f64 = vec![Complex::<f64>::zero(); 20];
+        let mut out_f64x2 = vec![Complex::<f64>::zero(); 20];
+
+        let len_f64 = compute_ref_orbit(&MAP, c_f64, 20, &mut out_f64);
+        let len_f64x2 = compute_ref_orbit(&MAP, c_f64x2, 20, &mut out_f64x2);
+
+        assert_eq!(len_f64, len_f64x2, "orbit lengths must match");
+        for (a, b) in out_f64[..len_f64].iter().zip(out_f64x2[..len_f64x2].iter()) {
+            assert!(
+                (a.re - b.re).abs() < 1e-12 && (a.im - b.im).abs() < 1e-12,
+                "orbit entry mismatch: f64={a:?} f64x2={b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ref_orbit_interior_point_orbit_is_bounded() {
+        // c = -0.5 + 0i is inside the Mandelbrot set; orbit should stay bounded
+        let c = Complex::new(-0.5_f64, 0.0);
+        let mut out = vec![Complex::<f64>::zero(); 200];
+        let len = compute_ref_orbit(&MAP, c, 200, &mut out);
+        assert_eq!(len, 200, "interior orbit should not escape");
+        for z in &out[..len] {
+            assert!(z.re.abs() <= 2.0 + 1e-10 && z.im.abs() <= 2.0 + 1e-10);
+        }
     }
 }
