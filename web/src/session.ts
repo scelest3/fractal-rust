@@ -1,35 +1,54 @@
 /**
- * FractalSession — main-thread orchestrator for Phase 1.
+ * FractalSession — main-thread orchestrator.
  *
  * Responsibilities:
  *  - Own the ZoomPanFSM and wire it to the canvas
  *  - Tile the canvas into 256×256 chunks and dispatch render jobs to workers
+ *  - For zoom_exp > 15: trigger reference orbit computation (Orbit Worker),
+ *    wait for orbit_ready, then dispatch perturbation tiles
+ *  - For zoom_exp ≤ 15: dispatch escape_time tiles directly (no orbit needed)
  *  - Receive completed tiles and upload them to the GL pipeline
  *
- * No WASM runs on the main thread. All computation is in Tile Workers.
- *
- * Worker count: hardwareConcurrency − 2 (min 2, max 8). Each worker owns one
- * SAB slot — worker k always writes to slot k — so N_WORKERS === RING_SLOTS.
- * Workers are independent WASM instances; no shared WASM memory is needed for
- * Phase 1's copy-to-SAB approach. Phase 2 will eliminate the copy.
+ * No WASM runs on the main thread. All computation is in Web Workers.
  */
 import { ZoomPanFSM, DEFAULT_VIEW, pixelToFractal, pixelStep } from "./viewport.ts";
 import { BoxZoom } from "./box-zoom.ts";
 import { GlPipeline } from "./gl-pipeline.ts";
 import { wasmBundleUrl } from "./detect-simd.ts";
 
-/** Minimum iteration budget — enough for a clean render at the default view. */
 const BASE_ITER = 256;
-
-/** Extra iterations per decade of zoom. At zoom_exp=10 this adds 640 → 896 total. */
 const ITER_PER_DECADE = 64;
 const TILE_SIZE = 256;
 const TILE_SLOT_BYTES = TILE_SIZE * TILE_SIZE * 4 * 4; // 1 MiB per slot
 
-// Reserve 2 threads (main + one headroom) and cap at 8 to control SAB size.
+// ── Orbit SAB layout (mirrors wasm-bridge memory-layout constants) ──────────
+//
+// orbitSab holds: [8-byte header] [orbit entries] ... [BLA entries] ...
+// The header is currently unused by TypeScript (orbit_len is passed via message).
+// PRIMARY_ORBIT_ENTRY_BYTES = 32 (max stride, Phoenix), Mandelbrot uses 16.
+// BLA_ENTRY_BYTES = 48.
+
+const ORBIT_HEADER_BYTES = 8;
+const PRIMARY_ORBIT_ENTRY_BYTES = 32;
+const BLA_ENTRY_BYTES = 48;
+const PRIMARY_ORBIT_DATA_OFFSET = ORBIT_HEADER_BYTES; // = 8
+
+/** Covers zoom_exp ≤ 50 with ITER_PER_DECADE=64: max = 256 + 50*64 = 3456. */
+const MAX_ORBIT_ITER = 4096;
+
+function blaTableOffset(maxOrbitIter: number): number {
+  return ORBIT_HEADER_BYTES + maxOrbitIter * PRIMARY_ORBIT_ENTRY_BYTES;
+}
+function orbitSabSize(maxOrbitIter: number): number {
+  return blaTableOffset(maxOrbitIter) + maxOrbitIter * BLA_ENTRY_BYTES;
+}
+
+/** Zoom depth at which the perturbation path is engaged. */
+const PERTURB_ZOOM_THRESHOLD = 15;
+
+// Workers: N_TILE_WORKERS tile workers + 1 orbit worker.
 const N_WORKERS = Math.max(2, Math.min(8, (navigator.hardwareConcurrency ?? 4) - 2));
-// One slot per worker: worker k always writes to slot k.
-const RING_SLOTS = N_WORKERS;
+const RING_SLOTS = N_WORKERS; // worker k → slot k
 
 interface TileDesc {
   deltaRe: number;
@@ -40,11 +59,16 @@ interface TileDesc {
   tileY: number;
   slotIndex: number;
   generation: number;
+  usePerturb: boolean;
 }
 
 type WorkerInMsg =
   | { type: "init_done"; lut: Float32Array }
   | { type: "tile_ready"; slotIndex: number; tileX: number; tileY: number; generation: number };
+
+type OrbitWorkerInMsg =
+  | { type: "orbit_worker_ready" }
+  | { type: "orbit_ready"; ref_orbit_id: number; orbit_len: number };
 
 function makeOverlay(): HTMLElement {
   const el = document.createElement("div");
@@ -64,24 +88,30 @@ export class FractalSession {
   private readonly gl: GlPipeline;
   private readonly workers: Worker[];
   private readonly tileSab: SharedArrayBuffer;
+  private readonly orbitSab: SharedArrayBuffer;
+  private readonly orbitWorker: Worker;
+  private readonly overlay: HTMLElement;
 
-  // Tracks workers that have been dispatched a tile and haven't yet responded.
-  // A worker is removed from this set when any tile_ready arrives from it,
-  // regardless of generation — the worker is genuinely idle at that point.
   private readonly busyWorkers = new Set<number>();
-
   private workerInitCount = 0;
+  private orbitWorkerReady = false;
+
   private pendingTiles: TileDesc[] = [];
   private generation = 0;
   private lutReady = false;
   private tilesThisGen = 0;
   private tilesDrawnThisGen = 0;
   private dispatchDebounceId: ReturnType<typeof setTimeout> | null = null;
-  private readonly overlay: HTMLElement;
+
+  // Orbit state
+  private currentOrbitId = 0;
+  private orbitReady = false;
+  private pendingOrbitDispatch = false; // waiting for orbit_ready before dispatching
 
   constructor(canvas: HTMLCanvasElement) {
     this.overlay = makeOverlay();
     this.tileSab = new SharedArrayBuffer(RING_SLOTS * TILE_SLOT_BYTES);
+    this.orbitSab = new SharedArrayBuffer(orbitSabSize(MAX_ORBIT_ITER));
     this.gl = new GlPipeline(canvas);
 
     this.fsm = new ZoomPanFSM(DEFAULT_VIEW, {
@@ -100,19 +130,70 @@ export class FractalSession {
     });
 
     const wasmUrl = wasmBundleUrl();
+
+    // Orbit Worker — one dedicated worker for BigFloat reference orbit computation.
+    this.orbitWorker = new Worker(
+      new URL("./orbit-worker.ts", import.meta.url),
+      { type: "module" },
+    );
+    this.orbitWorker.onerror = (e) => console.error("[FractalSession] orbit worker error", e);
+    this.orbitWorker.onmessage = (e: MessageEvent<OrbitWorkerInMsg>) =>
+      this.onOrbitWorkerMessage(e.data);
+    this.orbitWorker.postMessage({
+      type: "orbit_init",
+      wasmUrl,
+      orbitSab: this.orbitSab,
+      primaryOrbitDataOffset: PRIMARY_ORBIT_DATA_OFFSET,
+      blaTableOffset: blaTableOffset(MAX_ORBIT_ITER),
+    });
+
+    // Tile Workers.
     this.workers = Array.from({ length: N_WORKERS }, (_, i) => {
       const w = new Worker(new URL("./tile-worker.ts", import.meta.url), { type: "module" });
-      w.onerror = (e) => console.error(`[FractalSession] worker ${i} error`, e);
+      w.onerror = (e) => console.error(`[FractalSession] tile worker ${i} error`, e);
       w.onmessage = (e: MessageEvent<WorkerInMsg>) => this.onWorkerMessage(i, e.data);
-      w.postMessage({ type: "init", wasmUrl, tileSab: this.tileSab });
+      w.postMessage({
+        type: "init",
+        wasmUrl,
+        tileSab: this.tileSab,
+        orbitSab: this.orbitSab,
+        primaryOrbitDataOffset: PRIMARY_ORBIT_DATA_OFFSET,
+        blaTableOffset: blaTableOffset(MAX_ORBIT_ITER),
+      });
       return w;
     });
   }
 
+  private onOrbitWorkerMessage(msg: OrbitWorkerInMsg): void {
+    if (msg.type === "orbit_worker_ready") {
+      this.orbitWorkerReady = true;
+      // If a dispatch is waiting for the orbit worker to be ready, retry.
+      if (this.pendingOrbitDispatch) this.scheduleDispatch();
+    } else if (msg.type === "orbit_ready") {
+      this.onOrbitReady(msg.ref_orbit_id, msg.orbit_len);
+    }
+  }
+
+  private onOrbitReady(ref_orbit_id: number, orbit_len: number): void {
+    if (ref_orbit_id !== this.currentOrbitId) return; // Stale — a newer orbit was requested.
+
+    this.orbitReady = true;
+    this.pendingOrbitDispatch = false;
+
+    // Forward to all Tile Workers (ordered before subsequent render_tile messages).
+    const orbitMsg = {
+      type: "orbit_ready",
+      primaryOrbitDataOffset: PRIMARY_ORBIT_DATA_OFFSET,
+      blaTableOffset: blaTableOffset(MAX_ORBIT_ITER),
+      orbit_len,
+    };
+    for (const w of this.workers) w.postMessage(orbitMsg);
+
+    this.scheduleDispatch();
+  }
+
   private onWorkerMessage(workerIndex: number, msg: WorkerInMsg): void {
     if (msg.type === "init_done") {
-      // Upload LUT from the first worker that reports in; all workers produce
-      // identical LUTs so subsequent ones are discarded.
       if (this.workerInitCount === 0) this.gl.uploadLut(msg.lut);
       this.workerInitCount++;
       if (this.workerInitCount === N_WORKERS) {
@@ -127,11 +208,12 @@ export class FractalSession {
   private updateOverlay(): void {
     const v = this.fsm.getView();
     const state = this.fsm.getState();
+    const mode = v.zoom_exp > PERTURB_ZOOM_THRESHOLD ? "perturb" : "escape_time";
     this.overlay.innerHTML =
-      `state: ${state}<br>` +
+      `state: ${state} [${mode}]<br>` +
       `cx: ${parseFloat(v.cx).toFixed(8)}<br>` +
       `cy: ${parseFloat(v.cy).toFixed(8)}<br>` +
-      `zoom: 10^${v.zoom_exp.toFixed(3)} (${Math.round(Math.pow(10, v.zoom_exp))}×)<br>` +
+      `zoom: 10^${v.zoom_exp.toFixed(3)}<br>` +
       `gen: ${this.generation} | workers: ${N_WORKERS}`;
   }
 
@@ -147,16 +229,55 @@ export class FractalSession {
   private scheduleDispatch(): void {
     if (!this.lutReady) return;
 
+    const view = this.fsm.getView();
+    const usePerturb = view.zoom_exp > PERTURB_ZOOM_THRESHOLD;
+
+    if (usePerturb) {
+      if (!this.orbitWorkerReady) {
+        // Orbit worker still initialising; retry when it's ready.
+        this.pendingOrbitDispatch = true;
+        return;
+      }
+      if (!this.orbitReady) {
+        // Request a new orbit if we haven't already for this generation.
+        if (!this.pendingOrbitDispatch) {
+          this.pendingOrbitDispatch = true;
+          this.orbitReady = false;
+          this.currentOrbitId++;
+          const maxIter = this.computeMaxIter(view.zoom_exp);
+          this.orbitWorker.postMessage({
+            type: "compute_orbit",
+            cx: view.cx,
+            cy: view.cy,
+            zoom_exp: view.zoom_exp,
+            max_iter: maxIter,
+            ref_orbit_id: this.currentOrbitId,
+          });
+        }
+        return; // Tiles dispatched after orbit_ready arrives.
+      }
+    } else {
+      // Escape-time path: no orbit needed; reset orbit state.
+      this.orbitReady = false;
+      this.pendingOrbitDispatch = false;
+    }
+
+    this.dispatchGeneration(view, usePerturb);
+  }
+
+  private dispatchGeneration(
+    view: { cx: string; cy: string; zoom_exp: number },
+    usePerturb: boolean,
+  ): void {
     this.generation++;
     const gen = this.generation;
     this.pendingTiles = [];
 
-    const view = this.fsm.getView();
     const canvas = this.gl.canvas;
     const W = canvas.width as number;
     const H = canvas.height as number;
     const step = pixelStep(view.zoom_exp, H);
-    const maxIter = Math.max(BASE_ITER, Math.round(BASE_ITER + Math.max(0, view.zoom_exp) * ITER_PER_DECADE));
+    const maxIter = this.computeMaxIter(view.zoom_exp);
     const tilesX = Math.ceil(W / TILE_SIZE);
     const tilesY = Math.ceil(H / TILE_SIZE);
 
@@ -166,18 +287,27 @@ export class FractalSession {
 
     for (let ty = 0; ty < tilesY; ty++) {
       for (let tx = 0; tx < tilesX; tx++) {
-        const { fx: deltaRe, fy: deltaIm } = pixelToFractal(
-          tx * TILE_SIZE,
-          ty * TILE_SIZE,
-          view,
-          W,
-          H,
-        );
+        let deltaRe: number;
+        let deltaIm: number;
+
+        if (usePerturb) {
+          // Perturbation: delta from reference (viewport center).
+          // Computed as integer_offset × step — no catastrophic cancellation.
+          deltaRe = (tx * TILE_SIZE - W / 2) * step;
+          deltaIm = (ty * TILE_SIZE - H / 2) * step;
+        } else {
+          // Escape-time: absolute fractal coords of tile top-left.
+          const { fx, fy } = pixelToFractal(tx * TILE_SIZE, ty * TILE_SIZE, view, W, H);
+          deltaRe = fx;
+          deltaIm = fy;
+        }
+
         this.pendingTiles.push({
           deltaRe, deltaIm, step, maxIter,
           tileX: tx, tileY: ty,
           slotIndex: 0, // overwritten by dispatchPending
           generation: gen,
+          usePerturb,
         });
       }
     }
@@ -185,12 +315,16 @@ export class FractalSession {
     this.dispatchPending();
   }
 
+  private computeMaxIter(zoom_exp: number): number {
+    return Math.max(BASE_ITER, Math.round(BASE_ITER + Math.max(0, zoom_exp) * ITER_PER_DECADE));
+  }
+
   private dispatchPending(): void {
     for (let i = 0; i < this.workers.length; i++) {
       if (this.pendingTiles.length === 0) break;
       if (this.busyWorkers.has(i)) continue;
       const tile = this.pendingTiles.shift()!;
-      tile.slotIndex = i; // worker i owns slot i
+      tile.slotIndex = i;
       this.busyWorkers.add(i);
       this.workers[i].postMessage({ type: "render_tile", ...tile });
     }
@@ -200,11 +334,9 @@ export class FractalSession {
     workerIndex: number,
     msg: { slotIndex: number; tileX: number; tileY: number; generation: number },
   ): void {
-    // Worker is idle regardless of generation — unblock it before anything else.
     this.busyWorkers.delete(workerIndex);
 
     if (msg.generation !== this.generation) {
-      // Stale completion from a previous generation; give the worker new work.
       this.dispatchPending();
       return;
     }

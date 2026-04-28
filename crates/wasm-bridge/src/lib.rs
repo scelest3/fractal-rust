@@ -2,6 +2,7 @@
 //!
 //! Exposes a small, stable Worker-facing API. Contains no math; all logic
 //! lives in the inner crates. Full implementation across Phases 0–5.
+use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 
 // ── Memory layout constants ────────────────────────────────────────────────
@@ -262,4 +263,163 @@ pub fn render_tile(job: &TileJob, layout: &MemoryLayout) -> TileResult {
     // Worker verified the slot is EMPTY before calling and holds WRITING state.
     let out = unsafe { core::slice::from_raw_parts_mut(ptr, TILE_PIXELS) };
     render_tile_impl(job, out)
+}
+
+// ── Phase 2: reference orbit + perturbation rendering ─────────────────────
+
+// Thread-local storage shared between the orbit-compute path (Orbit Worker)
+// and the perturbation-render path (Tile Workers). Each WASM instance — one
+// per Web Worker — has its own copy, so no cross-worker contention.
+thread_local! {
+    static ORBIT: RefCell<Vec<arith::Complex<f64>>> = const { RefCell::new(Vec::new()) };
+    static BLA:   RefCell<Vec<kernel::BlaEntry>>    = const { RefCell::new(Vec::new()) };
+}
+
+/// Compute the reference orbit and BLA table for a deep-zoom render.
+///
+/// Selects `BigFloat<N>` precision via `required_limbs(zoom_exp)`, parses
+/// `cx`/`cy` as BigDecimal strings, runs `kernel::compute_ref_orbit`, then
+/// `kernel::build_bla_table`. Results are stored in thread-local buffers;
+/// read them with `orbit_data_ptr` / `orbit_data_len` / `bla_data_ptr`.
+///
+/// Called by the Orbit Worker after each zoom-settle event.
+#[wasm_bindgen]
+pub fn compute_reference_orbit(cx: &str, cy: &str, zoom_exp: f64, max_iter: u32) {
+    let (orbit, bla) = match arith::required_limbs(zoom_exp) {
+        n if n <= 2 => orbit_inner::<2>(cx, cy, max_iter),
+        n if n <= 4 => orbit_inner::<4>(cx, cy, max_iter),
+        n if n <= 8 => orbit_inner::<8>(cx, cy, max_iter),
+        n => panic!("required_limbs={n} exceeds Phase 2 max (N=8); zoom_exp={zoom_exp}"),
+    };
+    ORBIT.with(|o| *o.borrow_mut() = orbit);
+    BLA.with(|b| *b.borrow_mut() = bla);
+}
+
+fn orbit_inner<const N: usize>(
+    cx: &str,
+    cy: &str,
+    max_iter: u32,
+) -> (Vec<arith::Complex<f64>>, Vec<kernel::BlaEntry>) {
+    let c = arith::Complex::new(
+        arith::BigFloat::<N>::from_decimal_str(cx).unwrap_or_default(),
+        arith::BigFloat::<N>::from_decimal_str(cy).unwrap_or_default(),
+    );
+    let mut buf = vec![arith::Complex::<f64>::zero(); max_iter as usize];
+    let orbit_len = kernel::compute_ref_orbit(&kernel::MandelbrotMap, c, max_iter, &mut buf);
+    let orbit = buf[..orbit_len].to_vec();
+    let bla = kernel::build_bla_table(&orbit);
+    (orbit, bla)
+}
+
+/// Byte offset of the orbit buffer in WASM linear memory.
+/// Valid immediately after `compute_reference_orbit` returns.
+#[wasm_bindgen]
+pub fn orbit_data_ptr() -> u32 {
+    ORBIT.with(|o| o.borrow().as_ptr() as u32)
+}
+
+/// Number of `Complex<f64>` entries in the orbit (= valid iteration steps).
+#[wasm_bindgen]
+pub fn orbit_data_len() -> u32 {
+    ORBIT.with(|o| o.borrow().len() as u32)
+}
+
+/// Byte offset of the BLA table in WASM linear memory.
+/// Length = `orbit_data_len() * 48` (one `BlaEntry` per orbit step).
+#[wasm_bindgen]
+pub fn bla_data_ptr() -> u32 {
+    BLA.with(|b| b.borrow().as_ptr() as u32)
+}
+
+/// Install a reference orbit and BLA table into WASM thread-local storage.
+///
+/// Called by Tile Workers when they receive an `orbit_ready` message.
+/// `orbit_f64` is a flat `[re₀, im₀, re₁, im₁, …]` array (2 f64 per entry).
+/// `bla_bytes` is the raw byte representation of `BlaEntry` structs (48 B each).
+///
+/// This copy (from orbitSab → WASM heap) happens once per orbit change,
+/// not once per tile render.
+#[wasm_bindgen]
+pub fn install_orbit(orbit_f64: &[f64], bla_bytes: &[u8]) {
+    let orbit: Vec<arith::Complex<f64>> = orbit_f64
+        .chunks_exact(2)
+        .map(|c| arith::Complex::new(c[0], c[1]))
+        .collect();
+
+    let entry_size = core::mem::size_of::<kernel::BlaEntry>(); // 48
+    let bla_len = bla_bytes.len() / entry_size;
+    let mut bla = vec![kernel::BlaEntry::default(); bla_len];
+    if bla_len > 0 {
+        // SAFETY: BlaEntry is repr(C); bytes originate from the same Rust build
+        // running in the Orbit Worker's WASM instance. We write into a properly
+        // aligned Vec allocation via copy_nonoverlapping (source alignment unconstrained).
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bla_bytes.as_ptr(),
+                bla.as_mut_ptr() as *mut u8,
+                bla_len * entry_size,
+            );
+        }
+    }
+
+    ORBIT.with(|o| *o.borrow_mut() = orbit);
+    BLA.with(|b| *b.borrow_mut() = bla);
+}
+
+/// Render a 256×256 perturbation tile using the installed reference orbit.
+///
+/// `delta_re` / `delta_im` are the fractal offsets of the tile's top-left
+/// pixel from the reference point (viewport center), computed as
+/// `(tile_pixel_x − W/2) × pixel_step`. This avoids catastrophic cancellation
+/// at deep zoom — the delta is computed from a small integer × tiny step,
+/// never as a difference of two large nearby f64 values.
+///
+/// `out_ptr` must be a buffer returned by `alloc_tile_buf()`. Glitched pixels
+/// (Phase 2: no secondary orbit yet) are written as `TilePixel::default()`.
+/// Returns the number of glitched pixels.
+#[wasm_bindgen]
+pub fn render_tile_perturb(
+    delta_re: f64,
+    delta_im: f64,
+    pixel_step: f64,
+    max_iter: u32,
+    out_ptr: u32,
+) -> u32 {
+    ORBIT.with(|orbit_cell| {
+        BLA.with(|bla_cell| {
+            let orbit = orbit_cell.borrow();
+            let bla = bla_cell.borrow();
+            if orbit.is_empty() {
+                return 0;
+            }
+            // Safety: out_ptr is from alloc_tile_buf() — a valid TILE_PIXELS-sized heap buffer.
+            let out = unsafe {
+                core::slice::from_raw_parts_mut(out_ptr as *mut kernel::TilePixel, TILE_PIXELS)
+            };
+            let mut glitch_count = 0u32;
+            for row in 0..TILE_SIZE {
+                for col in 0..TILE_SIZE {
+                    let dc = arith::DeltaC::new(
+                        delta_re + col as f64 * pixel_step,
+                        delta_im + row as f64 * pixel_step,
+                    );
+                    let result = kernel::perturb_pixel(
+                        &kernel::MandelbrotMap,
+                        &orbit,
+                        &bla,
+                        dc,
+                        max_iter,
+                    );
+                    out[row * TILE_SIZE + col] = match result {
+                        kernel::EscapeResult::Glitched => {
+                            glitch_count += 1;
+                            kernel::TilePixel::default() // corrected in Issue #22
+                        }
+                        other => kernel::TilePixel::from(other),
+                    };
+                }
+            }
+            glitch_count
+        })
+    })
 }

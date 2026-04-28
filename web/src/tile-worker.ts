@@ -1,23 +1,43 @@
+// Force ES module scope (prevents global variable collisions with other worker files).
+export {};
+
 /**
  * Tile Worker — runs in a Web Worker thread.
  *
- * Handles two message types:
- *   init        — load WASM, build LUT, signal main thread
- *   render_tile — render one 256×256 tile into a WASM heap buffer,
- *                 copy into the shared SAB slot, signal main thread
+ * Handles three message types:
+ *   init        — load WASM, receive SABs, build LUT, signal main thread
+ *   orbit_ready — copy orbit + BLA from orbitSab into WASM heap via install_orbit
+ *   render_tile — render one 256×256 tile (escape_time or perturbation path),
+ *                 copy into the shared tileSab slot, signal main thread
  *
- * Phase 1 memory model: WASM writes into its own heap (alloc_tile_buf),
- * then we copy once into the SharedArrayBuffer. Phase 2 will eliminate
- * the copy by compiling with -Z build-std so wasm-bindgen accepts an
- * injected SharedArrayBuffer as WASM linear memory.
+ * Perturbation path (zoom_exp > 15):
+ *   delta_re / delta_im are offsets from the reference point (viewport center),
+ *   computed as (tile_pixel - W/2) × pixel_step. The WASM uses the pre-installed
+ *   orbit to call perturb_pixel per pixel.
+ *
+ * Phase 2 memory model: WASM writes into its own heap (alloc_tile_buf), then we
+ * copy once into the shared tileSab slot. Phase 3 will eliminate the copy when
+ * -Z build-std lands and wasm-bindgen can accept an injected SharedArrayBuffer.
  */
 
 const TILE_SLOT_BYTES = 256 * 256 * 4 * 4; // 1 MiB per slot
+const COMPLEX_F64_BYTES = 16;               // sizeof(Complex<f64>)
+const BLA_ENTRY_BYTES = 48;                 // sizeof(BlaEntry)
 
 interface InitMsg {
   type: "init";
   wasmUrl: string;
   tileSab: SharedArrayBuffer;
+  orbitSab: SharedArrayBuffer;
+  primaryOrbitDataOffset: number;
+  blaTableOffset: number;
+}
+
+interface OrbitReadyMsg {
+  type: "orbit_ready";
+  primaryOrbitDataOffset: number;
+  blaTableOffset: number;
+  orbit_len: number;
 }
 
 interface RenderTileMsg {
@@ -30,11 +50,11 @@ interface RenderTileMsg {
   tileX: number;
   tileY: number;
   generation: number;
+  usePerturb: boolean;
 }
 
-type WorkerMsg = InitMsg | RenderTileMsg;
+type WorkerMsg = InitMsg | OrbitReadyMsg | RenderTileMsg;
 
-// Raw WASM instance exports (alloc/free/render are primitive-typed, available on InitOutput).
 interface WasmExports {
   memory: WebAssembly.Memory;
   alloc_tile_buf: () => number;
@@ -46,21 +66,33 @@ interface WasmExports {
     maxIter: number,
     ptr: number,
   ) => void;
+  render_tile_perturb: (
+    deltaRe: number,
+    deltaIm: number,
+    pixelStep: number,
+    maxIter: number,
+    ptr: number,
+  ) => number; // returns glitch count
 }
 
-// build_lut returns a boxed slice and lives on the JS glue module, not on InitOutput.
 interface WasmGlue {
   build_lut: (palette: null) => Float32Array;
+  install_orbit: (orbitF64: Float64Array, blaBytes: Uint8Array) => void;
 }
 
 let wasm: WasmExports | null = null;
 let glueModule: WasmGlue | null = null;
 let tileSab: SharedArrayBuffer | null = null;
+let orbitSab: SharedArrayBuffer | null = null;
+let primaryOrbitDataOffset = 0;
+let blaTableOffset = 0;
 
 self.onmessage = async (event: MessageEvent<WorkerMsg>) => {
   const msg = event.data;
   if (msg.type === "init") {
     await handleInit(msg);
+  } else if (msg.type === "orbit_ready") {
+    handleOrbitReady(msg);
   } else if (msg.type === "render_tile") {
     handleRenderTile(msg);
   }
@@ -68,18 +100,38 @@ self.onmessage = async (event: MessageEvent<WorkerMsg>) => {
 
 async function handleInit(msg: InitMsg): Promise<void> {
   tileSab = msg.tileSab;
+  orbitSab = msg.orbitSab;
+  primaryOrbitDataOffset = msg.primaryOrbitDataOffset;
+  blaTableOffset = msg.blaTableOffset;
 
   const glueUrl = msg.wasmUrl.replace("_bg.wasm", ".js");
   const glue = await import(/* @vite-ignore */ glueUrl);
   wasm = (await glue.default({ module_or_path: msg.wasmUrl })) as WasmExports;
   glueModule = glue as WasmGlue;
 
-  // build_lut is a JS glue wrapper (handles boxed-slice memory), not a raw
-  // WASM export — call it on the glue module, not on the InitOutput object.
   const lutView = glueModule.build_lut(null);
   const lut = new Float32Array(lutView);
 
   (self as unknown as Worker).postMessage({ type: "init_done", lut });
+}
+
+function handleOrbitReady(msg: OrbitReadyMsg): void {
+  if (!wasm || !glueModule || !orbitSab) return;
+
+  const { orbit_len } = msg;
+
+  // Copy orbit from orbitSab (SharedArrayBuffer) into a regular ArrayBuffer,
+  // then pass to WASM. wasm-bindgen cannot accept SAB-backed typed arrays.
+  const orbitByteCount = orbit_len * COMPLEX_F64_BYTES;
+  const orbitLocal = new Uint8Array(orbitByteCount);
+  orbitLocal.set(new Uint8Array(orbitSab, primaryOrbitDataOffset, orbitByteCount));
+  const orbitF64 = new Float64Array(orbitLocal.buffer);
+
+  const blaByteCount = orbit_len * BLA_ENTRY_BYTES;
+  const blaLocal = new Uint8Array(blaByteCount);
+  blaLocal.set(new Uint8Array(orbitSab, blaTableOffset, blaByteCount));
+
+  glueModule.install_orbit(orbitF64, blaLocal);
 }
 
 function handleRenderTile(msg: RenderTileMsg): void {
@@ -88,13 +140,18 @@ function handleRenderTile(msg: RenderTileMsg): void {
     return;
   }
 
-  const { deltaRe, deltaIm, step, slotIndex, tileX, tileY, generation } = msg;
+  const { deltaRe, deltaIm, step, slotIndex, tileX, tileY, generation, usePerturb } = msg;
   const maxIter = msg.maxIter ?? 256;
 
   const ptr = wasm.alloc_tile_buf();
-  wasm.render_tile_to_ptr(deltaRe, deltaIm, step, maxIter, ptr);
 
-  // Copy WASM heap → SAB slot. Re-read memory.buffer in case WASM grew.
+  if (usePerturb) {
+    wasm.render_tile_perturb(deltaRe, deltaIm, step, maxIter, ptr);
+  } else {
+    wasm.render_tile_to_ptr(deltaRe, deltaIm, step, maxIter, ptr);
+  }
+
+  // Copy WASM heap → tileSab slot. Re-read memory.buffer in case WASM grew.
   const byteOffset = slotIndex * TILE_SLOT_BYTES;
   new Uint8Array(tileSab, byteOffset, TILE_SLOT_BYTES).set(
     new Uint8Array(wasm.memory.buffer, ptr, TILE_SLOT_BYTES),
