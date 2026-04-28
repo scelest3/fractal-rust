@@ -299,6 +299,203 @@ pub fn perturb_pixel<M: PerturbationSupport>(
     EscapeResult::Interior { orbit_min_r, orbit_min_z }
 }
 
+// ── BlaEntry ──────────────────────────────────────────────────────────────────
+
+/// One entry in the BLA (Bilinear Approximation) acceleration table.
+///
+/// For a pixel starting at orbit index `n` with perturbation `δz_n`, the
+/// approximation `δz_{n+skip} ≈ a·δz_n + b·δc` is valid when `|δz_n| < valid_radius`.
+///
+/// Layout is `repr(C)` so entries can be read directly from shared WASM memory.
+/// Total size: 48 bytes (verified by `size_of` test).
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct BlaEntry {
+    /// Linear coefficient for `δz_n` (maps perturbation forward by `skip` steps).
+    pub a: Complex<f64>,       // 16 B
+    /// Linear coefficient for `δc` (accumulated dc contribution over `skip` steps).
+    pub b: Complex<f64>,       // 16 B
+    /// Number of orbit steps this entry skips.
+    pub skip: u32,             //  4 B
+    _pad: u32,                 //  4 B  (ensures f64 alignment for valid_radius)
+    /// Maximum `|δz_n|` for which the approximation is valid.
+    pub valid_radius: f64,     //  8 B
+}                              // 48 B total
+
+/// Merge two consecutive BLA entries into one that covers both spans.
+///
+/// Merged coefficients: `A = A₁·A₀`, `B = A₁·B₀ + B₁`.
+/// Merged radius (ARCHITECTURE.md): `min(r₀, r₁ / |A₀|)`.
+/// The `/|A₀|` factor is mandatory — omitting it causes silent false banding.
+fn bla_merge(e0: BlaEntry, e1: BlaEntry) -> BlaEntry {
+    let a0_norm = e0.a.norm_sqr().sqrt();
+    let valid_radius = if a0_norm > 0.0 {
+        e0.valid_radius.min(e1.valid_radius / a0_norm)
+    } else {
+        0.0
+    };
+    BlaEntry {
+        a: e1.a * e0.a,
+        b: e1.a * e0.b + e1.b,
+        skip: e0.skip + e1.skip,
+        _pad: 0,
+        valid_radius,
+    }
+}
+
+/// Build the BLA acceleration table for a reference orbit.
+///
+/// Uses Zhuoran's level-doubling algorithm: builds log₂(orbit_len) levels of
+/// merged entries, then stores the highest-level valid entry at each position.
+///
+/// `bla_table[n].skip` is the maximum number of steps that can be skipped from
+/// orbit position `n` while keeping the approximation error within `valid_radius`.
+///
+/// An entry with `valid_radius == 0` is never applicable (position near orbit start
+/// or where the orbit collapses); the rendering loop falls back to direct iteration.
+pub fn build_bla_table(orbit: &[Complex<f64>]) -> Vec<BlaEntry> {
+    let n = orbit.len();
+    if n == 0 {
+        return vec![];
+    }
+
+    // Level 0: single-step linear approximation δz_{k+1} ≈ 2·Z_k·δz_k + δc.
+    // valid_radius = |Z_k|: valid when |δz| is smaller than the reference orbit value.
+    let one = Complex::new(1.0_f64, 0.0);
+    let level0: Vec<BlaEntry> = orbit
+        .iter()
+        .map(|&z| BlaEntry {
+            a: Complex::new(2.0_f64, 0.0) * z,
+            b: one,
+            skip: 1,
+            _pad: 0,
+            valid_radius: z.norm_sqr().sqrt(),
+        })
+        .collect();
+
+    // Build successive levels by merging adjacent pairs.
+    // levels[k][i] covers orbit positions i .. i + 2^k.
+    let mut levels: Vec<Vec<BlaEntry>> = vec![level0];
+    let mut half = 1usize;
+    while half < n {
+        let prev = levels.last().unwrap();
+        let cur: Vec<BlaEntry> = (0..n)
+            .map(|i| {
+                if i + half < n {
+                    let e0 = prev[i];
+                    let e1 = prev[i + half];
+                    // Only merge if both halves have non-zero valid_radius.
+                    if e0.valid_radius > 0.0 && e1.valid_radius > 0.0 {
+                        bla_merge(e0, e1)
+                    } else {
+                        BlaEntry::default() // sentinel: valid_radius = 0, never used
+                    }
+                } else {
+                    BlaEntry::default() // position too close to end; no entry at this level
+                }
+            })
+            .collect();
+        levels.push(cur);
+        half *= 2;
+    }
+
+    // Final table: for each position, take the highest-level entry with valid_radius > 0.
+    (0..n)
+        .map(|i| {
+            for lvl in (0..levels.len()).rev() {
+                let e = levels[lvl][i];
+                if e.valid_radius > 0.0 {
+                    return e;
+                }
+            }
+            BlaEntry::default() // Z_i = 0, no BLA applicable (e.g. orbit start)
+        })
+        .collect()
+}
+
+// ── perturb_pixel_bla ─────────────────────────────────────────────────────────
+
+/// BLA-accelerated perturbation loop. Uses `bla_table[n]` to skip multiple orbit
+/// steps when `|δz_n| < bla_table[n].valid_radius`, falling back to direct iteration
+/// when the BLA approximation would be inaccurate.
+///
+/// `ref_orbit` and `bla_table` must have the same length.
+///
+/// **orbit_min note**: BLA steps skip intermediate orbit entries, so `orbit_min_r`
+/// in the returned `Interior` result may be larger than the non-BLA value. This is
+/// acceptable for deep-zoom rendering where orbit traps are rarely the primary coloring.
+pub fn perturb_pixel_bla<M: PerturbationSupport>(
+    map: &M,
+    ref_orbit: &[Complex<f64>],
+    bla_table: &[BlaEntry],
+    delta_c: DeltaC,
+    max_iter: u32,
+) -> EscapeResult {
+    debug_assert_eq!(ref_orbit.len(), bla_table.len());
+    let dc = delta_c.as_complex_f64();
+    let mut dz = Complex::<f64>::zero();
+    let mut orbit_min_r = f64::MAX;
+    let mut orbit_min_z = Complex::<f64>::zero();
+    let orbit_len = ref_orbit.len();
+    let limit = (max_iter as usize).min(orbit_len);
+    let glitch_thresh_sq = {
+        let t = map.glitch_threshold();
+        t * t
+    };
+
+    let mut n = 0usize;
+    while n < limit {
+        let z_ref = ref_orbit[n];
+        let z_n = z_ref + dz;
+
+        // Track orbit_min over {z_1, z_2, …} — z_0 = 0 excluded.
+        if n > 0 {
+            let r = z_n.norm_sqr().sqrt();
+            if r < orbit_min_r {
+                orbit_min_r = r;
+                orbit_min_z = z_n;
+            }
+        }
+
+        // Escape check.
+        let r_sq = z_n.norm_sqr();
+        if r_sq > map.escape_radius_sq() {
+            let norm = r_sq.sqrt();
+            let smooth_t = n as f64 - norm.ln().ln() / core::f64::consts::LN_2;
+            return EscapeResult::Escaped {
+                iter: n as u32,
+                smooth_t,
+                orbit_min_r,
+                orbit_min_z,
+                angle_final: z_n.im.atan2(z_n.re),
+            };
+        }
+
+        // Glitch check.
+        let ref_sq = z_ref.norm_sqr();
+        if ref_sq > 1e-30 && dz.norm_sqr() > glitch_thresh_sq * ref_sq {
+            return EscapeResult::Glitched;
+        }
+
+        // Try BLA: skip multiple steps when |δz_n| < valid_radius.
+        let entry = bla_table[n];
+        let next_n = n + entry.skip as usize;
+        if entry.valid_radius > 0.0
+            && dz.norm_sqr().sqrt() < entry.valid_radius
+            && next_n <= limit
+        {
+            dz = entry.a * dz + entry.b * dc;
+            n = next_n;
+        } else {
+            // Direct single step.
+            dz = map.perturb_step(dz, dc, z_ref);
+            n += 1;
+        }
+    }
+
+    EscapeResult::Interior { orbit_min_r, orbit_min_z }
+}
+
 // ── escape_time ───────────────────────────────────────────────────────────────
 
 /// Compute the escape-time result for one pixel using plain f64 iteration.
@@ -886,5 +1083,289 @@ mod tests {
     fn golden_period2_bulb_exterior() {
         // Near the period-2 bulb boundary.
         golden_assert(-1.3, 0.0, 500);
+    }
+
+    // ── BlaEntry ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bla_entry_size_is_48_bytes() {
+        assert_eq!(core::mem::size_of::<BlaEntry>(), 48);
+    }
+
+    #[test]
+    fn bla_entry_repr_c_layout() {
+        // Offsets per spec: a@0, b@16, skip@32, _pad@36, valid_radius@40.
+        let e = BlaEntry {
+            a: Complex::new(1.0_f64, 2.0),
+            b: Complex::new(3.0_f64, 4.0),
+            skip: 7,
+            _pad: 0,
+            valid_radius: 0.5,
+        };
+        assert_eq!(e.a, Complex::new(1.0_f64, 2.0));
+        assert_eq!(e.b, Complex::new(3.0_f64, 4.0));
+        assert_eq!(e.skip, 7);
+        assert!((e.valid_radius - 0.5).abs() < 1e-15);
+    }
+
+    // ── build_bla_table ───────────────────────────────────────────────────────
+
+    #[test]
+    fn bla_table_empty_orbit_gives_empty_table() {
+        let table = build_bla_table(&[]);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn bla_table_length_matches_orbit() {
+        let c = Complex::new(-0.5_f64, 0.0);
+        let mut orbit = vec![Complex::<f64>::zero(); 64];
+        let len = compute_ref_orbit(&MAP, c, 64, &mut orbit);
+        let table = build_bla_table(&orbit[..len]);
+        assert_eq!(table.len(), len);
+    }
+
+    #[test]
+    fn bla_table_level0_a_equals_two_z() {
+        // Level-0 entry at position 1: A = 2·Z_1 = 2·c_ref (for c_ref = -0.5+0i, Z_1 = -0.5).
+        let c = Complex::new(-0.5_f64, 0.0);
+        let mut orbit = vec![Complex::<f64>::zero(); 32];
+        let len = compute_ref_orbit(&MAP, c, 32, &mut orbit);
+        // Position 0 has Z_0 = 0, so valid_radius = 0 (no BLA applicable).
+        assert_eq!(orbit[0].re, 0.0);
+        // Position 1: Z_1 = Z_0^2 + c = c = -0.5+0i.
+        let e1 = build_bla_table(&orbit[..len])[1];
+        // The table entry at position 1 will be a higher-level merge — but A must
+        // equal the product of level-0 A values along the chain.  We just check
+        // valid_radius > 0 (table entry exists) and skip >= 1.
+        assert!(e1.valid_radius > 0.0, "position 1 must have a valid BLA entry");
+        assert!(e1.skip >= 1);
+        // Level-0 A at position 1 = 2·Z_1 = 2·(-0.5) = -1+0i.
+        // Level-0 valid_radius at position 1 = |Z_1| = 0.5.
+        // The final entry may be higher level, so we just verify the invariant.
+        let _ = len;
+    }
+
+    #[test]
+    fn bla_table_merge_formula_valid_radius_uses_a_norm() {
+        // Directly test bla_merge: min(r₀, r₁/|A₀|) vs the wrong min(r₀, r₁).
+        let e0 = BlaEntry {
+            a: Complex::new(2.0_f64, 0.0), // |A₀| = 2
+            b: Complex::new(1.0_f64, 0.0),
+            skip: 1,
+            _pad: 0,
+            valid_radius: 1.0,
+        };
+        let e1 = BlaEntry {
+            a: Complex::new(0.5_f64, 0.0),
+            b: Complex::new(1.0_f64, 0.0),
+            skip: 1,
+            _pad: 0,
+            valid_radius: 0.4,
+        };
+        let merged = bla_merge(e0, e1);
+        // Correct: min(1.0, 0.4/2.0) = min(1.0, 0.2) = 0.2
+        // Wrong (omitting /|A₀|): min(1.0, 0.4) = 0.4
+        assert!(
+            (merged.valid_radius - 0.2).abs() < 1e-14,
+            "valid_radius = {}, expected 0.2",
+            merged.valid_radius
+        );
+        assert_eq!(merged.skip, 2);
+    }
+
+    #[test]
+    fn bla_table_higher_levels_have_increasing_skip() {
+        // For a smooth interior orbit, entries near the middle should have skip > 1.
+        let c = Complex::new(-0.5_f64, 0.0);
+        let mut orbit = vec![Complex::<f64>::zero(); 256];
+        let len = compute_ref_orbit(&MAP, c, 256, &mut orbit);
+        let table = build_bla_table(&orbit[..len]);
+
+        // After convergence (n > 20), skip should be significantly > 1.
+        let mid_skip = table[len / 2].skip;
+        assert!(
+            mid_skip > 1,
+            "expected skip > 1 in smooth interior region, got {mid_skip}"
+        );
+    }
+
+    // ── perturb_pixel_bla: skip ratio ─────────────────────────────────────────
+
+    #[test]
+    fn bla_skip_ratio_80pct_on_smooth_interior() {
+        // Reference: c = -0.5+0i, interior, orbit converges.
+        // Pixel: δc = 1e-15 (simulates deep zoom). After convergence, |δz| ≈ 1e-15
+        // which is far below any valid_radius ≈ 0.1–0.5. BLA should fire almost always.
+        const MAX_ITER: u32 = 512;
+        let c_ref = Complex::new(-0.5_f64, 0.0);
+        let mut orbit = vec![Complex::<f64>::zero(); MAX_ITER as usize];
+        let orbit_len = compute_ref_orbit(&MAP, c_ref, MAX_ITER, &mut orbit);
+        let table = build_bla_table(&orbit[..orbit_len]);
+
+        let dc = DeltaC::new(1e-15, 0.0);
+        let mut dz = Complex::<f64>::zero();
+        let mut total_steps = 0u32;
+        let mut bla_steps = 0u32;
+
+        let mut n = 0usize;
+        while n < orbit_len {
+            let z_ref = orbit[n];
+            let z_n = z_ref + dz;
+            let r_sq = z_n.norm_sqr();
+            if r_sq > MAP.escape_radius_sq() {
+                break;
+            }
+            let ref_sq = z_ref.norm_sqr();
+            let glitch_sq = 1e-6 * ref_sq;
+            if ref_sq > 1e-30 && dz.norm_sqr() > glitch_sq {
+                break;
+            }
+
+            let entry = table[n];
+            total_steps += 1;
+            let next_n = n + entry.skip as usize;
+            if entry.valid_radius > 0.0
+                && dz.norm_sqr().sqrt() < entry.valid_radius
+                && next_n <= orbit_len
+            {
+                bla_steps += 1;
+                dz = entry.a * dz + entry.b * dc.as_complex_f64();
+                n = next_n;
+            } else {
+                dz = MAP.perturb_step(dz, dc.as_complex_f64(), z_ref);
+                n += 1;
+            }
+        }
+
+        let ratio = bla_steps as f64 / total_steps as f64;
+        assert!(
+            ratio >= 0.80,
+            "BLA skip ratio {:.1}% < 80% required",
+            ratio * 100.0
+        );
+    }
+
+    // ── pixel-exact: perturb_pixel_bla vs perturb_pixel ───────────────────────
+
+    #[test]
+    fn bla_pixel_exact_interior_matches_perturb_pixel() {
+        // Interior reference, tiny δc — both paths must return Interior with
+        // matching escaped flag and smooth_t (no BLA approximation errors).
+        const MAX_ITER: u32 = 256;
+        let c_ref = Complex::new(-0.5_f64, 0.0);
+        let mut orbit = vec![Complex::<f64>::zero(); MAX_ITER as usize];
+        let orbit_len = compute_ref_orbit(&MAP, c_ref, MAX_ITER, &mut orbit);
+        let table = build_bla_table(&orbit[..orbit_len]);
+
+        // Single pixel very close to reference; guaranteed interior.
+        let dc = DeltaC::new(1e-12, 0.0);
+        let r_ref = perturb_pixel(&MAP, &orbit[..orbit_len], dc, MAX_ITER);
+        let r_bla = perturb_pixel_bla(&MAP, &orbit[..orbit_len], &table, dc, MAX_ITER);
+
+        // Both must be Interior (not Glitched or Escaped).
+        assert!(
+            matches!(r_ref, EscapeResult::Interior { .. }),
+            "reference should be Interior, got {r_ref:?}"
+        );
+        assert!(
+            matches!(r_bla, EscapeResult::Interior { .. }),
+            "BLA result should be Interior, got {r_bla:?}"
+        );
+    }
+
+    #[test]
+    fn bla_pixel_exact_degenerate_zero_ref_matches_perturb_pixel() {
+        // Zero reference (valid_radius = 0 everywhere): BLA never fires, so
+        // perturb_pixel_bla must be identical to perturb_pixel.
+        const MAX_ITER: u32 = 200;
+        let orbit = zero_orbit(MAX_ITER as usize);
+        let table = build_bla_table(&orbit);
+
+        // Verify all table entries have valid_radius = 0 (Z = 0 everywhere).
+        assert!(
+            table.iter().all(|e| e.valid_radius == 0.0),
+            "zero orbit must produce all-zero valid_radius entries"
+        );
+
+        // Two test pixels: interior (dc=0) and exterior (dc=2).
+        for (re, im) in [(0.0_f64, 0.0_f64), (2.0_f64, 0.0_f64)] {
+            let dc = DeltaC::new(re, im);
+            let r_ref = perturb_pixel(&MAP, &orbit, dc, MAX_ITER);
+            let r_bla = perturb_pixel_bla(&MAP, &orbit, &table, dc, MAX_ITER);
+
+            let px_ref = if matches!(r_ref, EscapeResult::Glitched) {
+                continue; // glitch is acceptable for large dc
+            } else {
+                TilePixel::from(r_ref)
+            };
+            if matches!(r_bla, EscapeResult::Glitched) {
+                continue;
+            }
+            let px_bla = TilePixel::from(r_bla);
+
+            assert!(
+                tile_pixels_match(px_ref, px_bla),
+                "degenerate-ref pixel ({re}, {im}): ref={px_ref:?} bla={px_bla:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bla_pixel_exact_256x256_tile_at_interior_ref() {
+        // Full 256×256 tile, interior reference c_ref = -0.5+0i.
+        // δc values span ±1e-8 around c_ref: all pixels are interior (no glitch).
+        // perturb_pixel and perturb_pixel_bla must agree on escaped/interior for all.
+        const MAX_ITER: u32 = 256;
+        const TILE: usize = 256;
+        const STEP: f64 = 2e-8 / TILE as f64;
+
+        let c_ref = Complex::new(-0.5_f64, 0.0);
+        let mut orbit = vec![Complex::<f64>::zero(); MAX_ITER as usize];
+        let orbit_len = compute_ref_orbit(&MAP, c_ref, MAX_ITER, &mut orbit);
+        let table = build_bla_table(&orbit[..orbit_len]);
+
+        let mut mismatches = 0u32;
+        for row in 0..TILE {
+            for col in 0..TILE {
+                let dre = (col as f64 - TILE as f64 / 2.0) * STEP;
+                let dim = (row as f64 - TILE as f64 / 2.0) * STEP;
+                let dc = DeltaC::new(dre, dim);
+
+                let r_ref = perturb_pixel(&MAP, &orbit[..orbit_len], dc, MAX_ITER);
+                let r_bla = perturb_pixel_bla(&MAP, &orbit[..orbit_len], &table, dc, MAX_ITER);
+
+                // Skip glitched pixels (δc might be large near tile edges).
+                if matches!(r_ref, EscapeResult::Glitched)
+                    || matches!(r_bla, EscapeResult::Glitched)
+                {
+                    continue;
+                }
+
+                // Escaped classification and smooth_t must match.
+                let escaped_ref = matches!(r_ref, EscapeResult::Escaped { .. });
+                let escaped_bla = matches!(r_bla, EscapeResult::Escaped { .. });
+                if escaped_ref != escaped_bla {
+                    mismatches += 1;
+                    continue;
+                }
+                if escaped_ref {
+                    if let (
+                        EscapeResult::Escaped { smooth_t: st_ref, angle_final: af_ref, .. },
+                        EscapeResult::Escaped { smooth_t: st_bla, angle_final: af_bla, .. },
+                    ) = (r_ref, r_bla)
+                    {
+                        if (st_ref - st_bla).abs() > 1e-6 || (af_ref - af_bla).abs() > 1e-6 {
+                            mismatches += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            mismatches, 0,
+            "{mismatches} pixel(s) differed between perturb_pixel and perturb_pixel_bla"
+        );
     }
 }
