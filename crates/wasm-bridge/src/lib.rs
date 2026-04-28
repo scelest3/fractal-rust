@@ -422,73 +422,48 @@ pub fn render_tile_perturb(
                 core::slice::from_raw_parts_mut(out_ptr as *mut kernel::TilePixel, TILE_PIXELS)
             };
 
-            // Pass 1: render all pixels against primary orbit.
-            let mut is_glitched = vec![false; TILE_PIXELS];
-            let mut secondary_dc: Option<(f64, f64)> = None;
+            // Precompute secondary orbit at the tile center δc.
+            // The center pixel is a representative point for the tile; rebasing to it
+            // corrects exterior pixels that glitch against the primary mid-loop.
+            let center_dc_re = delta_re + 128.0 * pixel_step;
+            let center_dc_im = delta_im + 128.0 * pixel_step;
+            let mut secondary = Vec::new();
+            kernel::compute_secondary_orbit(
+                &kernel::MandelbrotMap,
+                &orbit,
+                arith::DeltaC::new(center_dc_re, center_dc_im),
+                max_iter,
+                &mut secondary,
+            );
 
+            // Single pass with inline rebasing — no post-hoc second pass needed.
+            let mut fallback_count = 0u32;
             for row in 0..TILE_SIZE {
                 for col in 0..TILE_SIZE {
                     let dc_re = delta_re + col as f64 * pixel_step;
                     let dc_im = delta_im + row as f64 * pixel_step;
+                    let dc_rel = arith::DeltaC::new(dc_re - center_dc_re, dc_im - center_dc_im);
                     let result = kernel::perturb_pixel(
                         &kernel::MandelbrotMap,
                         &orbit,
+                        &secondary,
                         &bla,
                         arith::DeltaC::new(dc_re, dc_im),
+                        dc_rel,
                         max_iter,
                     );
-                    match result {
+                    out[row * TILE_SIZE + col] = match result {
                         kernel::EscapeResult::Glitched => {
-                            is_glitched[row * TILE_SIZE + col] = true;
-                            if secondary_dc.is_none() {
-                                secondary_dc = Some((dc_re, dc_im));
-                            }
+                            fallback_count += 1;
+                            let c_abs = arith::Complex::new(cx_ref + dc_re, cy_ref + dc_im);
+                            kernel::TilePixel::from(kernel::escape_time(
+                                &kernel::MandelbrotMap,
+                                c_abs,
+                                max_iter,
+                            ))
                         }
-                        other => out[row * TILE_SIZE + col] = kernel::TilePixel::from(other),
-                    }
-                }
-            }
-
-            // Pass 2: compute secondary orbit and re-render glitched pixels.
-            let mut fallback_count = 0u32;
-            if let Some((sec_re, sec_im)) = secondary_dc {
-                let mut secondary = Vec::new();
-                kernel::compute_secondary_orbit(
-                    &kernel::MandelbrotMap,
-                    &orbit,
-                    arith::DeltaC::new(sec_re, sec_im),
-                    max_iter,
-                    &mut secondary,
-                );
-
-                for row in 0..TILE_SIZE {
-                    for col in 0..TILE_SIZE {
-                        if !is_glitched[row * TILE_SIZE + col] {
-                            continue;
-                        }
-                        let dc_re = delta_re + col as f64 * pixel_step;
-                        let dc_im = delta_im + row as f64 * pixel_step;
-                        let rel_dc = arith::DeltaC::new(dc_re - sec_re, dc_im - sec_im);
-                        let result = kernel::perturb_pixel(
-                            &kernel::MandelbrotMap,
-                            &secondary,
-                            &[],
-                            rel_dc,
-                            max_iter,
-                        );
-                        out[row * TILE_SIZE + col] = match result {
-                            kernel::EscapeResult::Glitched => {
-                                fallback_count += 1;
-                                let c_abs = arith::Complex::new(cx_ref + dc_re, cy_ref + dc_im);
-                                kernel::TilePixel::from(kernel::escape_time(
-                                    &kernel::MandelbrotMap,
-                                    c_abs,
-                                    max_iter,
-                                ))
-                            }
-                            other => kernel::TilePixel::from(other),
-                        };
-                    }
+                        other => kernel::TilePixel::from(other),
+                    };
                 }
             }
 
