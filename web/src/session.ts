@@ -43,8 +43,14 @@ function orbitSabSize(maxOrbitIter: number): number {
   return blaTableOffset(maxOrbitIter) + maxOrbitIter * BLA_ENTRY_BYTES;
 }
 
-/** Zoom depth at which the perturbation path is engaged. */
-const PERTURB_ZOOM_THRESHOLD = 15;
+/**
+ * Zoom depth above which F64x2 (double-double) escape-time is used.
+ * f64 absolute coordinates lose per-pixel precision around zoom_exp ≈ 14.
+ * F64x2 covers zoom_exp up to ≈ 20 cleanly (v1 cap).
+ * Perturbation theory (zoom_exp > 20) is v2 — the orbit worker is kept
+ * but not triggered in v1.
+ */
+const F64X2_ZOOM_THRESHOLD = 14;
 
 // Workers: N_TILE_WORKERS tile workers + 1 orbit worker.
 const N_WORKERS = Math.max(2, Math.min(8, (navigator.hardwareConcurrency ?? 4) - 2));
@@ -59,7 +65,9 @@ interface TileDesc {
   tileY: number;
   slotIndex: number;
   generation: number;
-  usePerturb: boolean;
+  useF64x2: boolean;
+  cxRef: number;
+  cyRef: number;
 }
 
 type WorkerInMsg =
@@ -217,7 +225,7 @@ export class FractalSession {
   private updateOverlay(): void {
     const v = this.fsm.getView();
     const state = this.fsm.getState();
-    const mode = v.zoom_exp > PERTURB_ZOOM_THRESHOLD ? "perturb" : "escape_time";
+    const mode = v.zoom_exp > F64X2_ZOOM_THRESHOLD ? "f64x2" : "f64";
     this.overlay.innerHTML =
       `state: ${state} [${mode}]<br>` +
       `cx: ${parseFloat(v.cx).toFixed(8)}<br>` +
@@ -237,45 +245,14 @@ export class FractalSession {
 
   private scheduleDispatch(): void {
     if (!this.lutReady) return;
-
     const view = this.fsm.getView();
-    const usePerturb = view.zoom_exp > PERTURB_ZOOM_THRESHOLD;
-
-    if (usePerturb) {
-      if (!this.orbitWorkerReady) {
-        // Orbit worker still initialising; onOrbitWorkerMessage will retry.
-        return;
-      }
-      if (!this.orbitReady) {
-        // Request a new orbit if we haven't already for this generation.
-        if (!this.pendingOrbitDispatch) {
-          this.pendingOrbitDispatch = true;
-          this.currentOrbitId++;
-          const maxIter = this.computeMaxIter(view.zoom_exp);
-          console.log(`[Session] requesting orbit id=${this.currentOrbitId} zoom_exp=${view.zoom_exp.toFixed(2)} max_iter=${maxIter}`);
-          this.orbitWorker.postMessage({
-            type: "compute_orbit",
-            cx: view.cx,
-            cy: view.cy,
-            zoom_exp: view.zoom_exp,
-            max_iter: maxIter,
-            ref_orbit_id: this.currentOrbitId,
-          });
-        }
-        return; // Tiles dispatched after orbit_ready arrives.
-      }
-    } else {
-      // Escape-time path: no orbit needed; reset orbit state.
-      this.orbitReady = false;
-      this.pendingOrbitDispatch = false;
-    }
-
-    this.dispatchGeneration(view, usePerturb);
+    const useF64x2 = view.zoom_exp > F64X2_ZOOM_THRESHOLD;
+    this.dispatchGeneration(view, useF64x2);
   }
 
   private dispatchGeneration(
     view: { cx: string; cy: string; zoom_exp: number },
-    usePerturb: boolean,
+    useF64x2: boolean,
   ): void {
     this.generation++;
     const gen = this.generation;
@@ -288,6 +265,8 @@ export class FractalSession {
     const maxIter = this.computeMaxIter(view.zoom_exp);
     const tilesX = Math.ceil(W / TILE_SIZE);
     const tilesY = Math.ceil(H / TILE_SIZE);
+    const cxRef = parseFloat(view.cx);
+    const cyRef = parseFloat(view.cy);
 
     this.tilesThisGen = tilesX * tilesY;
     this.tilesDrawnThisGen = 0;
@@ -298,13 +277,14 @@ export class FractalSession {
         let deltaRe: number;
         let deltaIm: number;
 
-        if (usePerturb) {
-          // Perturbation: delta from reference (viewport center).
-          // Computed as integer_offset × step — no catastrophic cancellation.
+        if (useF64x2) {
+          // F64x2 path: pass offset from viewport center so WASM can split
+          // the coordinate as F64x2(cxRef, 0) + F64x2(offset, 0) without
+          // catastrophic cancellation.
           deltaRe = (tx * TILE_SIZE - W / 2) * step;
           deltaIm = (ty * TILE_SIZE - H / 2) * step;
         } else {
-          // Escape-time: absolute fractal coords of tile top-left.
+          // f64 escape-time: absolute fractal coords of tile top-left.
           const { fx, fy } = pixelToFractal(tx * TILE_SIZE, ty * TILE_SIZE, view, W, H);
           deltaRe = fx;
           deltaIm = fy;
@@ -315,7 +295,9 @@ export class FractalSession {
           tileX: tx, tileY: ty,
           slotIndex: 0, // overwritten by dispatchPending
           generation: gen,
-          usePerturb,
+          useF64x2,
+          cxRef,
+          cyRef,
         });
       }
     }

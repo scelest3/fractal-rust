@@ -384,6 +384,82 @@ pub fn install_orbit(orbit_f64: &[f64], bla_bytes: &[u8]) {
     BLA.with(|b| *b.borrow_mut() = bla);
 }
 
+/// Render a 256×256 Mandelbrot tile using F64x2 (double-double) arithmetic.
+///
+/// Covers zoom_exp ≈ 14–20 where f64 absolute coordinates lose per-pixel
+/// precision but F64x2 (~30 significant digits) is exact.
+///
+/// `cx_ref` / `cy_ref` are the f64 viewport center. `delta_re` / `delta_im`
+/// are the tile top-left's integer-offset from center (`(tile_px - W/2) × step`).
+/// Splitting center + offset and combining in F64x2 avoids catastrophic
+/// cancellation without requiring a high-precision string parse per tile.
+#[wasm_bindgen]
+pub fn render_tile_f64x2(
+    cx_ref: f64,
+    cy_ref: f64,
+    delta_re: f64,
+    delta_im: f64,
+    pixel_step: f64,
+    max_iter: u32,
+    out_ptr: u32,
+) {
+    use arith::{F64x2, Precision};
+    // Safety: out_ptr is from alloc_tile_buf() — a valid TILE_PIXELS-sized heap buffer.
+    let out = unsafe {
+        core::slice::from_raw_parts_mut(out_ptr as *mut kernel::TilePixel, TILE_PIXELS)
+    };
+    let escape_r_sq = 4.0_f64;
+    let cx0 = F64x2::from_f64(cx_ref);
+    let cy0 = F64x2::from_f64(cy_ref);
+    for row in 0..TILE_SIZE {
+        for col in 0..TILE_SIZE {
+            let cr = cx0 + F64x2::from_f64(delta_re + col as f64 * pixel_step);
+            let ci = cy0 + F64x2::from_f64(delta_im + row as f64 * pixel_step);
+            out[row * TILE_SIZE + col] = mandelbrot_f64x2(cr, ci, max_iter, escape_r_sq);
+        }
+    }
+}
+
+fn mandelbrot_f64x2(cr: arith::F64x2, ci: arith::F64x2, max_iter: u32, escape_r_sq: f64) -> kernel::TilePixel {
+    use arith::{F64x2, Precision};
+    let mut zr = F64x2::zero();
+    let mut zi = F64x2::zero();
+    let mut orbit_min_r = f64::MAX;
+    let mut orbit_min_z = arith::Complex::<f64>::zero();
+
+    for iter in 0..max_iter {
+        let zr2 = zr * zr;
+        let zi2 = zi * zi;
+        let norm_sq = (zr2 + zi2).to_f64_lossy();
+
+        let r = norm_sq.sqrt();
+        if iter > 0 && r < orbit_min_r {
+            orbit_min_r = r;
+            orbit_min_z = arith::Complex::new(zr.to_f64_lossy(), zi.to_f64_lossy());
+        }
+
+        if norm_sq > escape_r_sq {
+            let smooth_t = (iter as f64 + 1.0) - norm_sq.sqrt().ln().ln() / core::f64::consts::LN_2;
+            let zr_f64 = zr.to_f64_lossy();
+            let zi_f64 = zi.to_f64_lossy();
+            return kernel::TilePixel::from(kernel::EscapeResult::Escaped {
+                iter,
+                smooth_t,
+                orbit_min_r,
+                orbit_min_z,
+                angle_final: zi_f64.atan2(zr_f64),
+            });
+        }
+
+        // z ← z² + c
+        let zr_new = zr2 - zi2 + cr;
+        zi = F64x2::from_f64(2.0) * zr * zi + ci;
+        zr = zr_new;
+    }
+
+    kernel::TilePixel::from(kernel::EscapeResult::Interior { orbit_min_r, orbit_min_z })
+}
+
 /// Render a 256×256 perturbation tile using the installed reference orbit.
 ///
 /// `cx_ref` / `cy_ref` are the f64 approximation of the reference point

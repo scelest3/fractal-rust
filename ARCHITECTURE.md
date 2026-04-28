@@ -47,7 +47,7 @@ Browser-based, high-resolution fractal explorer targeting sustained 60 fps inter
 
 ### Goals
 
-- Correct deep-zoom rendering at ≥ 1 000 iterations at 10⁻³⁰⁰ depth (v1 cap; see §8)
+- Correct deep-zoom rendering to zoom_exp ≈ 20 via F64x2 double-double arithmetic (v1 cap; see §8)
 - Smooth ≥ 60 fps pan / zoom via progressive tile streaming
 - PNG / JPEG / EXR image export at user-defined resolution
 - Interactive color palette editor (gradient stops, iteration-space mapping, orbit-trap overlay)
@@ -57,6 +57,8 @@ Browser-based, high-resolution fractal explorer targeting sustained 60 fps inter
 
 ### Non-Goals (v1)
 
+- Zoom beyond zoom_exp ≈ 20 (v2 — perturbation theory + BigFloat required; see §8)
+- Perturbation theory, BLA, and glitch correction (v2 — architecture is prepared but deferred)
 - Zoom beyond 10⁻³⁰⁰ (planned v2 — `DeltaC` opaque type is the upgrade path)
 - 3D fractal rendering (Mandelbox, Menger sponge)
 - Server-side rendering / compute cluster offload
@@ -495,23 +497,18 @@ View coordinate is always `(cx: BigDecimal string, cy: BigDecimal string, zoom_e
 
 Standard `f64` gives ~15–16 significant decimal digits. The strategy at each depth tier:
 
-| Zoom depth | Precision mode | Rust type | Approx. cost |
+| Zoom depth | Precision mode | Rust type | Status |
 |---|---|---|---|
-| zoom_exp < 10 | Native f64 | `Complex<f64>` | Baseline |
-| zoom_exp 10–20 | Double-double | `Complex<F64x2>` | ~3× f64 |
-| zoom_exp 20–300 | Perturbation + BigFloat<N> | `BigFloat<N>` ref, `DeltaC` probe | Ref once; probes at f64 speed |
-| zoom_exp > 300 | v2: rescaled `DeltaC` | extended `DeltaC` internals | `DeltaC` opaque type is the upgrade path |
+| zoom_exp < 15 | Native f64 escape-time | `Complex<f64>` | ✅ v1 — implemented |
+| zoom_exp 15–20 | Double-double escape-time | `Complex<F64x2>` | 🔨 v1 — in progress |
+| zoom_exp 20–300 | Perturbation + BigFloat<N> | `BigFloat<N>` ref, `DeltaC` probe | 🔜 v2 — deferred |
+| zoom_exp > 300 | Rescaled `DeltaC` | extended `DeltaC` internals | 🔜 v2 — deferred |
 
-Precision tier is selected automatically at runtime. `zoom_exp` is the log₁₀ of the magnification (e.g. `zoom_exp = 100` for 10⁻¹⁰⁰ depth):
+**v1 zoom cap: zoom_exp ≈ 20.** F64x2 (double-double, ~30 decimal digits) covers this range with pure escape-time — no perturbation theory, no reference orbits, no glitch correction. Each pixel's coordinate is computed as `Complex<F64x2>` by adding the viewport center (parsed from the BigDecimal string) to the pixel offset (an exact f64 integer multiple of `pixel_step`). The arithmetic cost is ~3–4× f64 per iteration, acceptable for this zoom range.
 
-```rust
-fn required_limbs(zoom_exp: f64) -> usize {
-    let digits_needed = zoom_exp + 8.0; // 8-digit safety margin
-    ((digits_needed / 15.9).ceil() as usize).max(2)
-}
-```
+Precision tier is selected automatically at runtime. `zoom_exp` is the log₁₀ of the magnification (e.g. `zoom_exp = 15` for 10⁻¹⁵ depth).
 
-**v1 zoom cap:** `zoom_exp` is clamped to 300 in the UI and asserted in `required_limbs`. At `zoom_exp = 300`, per-pixel `DeltaC` values are ~10⁻³⁰³ — safely within normal f64 range (~2.2×10⁻³⁰⁸). Beyond that, f64 `DeltaC` underflows silently. The `DeltaC` type is opaque at all perturbation call sites so the internals can be upgraded to a rescaled representation in v2 without changing callers.
+**v2 perturbation path:** The BigFloat<N> reference orbit, BLA acceleration, and glitch correction infrastructure is architecturally prepared (see §9) but deferred to v2. The `DeltaC` opaque type, `required_limbs`, and all kernel trait signatures are designed for forward compatibility — adding the perturbation dispatch in `wasm-bridge` is the only code change required to unlock zoom_exp > 20.
 
 ### 8.1 Reference Orbit Lifecycle
 
@@ -926,7 +923,8 @@ This runs before `fetch`, so non-SIMD browsers never request the SIMD bundle. Sh
 |---|---|---|
 | 0 — Scaffold | Workspace, CI, shared-memory WASM hello-world renders to canvas | `wasm-bridge` (stub), shared memory init |
 | 1 — Mandelbrot f64 | Basic escape-time Mandelbrot, smooth coloring, pan/zoom | `kernel`, `coloring`, `gl-pipeline`, `viewport.ts` |
-| 2 — Deep Zoom | F64x2 / BigFloat; perturbation theory; BLA (with validation); glitch correction | `arith`, `kernel` (perturb), `scheduler` |
+| 2 — Deep Zoom (v1) | F64x2 escape-time for zoom_exp 15–20; automatic precision dispatch | `arith` (F64x2), `wasm-bridge` (F64x2 dispatch), `session.ts` |
+| 2b — Deep Zoom (v2) | Perturbation theory; BigFloat<N>; BLA; glitch correction / rebasing | `arith` (BigFloat), `kernel` (perturb, BLA), `scheduler` |
 | 3 — Newton | Newton fractal with polynomial config UI and root-index coloring | `kernel` (newton), `coloring` (root) |
 | 4 — Color Editor | Full palette editor, orbit trap, LUT, preset library | `coloring`, `color-editor.ts` |
 | 5 — Export | PNG / JPEG / EXR export pipeline; PBO readback; large-image stitching | `export.ts`, `openexr-wasm` |

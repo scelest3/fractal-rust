@@ -53,7 +53,9 @@ interface RenderTileMsg {
   tileX: number;
   tileY: number;
   generation: number;
-  usePerturb: boolean;
+  useF64x2: boolean;
+  cxRef: number;
+  cyRef: number;
 }
 
 type WorkerMsg = InitMsg | OrbitReadyMsg | RenderTileMsg;
@@ -69,6 +71,15 @@ interface WasmExports {
     maxIter: number,
     ptr: number,
   ) => void;
+  render_tile_f64x2: (
+    cxRef: number,
+    cyRef: number,
+    deltaRe: number,
+    deltaIm: number,
+    pixelStep: number,
+    maxIter: number,
+    ptr: number,
+  ) => void;
   render_tile_perturb: (
     cxRef: number,
     cyRef: number,
@@ -77,7 +88,7 @@ interface WasmExports {
     pixelStep: number,
     maxIter: number,
     ptr: number,
-  ) => number; // returns glitch count
+  ) => number; // returns glitch count (v2)
 }
 
 interface WasmGlue {
@@ -154,14 +165,13 @@ function handleRenderTile(msg: RenderTileMsg): void {
     return;
   }
 
-  const { deltaRe, deltaIm, step, slotIndex, tileX, tileY, generation, usePerturb } = msg;
+  const { deltaRe, deltaIm, step, slotIndex, tileX, tileY, generation, useF64x2, cxRef, cyRef } = msg;
   const maxIter = msg.maxIter ?? 256;
 
   const ptr = wasm.alloc_tile_buf();
 
-  if (usePerturb) {
-    const glitches = wasm.render_tile_perturb(orbitCxRef, orbitCyRef, deltaRe, deltaIm, step, maxIter, ptr);
-    if (glitches > 0) console.log(`[TileWorker] tile (${tileX},${tileY}) glitches=${glitches}`);
+  if (useF64x2) {
+    wasm.render_tile_f64x2(cxRef, cyRef, deltaRe, deltaIm, step, maxIter, ptr);
   } else {
     wasm.render_tile_to_ptr(deltaRe, deltaIm, step, maxIter, ptr);
   }
