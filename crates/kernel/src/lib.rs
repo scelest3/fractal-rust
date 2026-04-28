@@ -448,6 +448,44 @@ pub fn build_bla_table(orbit: &[Complex<f64>]) -> Vec<BlaEntry> {
         .collect()
 }
 
+// ── compute_secondary_orbit ───────────────────────────────────────────────────
+
+/// Compute a secondary reference orbit by running f64 perturbation from the
+/// primary orbit to a nearby point `dc_secondary`.
+///
+/// Each entry `out[n]` = `Z_n + δz_n` — the secondary point's orbit in f64.
+/// This can be used as a replacement reference for `perturb_pixel`: pass
+/// `secondary_orbit` as `ref_orbit` and `dc_pixel − dc_secondary` as `delta_c`.
+///
+/// Runs purely in f64 (no BigFloat), making it fast enough to call per-tile
+/// inside a Tile Worker. No glitch check is performed — the output is always
+/// the best-available f64 approximation of the secondary orbit.
+///
+/// If the secondary escapes before `max_iter`, `out` is truncated at the
+/// escape step; `perturb_pixel` handles short reference orbits correctly.
+pub fn compute_secondary_orbit<M: PerturbationSupport>(
+    map: &M,
+    primary_orbit: &[Complex<f64>],
+    dc_secondary: DeltaC,
+    max_iter: u32,
+    out: &mut Vec<Complex<f64>>,
+) {
+    let dc = dc_secondary.as_complex_f64();
+    let mut dz = Complex::<f64>::zero();
+    let limit = (max_iter as usize + 1).min(primary_orbit.len());
+    out.clear();
+    out.reserve(limit);
+    for n in 0..limit {
+        let z_ref = primary_orbit[n];
+        let z_sec = z_ref + dz;
+        out.push(z_sec);
+        if z_sec.norm_sqr() > map.escape_radius_sq() {
+            break;
+        }
+        dz = map.perturb_step(dz, dc, z_ref);
+    }
+}
+
 // ── escape_time ───────────────────────────────────────────────────────────────
 
 /// Compute the escape-time result for one pixel using plain f64 iteration.
@@ -1312,6 +1350,92 @@ mod tests {
         assert_eq!(
             mismatches, 0,
             "{mismatches} pixel(s) differed between perturb_pixel (no BLA) and perturb_pixel (BLA)"
+        );
+    }
+
+    // ── compute_secondary_orbit ───────────────────────────────────────────────
+
+    #[test]
+    fn secondary_orbit_at_zero_dc_equals_primary() {
+        // dc_secondary = 0 → secondary orbit must be identical to primary orbit.
+        let c = Complex::new(-0.5_f64, 0.0);
+        let mut primary = vec![Complex::<f64>::zero(); 64];
+        let len = compute_ref_orbit(&MAP, c, 64, &mut primary);
+        let primary = &primary[..len];
+
+        let mut secondary = Vec::new();
+        compute_secondary_orbit(&MAP, primary, DeltaC::new(0.0, 0.0), 64, &mut secondary);
+
+        assert_eq!(secondary.len(), primary.len());
+        for (a, b) in primary.iter().zip(secondary.iter()) {
+            assert!((a.re - b.re).abs() < 1e-15 && (a.im - b.im).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn secondary_orbit_matches_direct_orbit_for_nearby_point() {
+        // Primary: c_ref = -0.5 + 0i. Secondary dc = 0.5 → c_sec = 0.0 (origin).
+        // compute_secondary_orbit should reproduce the direct orbit of c_sec.
+        const MAX_ITER: u32 = 100;
+        let c_ref = Complex::new(-0.5_f64, 0.0);
+        let c_sec = Complex::new(0.0_f64, 0.0); // c_ref + dc_sec = -0.5 + 0.5 = 0
+
+        let mut primary = vec![Complex::<f64>::zero(); MAX_ITER as usize + 1];
+        let primary_len = compute_ref_orbit(&MAP, c_ref, MAX_ITER, &mut primary);
+        let primary = &primary[..primary_len];
+
+        let mut secondary = Vec::new();
+        compute_secondary_orbit(&MAP, primary, DeltaC::new(0.5, 0.0), MAX_ITER, &mut secondary);
+
+        let mut direct = vec![Complex::<f64>::zero(); MAX_ITER as usize + 1];
+        let direct_len = compute_ref_orbit(&MAP, c_sec, MAX_ITER, &mut direct);
+        let direct = &direct[..direct_len];
+
+        assert_eq!(secondary.len(), direct.len(), "secondary orbit length must match direct");
+        for (i, (a, b)) in secondary.iter().zip(direct.iter()).enumerate() {
+            assert!(
+                (a.re - b.re).abs() < 1e-12 && (a.im - b.im).abs() < 1e-12,
+                "entry {i}: secondary={a:?} direct={b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_orbit_resolves_glitched_pixel() {
+        // Primary: c_ref = -0.5 + 0i (interior). Pixel at dc = 1.0 + 0i glitches.
+        // Secondary at dc_sec = dc_pixel: re-render with dc_rel = 0 must not glitch,
+        // and the result must match escape_time for c_pixel = c_ref + dc_pixel = 0.5.
+        const MAX_ITER: u32 = 200;
+        let c_ref = Complex::new(-0.5_f64, 0.0);
+        let dc_pixel = DeltaC::new(1.0, 0.0); // c_pixel = 0.5
+
+        let mut primary = vec![Complex::<f64>::zero(); MAX_ITER as usize + 1];
+        let orbit_len = compute_ref_orbit(&MAP, c_ref, MAX_ITER, &mut primary);
+        let primary = &primary[..orbit_len];
+
+        // Verify the pixel glitches against the primary.
+        assert!(
+            matches!(perturb_pixel(&MAP, primary, &[], dc_pixel, MAX_ITER), EscapeResult::Glitched),
+            "pixel should glitch against interior primary with large dc"
+        );
+
+        // Compute secondary orbit at dc_sec = dc_pixel.
+        let mut secondary = Vec::new();
+        compute_secondary_orbit(&MAP, primary, dc_pixel, MAX_ITER, &mut secondary);
+
+        // Re-render with dc_rel = 0 (pixel IS the secondary reference).
+        let r_secondary = perturb_pixel(&MAP, &secondary, &[], DeltaC::new(0.0, 0.0), MAX_ITER);
+        assert!(
+            !matches!(r_secondary, EscapeResult::Glitched),
+            "pixel must not glitch against secondary reference"
+        );
+
+        // Result must match escape_time for c = 0.5.
+        let et_px = TilePixel::from(escape_time(&MAP, Complex::new(0.5_f64, 0.0), MAX_ITER));
+        let pp_px = TilePixel::from(r_secondary);
+        assert!(
+            tile_pixels_match(et_px, pp_px),
+            "secondary-corrected result must match escape_time: et={et_px:?} pp={pp_px:?}"
         );
     }
 }

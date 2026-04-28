@@ -387,18 +387,19 @@ pub fn install_orbit(orbit_f64: &[f64], bla_bytes: &[u8]) {
 /// Render a 256×256 perturbation tile using the installed reference orbit.
 ///
 /// `cx_ref` / `cy_ref` are the f64 approximation of the reference point
-/// (viewport center). They are used only for the glitch fallback (see below).
+/// (viewport center). They are used only for the final escape_time fallback.
 ///
 /// `delta_re` / `delta_im` are the fractal offsets of the tile's top-left
 /// pixel from the reference point, computed as `(tile_pixel − W/2) × pixel_step`.
-/// This avoids catastrophic cancellation — the delta is an integer × tiny step.
 ///
-/// Glitched pixels fall back to `escape_time` with the absolute coordinate
-/// `(cx_ref + δ_pixel_re, cy_ref + δ_pixel_im)`. At zoom_exp ≤ 30 f64 precision
-/// is sufficient for exterior pixels. Secondary orbits (Issue #22) are the proper
-/// fix for zoom_exp > 30.
+/// Glitch correction is two-pass:
+///   Pass 1 — perturbation against the primary reference orbit.
+///   Pass 2 — pixels that glitched in pass 1 are re-rendered against a secondary
+///             orbit computed from the first glitch's δc (f64 perturbation, fast).
+///   Fallback — pixels that still glitch after pass 2 fall back to escape_time
+///              with absolute f64 coordinates (correct up to zoom_exp ≈ 14).
 ///
-/// Returns the number of glitched pixels (informational; all are corrected here).
+/// Returns the number of pixels that required the escape_time fallback.
 #[wasm_bindgen]
 pub fn render_tile_perturb(
     cx_ref: f64,
@@ -420,36 +421,78 @@ pub fn render_tile_perturb(
             let out = unsafe {
                 core::slice::from_raw_parts_mut(out_ptr as *mut kernel::TilePixel, TILE_PIXELS)
             };
-            let mut glitch_count = 0u32;
+
+            // Pass 1: render all pixels against primary orbit.
+            let mut is_glitched = vec![false; TILE_PIXELS];
+            let mut secondary_dc: Option<(f64, f64)> = None;
+
             for row in 0..TILE_SIZE {
                 for col in 0..TILE_SIZE {
                     let dc_re = delta_re + col as f64 * pixel_step;
                     let dc_im = delta_im + row as f64 * pixel_step;
-                    let dc = arith::DeltaC::new(dc_re, dc_im);
                     let result = kernel::perturb_pixel(
                         &kernel::MandelbrotMap,
                         &orbit,
                         &bla,
-                        dc,
+                        arith::DeltaC::new(dc_re, dc_im),
                         max_iter,
                     );
-                    out[row * TILE_SIZE + col] = match result {
+                    match result {
                         kernel::EscapeResult::Glitched => {
-                            glitch_count += 1;
-                            // Fallback: escape_time with absolute coordinate.
-                            // Correct for zoom_exp ≤ 30; Issue #22 adds secondary orbits.
-                            let c_abs = arith::Complex::new(cx_ref + dc_re, cy_ref + dc_im);
-                            kernel::TilePixel::from(kernel::escape_time(
-                                &kernel::MandelbrotMap,
-                                c_abs,
-                                max_iter,
-                            ))
+                            is_glitched[row * TILE_SIZE + col] = true;
+                            if secondary_dc.is_none() {
+                                secondary_dc = Some((dc_re, dc_im));
+                            }
                         }
-                        other => kernel::TilePixel::from(other),
-                    };
+                        other => out[row * TILE_SIZE + col] = kernel::TilePixel::from(other),
+                    }
                 }
             }
-            glitch_count
+
+            // Pass 2: compute secondary orbit and re-render glitched pixels.
+            let mut fallback_count = 0u32;
+            if let Some((sec_re, sec_im)) = secondary_dc {
+                let mut secondary = Vec::new();
+                kernel::compute_secondary_orbit(
+                    &kernel::MandelbrotMap,
+                    &orbit,
+                    arith::DeltaC::new(sec_re, sec_im),
+                    max_iter,
+                    &mut secondary,
+                );
+
+                for row in 0..TILE_SIZE {
+                    for col in 0..TILE_SIZE {
+                        if !is_glitched[row * TILE_SIZE + col] {
+                            continue;
+                        }
+                        let dc_re = delta_re + col as f64 * pixel_step;
+                        let dc_im = delta_im + row as f64 * pixel_step;
+                        let rel_dc = arith::DeltaC::new(dc_re - sec_re, dc_im - sec_im);
+                        let result = kernel::perturb_pixel(
+                            &kernel::MandelbrotMap,
+                            &secondary,
+                            &[],
+                            rel_dc,
+                            max_iter,
+                        );
+                        out[row * TILE_SIZE + col] = match result {
+                            kernel::EscapeResult::Glitched => {
+                                fallback_count += 1;
+                                let c_abs = arith::Complex::new(cx_ref + dc_re, cy_ref + dc_im);
+                                kernel::TilePixel::from(kernel::escape_time(
+                                    &kernel::MandelbrotMap,
+                                    c_abs,
+                                    max_iter,
+                                ))
+                            }
+                            other => kernel::TilePixel::from(other),
+                        };
+                    }
+                }
+            }
+
+            fallback_count
         })
     })
 }
