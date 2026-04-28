@@ -50,6 +50,7 @@ interface WasmGlue {
   orbit_data_ptr: () => number;
   orbit_data_len: () => number;
   bla_data_ptr: () => number;
+  bla_data_len: () => number;
 }
 
 let wasm: WasmExports | null = null;
@@ -91,7 +92,10 @@ function handleComputeOrbit(msg: ComputeOrbitMsg): void {
   // Compute in WASM heap (BigFloat<N> precision selected by zoom_exp).
   glue.compute_reference_orbit(cx, cy, zoom_exp, max_iter);
 
+  // orbit_len may be orbit_non_escaped + 1 for exterior references (the extra
+  // entry is Z_N, the first escaped value; perturb_pixel needs it).
   const orbit_len = glue.orbit_data_len();
+  const bla_len = glue.bla_data_len(); // non-escaped count, ≤ orbit_len
   const orbitPtr = glue.orbit_data_ptr();
   const blaPtr = glue.bla_data_ptr();
   const mem = wasm.memory.buffer;
@@ -102,18 +106,16 @@ function handleComputeOrbit(msg: ComputeOrbitMsg): void {
     new Uint8Array(mem, orbitPtr, orbitByteCount),
   );
 
-  // Copy BLA bytes (orbit_len × 48 B) into orbitSab at blaTableOffset.
-  const blaByteCount = orbit_len * BLA_ENTRY_BYTES;
+  // Copy BLA bytes (bla_len × 48 B) into orbitSab at blaTableOffset.
+  const blaByteCount = bla_len * BLA_ENTRY_BYTES;
   new Uint8Array(orbitSab, blaTableOffset, blaByteCount).set(
     new Uint8Array(mem, blaPtr, blaByteCount),
   );
-
-  // The data stays live in WASM thread_local until the next call —
-  // no explicit free needed.
 
   (self as unknown as Worker).postMessage({
     type: "orbit_ready",
     ref_orbit_id,
     orbit_len,
+    bla_len,
   });
 }

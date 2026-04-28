@@ -198,15 +198,17 @@ impl PerturbationSupport for MandelbrotMap {
 
 /// Compute the reference orbit in precision T, storing downcast f64 entries.
 ///
-/// Returns the number of entries written to `out` (≤ `max_iter`, ≤ `out.len()`).
-/// `out[n]` = Z_n (the value before the n-th step). The loop stops early if the
-/// reference point escapes; the escaped value is not stored.
+/// Returns the number of non-escaped entries written to `out[0..n]`.
+/// If the reference escapes at step `n`, the **escaped** value `Z_n` is also
+/// written to `out[n]` (one extra slot), so `out` should be sized `max_iter + 1`
+/// to guarantee room. `perturb_pixel` uses this extra entry to detect escape at
+/// the orbit boundary for exterior reference points.
 ///
 /// # Arguments
 /// * `map`      — controls the high-precision step and escape radius
 /// * `c`        — reference point in precision T
-/// * `max_iter` — upper bound on orbit length
-/// * `out`      — caller-supplied buffer; length sets an independent upper bound
+/// * `max_iter` — upper bound on non-escaped orbit length
+/// * `out`      — caller-supplied buffer; sized `max_iter + 1` to hold the escape entry
 pub fn compute_ref_orbit<T: Precision, M: PerturbationSupport>(
     map: &M,
     c: Complex<T>,
@@ -219,6 +221,11 @@ pub fn compute_ref_orbit<T: Precision, M: PerturbationSupport>(
         *slot = Complex::new(z.re.to_f64_lossy(), z.im.to_f64_lossy());
         let z_next = map.ref_step(z, c);
         if z_next.norm_sqr().to_f64_lossy() > map.escape_radius_sq() {
+            // Append the escaped Z value if there is room — perturb_pixel needs it
+            // to detect escape for pixels whose orbit mirrors the reference boundary.
+            if i + 1 < out.len() {
+                out[i + 1] = Complex::new(z_next.re.to_f64_lossy(), z_next.im.to_f64_lossy());
+            }
             return i + 1;
         }
         z = z_next;
@@ -262,7 +269,9 @@ pub fn perturb_pixel<M: PerturbationSupport>(
     let mut dz = Complex::<f64>::zero();
     let mut orbit_min_r = f64::MAX;
     let mut orbit_min_z = Complex::<f64>::zero();
-    let limit = (max_iter as usize).min(ref_orbit.len());
+    // Allow one step beyond max_iter so perturb_pixel can reach the escaped
+    // Z_N entry appended by compute_ref_orbit for exterior reference points.
+    let limit = (max_iter as usize + 1).min(ref_orbit.len());
     let glitch_thresh_sq = {
         let t = map.glitch_threshold();
         t * t

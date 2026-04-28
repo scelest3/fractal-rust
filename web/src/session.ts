@@ -68,7 +68,7 @@ type WorkerInMsg =
 
 type OrbitWorkerInMsg =
   | { type: "orbit_worker_ready" }
-  | { type: "orbit_ready"; ref_orbit_id: number; orbit_len: number };
+  | { type: "orbit_ready"; ref_orbit_id: number; orbit_len: number; bla_len: number };
 
 function makeOverlay(): HTMLElement {
   const el = document.createElement("div");
@@ -170,11 +170,11 @@ export class FractalSession {
       // If a dispatch is waiting for the orbit worker to be ready, retry.
       if (this.pendingOrbitDispatch) this.scheduleDispatch();
     } else if (msg.type === "orbit_ready") {
-      this.onOrbitReady(msg.ref_orbit_id, msg.orbit_len);
+      this.onOrbitReady(msg.ref_orbit_id, msg.orbit_len, msg.bla_len);
     }
   }
 
-  private onOrbitReady(ref_orbit_id: number, orbit_len: number): void {
+  private onOrbitReady(ref_orbit_id: number, orbit_len: number, bla_len: number): void {
     if (ref_orbit_id !== this.currentOrbitId) return; // Stale — a newer orbit was requested.
 
     this.orbitReady = true;
@@ -186,6 +186,7 @@ export class FractalSession {
       primaryOrbitDataOffset: PRIMARY_ORBIT_DATA_OFFSET,
       blaTableOffset: blaTableOffset(MAX_ORBIT_ITER),
       orbit_len,
+      bla_len,
     };
     for (const w of this.workers) w.postMessage(orbitMsg);
 

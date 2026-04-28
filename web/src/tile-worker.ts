@@ -38,6 +38,7 @@ interface OrbitReadyMsg {
   primaryOrbitDataOffset: number;
   blaTableOffset: number;
   orbit_len: number;
+  bla_len: number;
 }
 
 interface RenderTileMsg {
@@ -118,16 +119,17 @@ async function handleInit(msg: InitMsg): Promise<void> {
 function handleOrbitReady(msg: OrbitReadyMsg): void {
   if (!wasm || !glueModule || !orbitSab) return;
 
-  const { orbit_len } = msg;
+  const { orbit_len, bla_len } = msg;
 
   // Copy orbit from orbitSab (SharedArrayBuffer) into a regular ArrayBuffer,
   // then pass to WASM. wasm-bindgen cannot accept SAB-backed typed arrays.
+  // orbit_len may be bla_len + 1 for exterior references (extra escaped entry).
   const orbitByteCount = orbit_len * COMPLEX_F64_BYTES;
   const orbitLocal = new Uint8Array(orbitByteCount);
   orbitLocal.set(new Uint8Array(orbitSab, primaryOrbitDataOffset, orbitByteCount));
   const orbitF64 = new Float64Array(orbitLocal.buffer);
 
-  const blaByteCount = orbit_len * BLA_ENTRY_BYTES;
+  const blaByteCount = bla_len * BLA_ENTRY_BYTES;
   const blaLocal = new Uint8Array(blaByteCount);
   blaLocal.set(new Uint8Array(orbitSab, blaTableOffset, blaByteCount));
 

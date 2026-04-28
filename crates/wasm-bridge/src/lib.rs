@@ -304,10 +304,20 @@ fn orbit_inner<const N: usize>(
         arith::BigFloat::<N>::from_decimal_str(cx).unwrap_or_default(),
         arith::BigFloat::<N>::from_decimal_str(cy).unwrap_or_default(),
     );
-    let mut buf = vec![arith::Complex::<f64>::zero(); max_iter as usize];
+    // Allocate max_iter + 1 so compute_ref_orbit can append the escaped Z_N entry.
+    let mut buf = vec![arith::Complex::<f64>::zero(); max_iter as usize + 1];
     let orbit_len = kernel::compute_ref_orbit(&kernel::MandelbrotMap, c, max_iter, &mut buf);
-    let orbit = buf[..orbit_len].to_vec();
-    let bla = kernel::build_bla_table(&orbit);
+
+    // BLA is built from the non-escaped entries only (orbit_len).
+    let bla = kernel::build_bla_table(&buf[..orbit_len]);
+
+    // The orbit sent to perturb_pixel includes the escaped Z_N entry (orbit_len + 1)
+    // when the reference is exterior, so perturb_pixel can detect escape at the boundary.
+    // For interior references orbit_len == max_iter, and buf[orbit_len] is a zero entry
+    // that is never reached (limit = min(max_iter+1, orbit_len+1) = max_iter+1, but the
+    // interior loop will exhaust max_iter steps and return Interior before reaching it).
+    let effective_len = if orbit_len < max_iter as usize { orbit_len + 1 } else { orbit_len };
+    let orbit = buf[..effective_len].to_vec();
     (orbit, bla)
 }
 
@@ -325,10 +335,18 @@ pub fn orbit_data_len() -> u32 {
 }
 
 /// Byte offset of the BLA table in WASM linear memory.
-/// Length = `orbit_data_len() * 48` (one `BlaEntry` per orbit step).
 #[wasm_bindgen]
 pub fn bla_data_ptr() -> u32 {
     BLA.with(|b| b.borrow().as_ptr() as u32)
+}
+
+/// Number of `BlaEntry` entries in the BLA table.
+///
+/// May be less than `orbit_data_len()` by 1 for exterior reference points
+/// (the extra orbit entry is the escaped Z_N; it has no corresponding BLA entry).
+#[wasm_bindgen]
+pub fn bla_data_len() -> u32 {
+    BLA.with(|b| b.borrow().len() as u32)
 }
 
 /// Install a reference orbit and BLA table into WASM thread-local storage.
