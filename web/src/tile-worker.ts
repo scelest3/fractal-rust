@@ -39,6 +39,8 @@ interface OrbitReadyMsg {
   blaTableOffset: number;
   orbit_len: number;
   bla_len: number;
+  cx_ref: number;
+  cy_ref: number;
 }
 
 interface RenderTileMsg {
@@ -68,6 +70,8 @@ interface WasmExports {
     ptr: number,
   ) => void;
   render_tile_perturb: (
+    cxRef: number,
+    cyRef: number,
     deltaRe: number,
     deltaIm: number,
     pixelStep: number,
@@ -87,6 +91,8 @@ let tileSab: SharedArrayBuffer | null = null;
 let orbitSab: SharedArrayBuffer | null = null;
 let primaryOrbitDataOffset = 0;
 let blaTableOffset = 0;
+let orbitCxRef = 0;
+let orbitCyRef = 0;
 
 self.onmessage = async (event: MessageEvent<WorkerMsg>) => {
   const msg = event.data;
@@ -122,7 +128,9 @@ function handleOrbitReady(msg: OrbitReadyMsg): void {
     return;
   }
 
-  const { orbit_len, bla_len } = msg;
+  const { orbit_len, bla_len, cx_ref, cy_ref } = msg;
+  orbitCxRef = cx_ref;
+  orbitCyRef = cy_ref;
   console.log(`[TileWorker] installing orbit orbit_len=${orbit_len} bla_len=${bla_len}`);
 
   // Copy orbit from orbitSab (SharedArrayBuffer) into a regular ArrayBuffer,
@@ -152,7 +160,7 @@ function handleRenderTile(msg: RenderTileMsg): void {
   const ptr = wasm.alloc_tile_buf();
 
   if (usePerturb) {
-    const glitches = wasm.render_tile_perturb(deltaRe, deltaIm, step, maxIter, ptr);
+    const glitches = wasm.render_tile_perturb(orbitCxRef, orbitCyRef, deltaRe, deltaIm, step, maxIter, ptr);
     if (glitches > 0) console.log(`[TileWorker] tile (${tileX},${tileY}) glitches=${glitches}`);
   } else {
     wasm.render_tile_to_ptr(deltaRe, deltaIm, step, maxIter, ptr);

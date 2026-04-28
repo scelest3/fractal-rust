@@ -185,6 +185,7 @@ export class FractalSession {
     this.orbitReady = true;
     this.pendingOrbitDispatch = false;
 
+    const view = this.fsm.getView();
     // Forward to all Tile Workers (ordered before subsequent render_tile messages).
     const orbitMsg = {
       type: "orbit_ready",
@@ -192,6 +193,8 @@ export class FractalSession {
       blaTableOffset: blaTableOffset(MAX_ORBIT_ITER),
       orbit_len,
       bla_len,
+      cx_ref: parseFloat(view.cx),
+      cy_ref: parseFloat(view.cy),
     };
     for (const w of this.workers) w.postMessage(orbitMsg);
 
