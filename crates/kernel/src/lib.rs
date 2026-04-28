@@ -228,24 +228,33 @@ pub fn compute_ref_orbit<T: Precision, M: PerturbationSupport>(
 
 // ── perturb_pixel ─────────────────────────────────────────────────────────────
 
-/// Compute the escape-time result for one pixel via perturbation theory (no BLA).
+/// Compute the escape-time result for one pixel via perturbation theory.
 ///
-/// Iterates `δz_{n+1} = map.perturb_step(δz_n, ΔC, Z_n)` against the pre-computed
-/// f64 reference orbit. Escape is checked on `Z_n + δz_n` before each step;
-/// `orbit_min_r` is tracked over `{z_1, z_2, …}` (same convention as `escape_time`,
-/// excluding z_0 = 0).
+/// When `bla_table` is non-empty it is used to skip multiple orbit steps at once
+/// in smooth regions (BLA acceleration). Passing `&[]` disables BLA and falls back
+/// to direct per-step perturbation — used in validation tests and in Phase 1 rendering
+/// where the BLA table is not yet available. When non-empty, `bla_table` must have the
+/// same length as `ref_orbit`.
+///
+/// Escape is checked on `Z_n + δz_n` before each step (pre-step check). `orbit_min_r`
+/// is tracked over `{z_1, z_2, …}`, excluding z_0 = 0, matching `escape_time`'s
+/// convention. BLA steps skip intermediate orbit entries so `orbit_min_r` may be
+/// slightly larger than the non-BLA value — acceptable for deep-zoom rendering where
+/// orbit traps are rarely the primary coloring algorithm.
 ///
 /// Returns `EscapeResult::Glitched` when the Pauldelbrot criterion fires:
-/// `|δz_n|² > glitch_threshold² · |Z_n|²`. The caller must re-render the pixel
-/// with a reference orbit that passes through it.
+/// `|δz_n|² > glitch_threshold² · |Z_n|²`. The caller must re-render with a
+/// reference orbit that passes closer to the pixel.
 ///
 /// # Smooth-t alignment with `escape_time`
-/// The formula `n − ln(ln(|z_n|)) / ln(2)` (pre-step index n) equals
-/// `(iter + 1) − ln(ln(|z_{iter+1}|)) / ln(2)` (escape_time's iter = n − 1),
-/// so `TilePixel` output is bit-for-bit identical when dc = pixel − c_ref is small.
+/// `n − ln(ln(|z_n|)) / ln(2)` (pre-step index n) equals
+/// `(iter + 1) − ln(ln(|z_{iter+1}|)) / ln(2)` (escape_time's iter = n − 1)
+/// for the same escaped z, so `TilePixel` output matches escape_time bit-for-bit
+/// when the zero-reference trick is used in tests.
 pub fn perturb_pixel<M: PerturbationSupport>(
     map: &M,
     ref_orbit: &[Complex<f64>],
+    bla_table: &[BlaEntry],
     delta_c: DeltaC,
     max_iter: u32,
 ) -> EscapeResult {
@@ -259,7 +268,9 @@ pub fn perturb_pixel<M: PerturbationSupport>(
         t * t
     };
 
-    for (n, &z_ref) in ref_orbit[..limit].iter().enumerate() {
+    let mut n = 0usize;
+    while n < limit {
+        let z_ref = ref_orbit[n];
         let z_n = z_ref + dz;
 
         // Track orbit_min over {z_1, z_2, …} — z_0 = 0 excluded (matches escape_time).
@@ -271,11 +282,10 @@ pub fn perturb_pixel<M: PerturbationSupport>(
             }
         }
 
-        // Escape check on z_n = Z_n + δz_n.
+        // Pre-step escape check on z_n = Z_n + δz_n.
         let r_sq = z_n.norm_sqr();
         if r_sq > map.escape_radius_sq() {
             let norm = r_sq.sqrt();
-            // n - ln(ln(|z|)) / ln(2) equals escape_time's (iter+1) - ... for iter=n-1.
             let smooth_t = n as f64 - norm.ln().ln() / core::f64::consts::LN_2;
             return EscapeResult::Escaped {
                 iter: n as u32,
@@ -293,7 +303,23 @@ pub fn perturb_pixel<M: PerturbationSupport>(
             return EscapeResult::Glitched;
         }
 
+        // BLA: skip multiple steps when |δz_n| < valid_radius.
+        // bla_table.get(n) returns None for empty slices → always falls through to direct step.
+        if let Some(&entry) = bla_table.get(n) {
+            let next_n = n + entry.skip as usize;
+            if entry.valid_radius > 0.0
+                && dz.norm_sqr().sqrt() < entry.valid_radius
+                && next_n <= limit
+            {
+                dz = entry.a * dz + entry.b * dc;
+                n = next_n;
+                continue;
+            }
+        }
+
+        // Direct single perturbation step.
         dz = map.perturb_step(dz, dc, z_ref);
+        n += 1;
     }
 
     EscapeResult::Interior { orbit_min_r, orbit_min_z }
@@ -411,89 +437,6 @@ pub fn build_bla_table(orbit: &[Complex<f64>]) -> Vec<BlaEntry> {
             BlaEntry::default() // Z_i = 0, no BLA applicable (e.g. orbit start)
         })
         .collect()
-}
-
-// ── perturb_pixel_bla ─────────────────────────────────────────────────────────
-
-/// BLA-accelerated perturbation loop. Uses `bla_table[n]` to skip multiple orbit
-/// steps when `|δz_n| < bla_table[n].valid_radius`, falling back to direct iteration
-/// when the BLA approximation would be inaccurate.
-///
-/// `ref_orbit` and `bla_table` must have the same length.
-///
-/// **orbit_min note**: BLA steps skip intermediate orbit entries, so `orbit_min_r`
-/// in the returned `Interior` result may be larger than the non-BLA value. This is
-/// acceptable for deep-zoom rendering where orbit traps are rarely the primary coloring.
-pub fn perturb_pixel_bla<M: PerturbationSupport>(
-    map: &M,
-    ref_orbit: &[Complex<f64>],
-    bla_table: &[BlaEntry],
-    delta_c: DeltaC,
-    max_iter: u32,
-) -> EscapeResult {
-    debug_assert_eq!(ref_orbit.len(), bla_table.len());
-    let dc = delta_c.as_complex_f64();
-    let mut dz = Complex::<f64>::zero();
-    let mut orbit_min_r = f64::MAX;
-    let mut orbit_min_z = Complex::<f64>::zero();
-    let orbit_len = ref_orbit.len();
-    let limit = (max_iter as usize).min(orbit_len);
-    let glitch_thresh_sq = {
-        let t = map.glitch_threshold();
-        t * t
-    };
-
-    let mut n = 0usize;
-    while n < limit {
-        let z_ref = ref_orbit[n];
-        let z_n = z_ref + dz;
-
-        // Track orbit_min over {z_1, z_2, …} — z_0 = 0 excluded.
-        if n > 0 {
-            let r = z_n.norm_sqr().sqrt();
-            if r < orbit_min_r {
-                orbit_min_r = r;
-                orbit_min_z = z_n;
-            }
-        }
-
-        // Escape check.
-        let r_sq = z_n.norm_sqr();
-        if r_sq > map.escape_radius_sq() {
-            let norm = r_sq.sqrt();
-            let smooth_t = n as f64 - norm.ln().ln() / core::f64::consts::LN_2;
-            return EscapeResult::Escaped {
-                iter: n as u32,
-                smooth_t,
-                orbit_min_r,
-                orbit_min_z,
-                angle_final: z_n.im.atan2(z_n.re),
-            };
-        }
-
-        // Glitch check.
-        let ref_sq = z_ref.norm_sqr();
-        if ref_sq > 1e-30 && dz.norm_sqr() > glitch_thresh_sq * ref_sq {
-            return EscapeResult::Glitched;
-        }
-
-        // Try BLA: skip multiple steps when |δz_n| < valid_radius.
-        let entry = bla_table[n];
-        let next_n = n + entry.skip as usize;
-        if entry.valid_radius > 0.0
-            && dz.norm_sqr().sqrt() < entry.valid_radius
-            && next_n <= limit
-        {
-            dz = entry.a * dz + entry.b * dc;
-            n = next_n;
-        } else {
-            // Direct single step.
-            dz = map.perturb_step(dz, dc, z_ref);
-            n += 1;
-        }
-    }
-
-    EscapeResult::Interior { orbit_min_r, orbit_min_z }
 }
 
 // ── escape_time ───────────────────────────────────────────────────────────────
@@ -922,7 +865,7 @@ mod tests {
     fn perturb_pixel_interior_returns_interior() {
         // c = 0, dc = 0, ref = zero orbit → always Interior
         let orbit = zero_orbit(200);
-        let r = perturb_pixel(&MAP, &orbit, DeltaC::new(0.0, 0.0), 200);
+        let r = perturb_pixel(&MAP, &orbit, &[], DeltaC::new(0.0, 0.0), 200);
         assert!(matches!(r, EscapeResult::Interior { .. }));
     }
 
@@ -930,7 +873,7 @@ mod tests {
     fn perturb_pixel_interior_orbit_min_r_is_finite() {
         // Interior pixels must populate orbit_min_r (used by orbit traps)
         let orbit = zero_orbit(100);
-        let r = perturb_pixel(&MAP, &orbit, DeltaC::new(0.0, 0.0), 100);
+        let r = perturb_pixel(&MAP, &orbit, &[], DeltaC::new(0.0, 0.0), 100);
         if let EscapeResult::Interior { orbit_min_r, .. } = r {
             assert!(orbit_min_r.is_finite());
         } else {
@@ -942,7 +885,7 @@ mod tests {
     fn perturb_pixel_escaped_orbit_min_r_is_populated() {
         // Escaped pixels must also populate orbit_min_r
         let orbit = zero_orbit(200);
-        let r = perturb_pixel(&MAP, &orbit, DeltaC::new(2.0, 0.0), 200);
+        let r = perturb_pixel(&MAP, &orbit, &[], DeltaC::new(2.0, 0.0), 200);
         if let EscapeResult::Escaped { orbit_min_r, .. } = r {
             assert!(orbit_min_r.is_finite() && orbit_min_r >= 0.0);
         } else {
@@ -953,7 +896,7 @@ mod tests {
     #[test]
     fn perturb_pixel_smooth_t_is_finite_and_positive_for_escaped() {
         let orbit = zero_orbit(200);
-        let r = perturb_pixel(&MAP, &orbit, DeltaC::new(2.0, 0.0), 200);
+        let r = perturb_pixel(&MAP, &orbit, &[], DeltaC::new(2.0, 0.0), 200);
         if let EscapeResult::Escaped { smooth_t, .. } = r {
             assert!(smooth_t.is_finite() && smooth_t > 0.0);
         } else {
@@ -967,7 +910,7 @@ mod tests {
         // With Z_n=0: perturb_step(dz, 2, 0) = dz²+2, same recurrence as escape_time.
         let orbit = zero_orbit(200);
         let et = escape_time(&MAP, Complex::new(2.0_f64, 0.0), 200);
-        let pp = perturb_pixel(&MAP, &orbit, DeltaC::new(2.0, 0.0), 200);
+        let pp = perturb_pixel(&MAP, &orbit, &[], DeltaC::new(2.0, 0.0), 200);
         let et_px = TilePixel::from(et);
         let pp_px = TilePixel::from(pp);
         assert!(
@@ -981,7 +924,7 @@ mod tests {
         // c = -0.5+0i is interior in the Mandelbrot set
         let orbit = zero_orbit(500);
         let et = escape_time(&MAP, Complex::new(-0.5_f64, 0.0), 500);
-        let pp = perturb_pixel(&MAP, &orbit, DeltaC::new(-0.5, 0.0), 500);
+        let pp = perturb_pixel(&MAP, &orbit, &[], DeltaC::new(-0.5, 0.0), 500);
         let et_px = TilePixel::from(et);
         let pp_px = TilePixel::from(pp);
         assert!(
@@ -1006,7 +949,7 @@ mod tests {
                 let c = Complex::new(re, im);
 
                 let et_px = TilePixel::from(escape_time(&MAP, c, MAX_ITER));
-                let pp = perturb_pixel(&MAP, &orbit, DeltaC::new(re, im), MAX_ITER);
+                let pp = perturb_pixel(&MAP, &orbit, &[], DeltaC::new(re, im), MAX_ITER);
                 // Glitched pixels are skipped: with Z=0 the glitch guard always fires
                 // for the zero-threshold check, so no glitches should occur.
                 if matches!(pp, EscapeResult::Glitched) {
@@ -1037,6 +980,7 @@ mod tests {
         let r = perturb_pixel(
             &MAP,
             &ref_buf[..orbit_len],
+            &[],
             DeltaC::new(0.0, 0.99), // dc = 0.99i: huge relative to |Z_1|=0.5
             MAX_ITER,
         );
@@ -1055,7 +999,7 @@ mod tests {
     fn golden_assert(re: f64, im: f64, max_iter: u32) {
         let orbit = zero_orbit(max_iter as usize);
         let et_px = TilePixel::from(escape_time(&MAP, Complex::new(re, im), max_iter));
-        let pp = perturb_pixel(&MAP, &orbit, DeltaC::new(re, im), max_iter);
+        let pp = perturb_pixel(&MAP, &orbit, &[], DeltaC::new(re, im), max_iter);
         if matches!(pp, EscapeResult::Glitched) {
             return; // zero reference never glitches (Z=0 guard), so this is unreachable
         }
@@ -1246,27 +1190,24 @@ mod tests {
         );
     }
 
-    // ── pixel-exact: perturb_pixel_bla vs perturb_pixel ───────────────────────
+    // ── pixel-exact: perturb_pixel with BLA vs without ───────────────────────
 
     #[test]
     fn bla_pixel_exact_interior_matches_perturb_pixel() {
-        // Interior reference, tiny δc — both paths must return Interior with
-        // matching escaped flag and smooth_t (no BLA approximation errors).
+        // Interior reference, tiny δc — BLA and direct paths must both return Interior.
         const MAX_ITER: u32 = 256;
         let c_ref = Complex::new(-0.5_f64, 0.0);
         let mut orbit = vec![Complex::<f64>::zero(); MAX_ITER as usize];
         let orbit_len = compute_ref_orbit(&MAP, c_ref, MAX_ITER, &mut orbit);
         let table = build_bla_table(&orbit[..orbit_len]);
 
-        // Single pixel very close to reference; guaranteed interior.
         let dc = DeltaC::new(1e-12, 0.0);
-        let r_ref = perturb_pixel(&MAP, &orbit[..orbit_len], dc, MAX_ITER);
-        let r_bla = perturb_pixel_bla(&MAP, &orbit[..orbit_len], &table, dc, MAX_ITER);
+        let r_direct = perturb_pixel(&MAP, &orbit[..orbit_len], &[], dc, MAX_ITER);
+        let r_bla = perturb_pixel(&MAP, &orbit[..orbit_len], &table, dc, MAX_ITER);
 
-        // Both must be Interior (not Glitched or Escaped).
         assert!(
-            matches!(r_ref, EscapeResult::Interior { .. }),
-            "reference should be Interior, got {r_ref:?}"
+            matches!(r_direct, EscapeResult::Interior { .. }),
+            "direct should be Interior, got {r_direct:?}"
         );
         assert!(
             matches!(r_bla, EscapeResult::Interior { .. }),
@@ -1277,27 +1218,25 @@ mod tests {
     #[test]
     fn bla_pixel_exact_degenerate_zero_ref_matches_perturb_pixel() {
         // Zero reference (valid_radius = 0 everywhere): BLA never fires, so
-        // perturb_pixel_bla must be identical to perturb_pixel.
+        // perturb_pixel with BLA table must be identical to perturb_pixel without.
         const MAX_ITER: u32 = 200;
         let orbit = zero_orbit(MAX_ITER as usize);
         let table = build_bla_table(&orbit);
 
-        // Verify all table entries have valid_radius = 0 (Z = 0 everywhere).
         assert!(
             table.iter().all(|e| e.valid_radius == 0.0),
             "zero orbit must produce all-zero valid_radius entries"
         );
 
-        // Two test pixels: interior (dc=0) and exterior (dc=2).
         for (re, im) in [(0.0_f64, 0.0_f64), (2.0_f64, 0.0_f64)] {
             let dc = DeltaC::new(re, im);
-            let r_ref = perturb_pixel(&MAP, &orbit, dc, MAX_ITER);
-            let r_bla = perturb_pixel_bla(&MAP, &orbit, &table, dc, MAX_ITER);
+            let r_direct = perturb_pixel(&MAP, &orbit, &[], dc, MAX_ITER);
+            let r_bla = perturb_pixel(&MAP, &orbit, &table, dc, MAX_ITER);
 
-            let px_ref = if matches!(r_ref, EscapeResult::Glitched) {
-                continue; // glitch is acceptable for large dc
+            let px_direct = if matches!(r_direct, EscapeResult::Glitched) {
+                continue;
             } else {
-                TilePixel::from(r_ref)
+                TilePixel::from(r_direct)
             };
             if matches!(r_bla, EscapeResult::Glitched) {
                 continue;
@@ -1305,8 +1244,8 @@ mod tests {
             let px_bla = TilePixel::from(r_bla);
 
             assert!(
-                tile_pixels_match(px_ref, px_bla),
-                "degenerate-ref pixel ({re}, {im}): ref={px_ref:?} bla={px_bla:?}"
+                tile_pixels_match(px_direct, px_bla),
+                "degenerate-ref pixel ({re}, {im}): direct={px_direct:?} bla={px_bla:?}"
             );
         }
     }
@@ -1315,7 +1254,7 @@ mod tests {
     fn bla_pixel_exact_256x256_tile_at_interior_ref() {
         // Full 256×256 tile, interior reference c_ref = -0.5+0i.
         // δc values span ±1e-8 around c_ref: all pixels are interior (no glitch).
-        // perturb_pixel and perturb_pixel_bla must agree on escaped/interior for all.
+        // perturb_pixel with and without BLA must agree on escaped/interior for all.
         const MAX_ITER: u32 = 256;
         const TILE: usize = 256;
         const STEP: f64 = 2e-8 / TILE as f64;
@@ -1332,30 +1271,28 @@ mod tests {
                 let dim = (row as f64 - TILE as f64 / 2.0) * STEP;
                 let dc = DeltaC::new(dre, dim);
 
-                let r_ref = perturb_pixel(&MAP, &orbit[..orbit_len], dc, MAX_ITER);
-                let r_bla = perturb_pixel_bla(&MAP, &orbit[..orbit_len], &table, dc, MAX_ITER);
+                let r_direct = perturb_pixel(&MAP, &orbit[..orbit_len], &[], dc, MAX_ITER);
+                let r_bla = perturb_pixel(&MAP, &orbit[..orbit_len], &table, dc, MAX_ITER);
 
-                // Skip glitched pixels (δc might be large near tile edges).
-                if matches!(r_ref, EscapeResult::Glitched)
+                if matches!(r_direct, EscapeResult::Glitched)
                     || matches!(r_bla, EscapeResult::Glitched)
                 {
                     continue;
                 }
 
-                // Escaped classification and smooth_t must match.
-                let escaped_ref = matches!(r_ref, EscapeResult::Escaped { .. });
+                let escaped_direct = matches!(r_direct, EscapeResult::Escaped { .. });
                 let escaped_bla = matches!(r_bla, EscapeResult::Escaped { .. });
-                if escaped_ref != escaped_bla {
+                if escaped_direct != escaped_bla {
                     mismatches += 1;
                     continue;
                 }
-                if escaped_ref {
+                if escaped_direct {
                     if let (
-                        EscapeResult::Escaped { smooth_t: st_ref, angle_final: af_ref, .. },
-                        EscapeResult::Escaped { smooth_t: st_bla, angle_final: af_bla, .. },
-                    ) = (r_ref, r_bla)
+                        EscapeResult::Escaped { smooth_t: st_d, angle_final: af_d, .. },
+                        EscapeResult::Escaped { smooth_t: st_b, angle_final: af_b, .. },
+                    ) = (r_direct, r_bla)
                     {
-                        if (st_ref - st_bla).abs() > 1e-6 || (af_ref - af_bla).abs() > 1e-6 {
+                        if (st_d - st_b).abs() > 1e-6 || (af_d - af_b).abs() > 1e-6 {
                             mismatches += 1;
                         }
                     }
@@ -1365,7 +1302,7 @@ mod tests {
 
         assert_eq!(
             mismatches, 0,
-            "{mismatches} pixel(s) differed between perturb_pixel and perturb_pixel_bla"
+            "{mismatches} pixel(s) differed between perturb_pixel (no BLA) and perturb_pixel (BLA)"
         );
     }
 }
