@@ -88,34 +88,41 @@ function handleComputeOrbit(msg: ComputeOrbitMsg): void {
   }
 
   const { cx, cy, zoom_exp, max_iter, ref_orbit_id } = msg;
+  console.log(`[OrbitWorker] computing orbit cx=${cx} cy=${cy} zoom_exp=${zoom_exp} max_iter=${max_iter}`);
 
-  // Compute in WASM heap (BigFloat<N> precision selected by zoom_exp).
-  glue.compute_reference_orbit(cx, cy, zoom_exp, max_iter);
+  try {
+    // Compute in WASM heap (BigFloat<N> precision selected by zoom_exp).
+    glue.compute_reference_orbit(cx, cy, zoom_exp, max_iter);
 
-  // orbit_len may be orbit_non_escaped + 1 for exterior references (the extra
-  // entry is Z_N, the first escaped value; perturb_pixel needs it).
-  const orbit_len = glue.orbit_data_len();
-  const bla_len = glue.bla_data_len(); // non-escaped count, ≤ orbit_len
-  const orbitPtr = glue.orbit_data_ptr();
-  const blaPtr = glue.bla_data_ptr();
-  const mem = wasm.memory.buffer;
+    // orbit_len may be bla_len + 1 for exterior references (the extra entry is
+    // Z_N, the first escaped value; perturb_pixel needs it to detect escape).
+    const orbit_len = glue.orbit_data_len();
+    const bla_len = glue.bla_data_len();
+    const orbitPtr = glue.orbit_data_ptr();
+    const blaPtr = glue.bla_data_ptr();
+    const mem = wasm.memory.buffer;
 
-  // Copy orbit bytes (orbit_len × 16 B) into orbitSab at primaryOrbitDataOffset.
-  const orbitByteCount = orbit_len * COMPLEX_F64_BYTES;
-  new Uint8Array(orbitSab, primaryOrbitDataOffset, orbitByteCount).set(
-    new Uint8Array(mem, orbitPtr, orbitByteCount),
-  );
+    console.log(`[OrbitWorker] orbit_len=${orbit_len} bla_len=${bla_len} orbitPtr=${orbitPtr} blaPtr=${blaPtr}`);
 
-  // Copy BLA bytes (bla_len × 48 B) into orbitSab at blaTableOffset.
-  const blaByteCount = bla_len * BLA_ENTRY_BYTES;
-  new Uint8Array(orbitSab, blaTableOffset, blaByteCount).set(
-    new Uint8Array(mem, blaPtr, blaByteCount),
-  );
+    // Copy orbit bytes (orbit_len × 16 B) into orbitSab at primaryOrbitDataOffset.
+    const orbitByteCount = orbit_len * COMPLEX_F64_BYTES;
+    new Uint8Array(orbitSab, primaryOrbitDataOffset, orbitByteCount).set(
+      new Uint8Array(mem, orbitPtr, orbitByteCount),
+    );
 
-  (self as unknown as Worker).postMessage({
-    type: "orbit_ready",
-    ref_orbit_id,
-    orbit_len,
-    bla_len,
-  });
+    // Copy BLA bytes (bla_len × 48 B) into orbitSab at blaTableOffset.
+    const blaByteCount = bla_len * BLA_ENTRY_BYTES;
+    new Uint8Array(orbitSab, blaTableOffset, blaByteCount).set(
+      new Uint8Array(mem, blaPtr, blaByteCount),
+    );
+
+    (self as unknown as Worker).postMessage({
+      type: "orbit_ready",
+      ref_orbit_id,
+      orbit_len,
+      bla_len,
+    });
+  } catch (err) {
+    console.error("[OrbitWorker] compute_orbit failed:", err);
+  }
 }

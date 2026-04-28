@@ -166,16 +166,21 @@ export class FractalSession {
 
   private onOrbitWorkerMessage(msg: OrbitWorkerInMsg): void {
     if (msg.type === "orbit_worker_ready") {
+      console.log("[Session] orbit worker ready");
       this.orbitWorkerReady = true;
-      // If a dispatch is waiting for the orbit worker to be ready, retry.
-      if (this.pendingOrbitDispatch) this.scheduleDispatch();
+      // Always retry — scheduleDispatch will request the orbit if needed.
+      this.scheduleDispatch();
     } else if (msg.type === "orbit_ready") {
       this.onOrbitReady(msg.ref_orbit_id, msg.orbit_len, msg.bla_len);
     }
   }
 
   private onOrbitReady(ref_orbit_id: number, orbit_len: number, bla_len: number): void {
-    if (ref_orbit_id !== this.currentOrbitId) return; // Stale — a newer orbit was requested.
+    console.log(`[Session] orbit_ready id=${ref_orbit_id} orbit_len=${orbit_len} bla_len=${bla_len}`);
+    if (ref_orbit_id !== this.currentOrbitId) {
+      console.log(`[Session] stale orbit (current=${this.currentOrbitId}), ignoring`);
+      return;
+    }
 
     this.orbitReady = true;
     this.pendingOrbitDispatch = false;
@@ -235,17 +240,16 @@ export class FractalSession {
 
     if (usePerturb) {
       if (!this.orbitWorkerReady) {
-        // Orbit worker still initialising; retry when it's ready.
-        this.pendingOrbitDispatch = true;
+        // Orbit worker still initialising; onOrbitWorkerMessage will retry.
         return;
       }
       if (!this.orbitReady) {
         // Request a new orbit if we haven't already for this generation.
         if (!this.pendingOrbitDispatch) {
           this.pendingOrbitDispatch = true;
-          this.orbitReady = false;
           this.currentOrbitId++;
           const maxIter = this.computeMaxIter(view.zoom_exp);
+          console.log(`[Session] requesting orbit id=${this.currentOrbitId} zoom_exp=${view.zoom_exp.toFixed(2)} max_iter=${maxIter}`);
           this.orbitWorker.postMessage({
             type: "compute_orbit",
             cx: view.cx,

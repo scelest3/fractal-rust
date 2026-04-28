@@ -117,9 +117,13 @@ async function handleInit(msg: InitMsg): Promise<void> {
 }
 
 function handleOrbitReady(msg: OrbitReadyMsg): void {
-  if (!wasm || !glueModule || !orbitSab) return;
+  if (!wasm || !glueModule || !orbitSab) {
+    console.warn("[TileWorker] orbit_ready before init, ignoring");
+    return;
+  }
 
   const { orbit_len, bla_len } = msg;
+  console.log(`[TileWorker] installing orbit orbit_len=${orbit_len} bla_len=${bla_len}`);
 
   // Copy orbit from orbitSab (SharedArrayBuffer) into a regular ArrayBuffer,
   // then pass to WASM. wasm-bindgen cannot accept SAB-backed typed arrays.
@@ -148,7 +152,8 @@ function handleRenderTile(msg: RenderTileMsg): void {
   const ptr = wasm.alloc_tile_buf();
 
   if (usePerturb) {
-    wasm.render_tile_perturb(deltaRe, deltaIm, step, maxIter, ptr);
+    const glitches = wasm.render_tile_perturb(deltaRe, deltaIm, step, maxIter, ptr);
+    if (glitches > 0) console.log(`[TileWorker] tile (${tileX},${tileY}) glitches=${glitches}`);
   } else {
     wasm.render_tile_to_ptr(deltaRe, deltaIm, step, maxIter, ptr);
   }
