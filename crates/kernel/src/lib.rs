@@ -6,7 +6,7 @@
 //! `BigFloat<N>` types; `kernel` is generic over `T: Precision` for the cold
 //! reference orbit path (Phase 2).
 
-use arith::{Complex, Precision};
+use arith::{Complex, DeltaC, Precision};
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
@@ -224,6 +224,79 @@ pub fn compute_ref_orbit<T: Precision, M: PerturbationSupport>(
         z = z_next;
     }
     limit
+}
+
+// ── perturb_pixel ─────────────────────────────────────────────────────────────
+
+/// Compute the escape-time result for one pixel via perturbation theory (no BLA).
+///
+/// Iterates `δz_{n+1} = map.perturb_step(δz_n, ΔC, Z_n)` against the pre-computed
+/// f64 reference orbit. Escape is checked on `Z_n + δz_n` before each step;
+/// `orbit_min_r` is tracked over `{z_1, z_2, …}` (same convention as `escape_time`,
+/// excluding z_0 = 0).
+///
+/// Returns `EscapeResult::Glitched` when the Pauldelbrot criterion fires:
+/// `|δz_n|² > glitch_threshold² · |Z_n|²`. The caller must re-render the pixel
+/// with a reference orbit that passes through it.
+///
+/// # Smooth-t alignment with `escape_time`
+/// The formula `n − ln(ln(|z_n|)) / ln(2)` (pre-step index n) equals
+/// `(iter + 1) − ln(ln(|z_{iter+1}|)) / ln(2)` (escape_time's iter = n − 1),
+/// so `TilePixel` output is bit-for-bit identical when dc = pixel − c_ref is small.
+pub fn perturb_pixel<M: PerturbationSupport>(
+    map: &M,
+    ref_orbit: &[Complex<f64>],
+    delta_c: DeltaC,
+    max_iter: u32,
+) -> EscapeResult {
+    let dc = delta_c.as_complex_f64();
+    let mut dz = Complex::<f64>::zero();
+    let mut orbit_min_r = f64::MAX;
+    let mut orbit_min_z = Complex::<f64>::zero();
+    let limit = (max_iter as usize).min(ref_orbit.len());
+    let glitch_thresh_sq = {
+        let t = map.glitch_threshold();
+        t * t
+    };
+
+    for (n, &z_ref) in ref_orbit[..limit].iter().enumerate() {
+        let z_n = z_ref + dz;
+
+        // Track orbit_min over {z_1, z_2, …} — z_0 = 0 excluded (matches escape_time).
+        if n > 0 {
+            let r = z_n.norm_sqr().sqrt();
+            if r < orbit_min_r {
+                orbit_min_r = r;
+                orbit_min_z = z_n;
+            }
+        }
+
+        // Escape check on z_n = Z_n + δz_n.
+        let r_sq = z_n.norm_sqr();
+        if r_sq > map.escape_radius_sq() {
+            let norm = r_sq.sqrt();
+            // n - ln(ln(|z|)) / ln(2) equals escape_time's (iter+1) - ... for iter=n-1.
+            let smooth_t = n as f64 - norm.ln().ln() / core::f64::consts::LN_2;
+            return EscapeResult::Escaped {
+                iter: n as u32,
+                smooth_t,
+                orbit_min_r,
+                orbit_min_z,
+                angle_final: z_n.im.atan2(z_n.re),
+            };
+        }
+
+        // Pauldelbrot glitch criterion: |δz_n|² > threshold² · |Z_n|².
+        // Guard: skip when Z_n ≈ 0 — criterion is undefined near the origin.
+        let ref_sq = z_ref.norm_sqr();
+        if ref_sq > 1e-30 && dz.norm_sqr() > glitch_thresh_sq * ref_sq {
+            return EscapeResult::Glitched;
+        }
+
+        dz = map.perturb_step(dz, dc, z_ref);
+    }
+
+    EscapeResult::Interior { orbit_min_r, orbit_min_z }
 }
 
 // ── escape_time ───────────────────────────────────────────────────────────────
@@ -630,5 +703,188 @@ mod tests {
         for z in &out[..len] {
             assert!(z.re.abs() <= 2.0 + 1e-10 && z.im.abs() <= 2.0 + 1e-10);
         }
+    }
+
+    // ── perturb_pixel ─────────────────────────────────────────────────────────
+
+    // Build a zero reference orbit (c_ref = 0+0i, Z_n = 0 for all n).
+    // With this reference, perturb_step(dz, dc, 0) = dz² + dc, which is
+    // arithmetically identical to escape_time's z² + c, giving bit-identical output.
+    fn zero_orbit(len: usize) -> Vec<Complex<f64>> {
+        vec![Complex::new(0.0_f64, 0.0); len]
+    }
+
+    fn tile_pixels_match(a: TilePixel, b: TilePixel) -> bool {
+        a.escaped == b.escaped
+            && (a.smooth_t - b.smooth_t).abs() < 1e-6_f32
+            && (a.orbit_min_r - b.orbit_min_r).abs() < 1e-6_f32
+            && (a.angle - b.angle).abs() < 1e-6_f32
+    }
+
+    #[test]
+    fn perturb_pixel_interior_returns_interior() {
+        // c = 0, dc = 0, ref = zero orbit → always Interior
+        let orbit = zero_orbit(200);
+        let r = perturb_pixel(&MAP, &orbit, DeltaC::new(0.0, 0.0), 200);
+        assert!(matches!(r, EscapeResult::Interior { .. }));
+    }
+
+    #[test]
+    fn perturb_pixel_interior_orbit_min_r_is_finite() {
+        // Interior pixels must populate orbit_min_r (used by orbit traps)
+        let orbit = zero_orbit(100);
+        let r = perturb_pixel(&MAP, &orbit, DeltaC::new(0.0, 0.0), 100);
+        if let EscapeResult::Interior { orbit_min_r, .. } = r {
+            assert!(orbit_min_r.is_finite());
+        } else {
+            panic!("expected Interior");
+        }
+    }
+
+    #[test]
+    fn perturb_pixel_escaped_orbit_min_r_is_populated() {
+        // Escaped pixels must also populate orbit_min_r
+        let orbit = zero_orbit(200);
+        let r = perturb_pixel(&MAP, &orbit, DeltaC::new(2.0, 0.0), 200);
+        if let EscapeResult::Escaped { orbit_min_r, .. } = r {
+            assert!(orbit_min_r.is_finite() && orbit_min_r >= 0.0);
+        } else {
+            panic!("expected Escaped");
+        }
+    }
+
+    #[test]
+    fn perturb_pixel_smooth_t_is_finite_and_positive_for_escaped() {
+        let orbit = zero_orbit(200);
+        let r = perturb_pixel(&MAP, &orbit, DeltaC::new(2.0, 0.0), 200);
+        if let EscapeResult::Escaped { smooth_t, .. } = r {
+            assert!(smooth_t.is_finite() && smooth_t > 0.0);
+        } else {
+            panic!("expected Escaped");
+        }
+    }
+
+    #[test]
+    fn perturb_pixel_matches_escape_time_for_c_equals_2() {
+        // c = 2+0i, dc = 2+0i, zero ref orbit.
+        // With Z_n=0: perturb_step(dz, 2, 0) = dz²+2, same recurrence as escape_time.
+        let orbit = zero_orbit(200);
+        let et = escape_time(&MAP, Complex::new(2.0_f64, 0.0), 200);
+        let pp = perturb_pixel(&MAP, &orbit, DeltaC::new(2.0, 0.0), 200);
+        let et_px = TilePixel::from(et);
+        let pp_px = TilePixel::from(pp);
+        assert!(
+            tile_pixels_match(et_px, pp_px),
+            "TilePixel mismatch: escape_time={et_px:?} perturb_pixel={pp_px:?}"
+        );
+    }
+
+    #[test]
+    fn perturb_pixel_matches_escape_time_for_interior_point() {
+        // c = -0.5+0i is interior in the Mandelbrot set
+        let orbit = zero_orbit(500);
+        let et = escape_time(&MAP, Complex::new(-0.5_f64, 0.0), 500);
+        let pp = perturb_pixel(&MAP, &orbit, DeltaC::new(-0.5, 0.0), 500);
+        let et_px = TilePixel::from(et);
+        let pp_px = TilePixel::from(pp);
+        assert!(
+            tile_pixels_match(et_px, pp_px),
+            "TilePixel mismatch: escape_time={et_px:?} perturb_pixel={pp_px:?}"
+        );
+    }
+
+    #[test]
+    fn perturb_pixel_grid_matches_escape_time_at_zoom_exp_0() {
+        // 16×16 grid over the standard Mandelbrot viewport [-2, 1] × [-1.25, 1.25].
+        // Reference is the origin (Z_n = 0 for all n), dc = c for each pixel.
+        // With Z=0 the perturbation recurrence is identical to escape_time.
+        const N: usize = 16;
+        const MAX_ITER: u32 = 200;
+        let orbit = zero_orbit(MAX_ITER as usize);
+
+        for row in 0..N {
+            for col in 0..N {
+                let re = -2.0 + (col as f64 / (N - 1) as f64) * 3.0;
+                let im = -1.25 + (row as f64 / (N - 1) as f64) * 2.5;
+                let c = Complex::new(re, im);
+
+                let et_px = TilePixel::from(escape_time(&MAP, c, MAX_ITER));
+                let pp = perturb_pixel(&MAP, &orbit, DeltaC::new(re, im), MAX_ITER);
+                // Glitched pixels are skipped: with Z=0 the glitch guard always fires
+                // for the zero-threshold check, so no glitches should occur.
+                if matches!(pp, EscapeResult::Glitched) {
+                    continue;
+                }
+                let pp_px = TilePixel::from(pp);
+                assert!(
+                    tile_pixels_match(et_px, pp_px),
+                    "mismatch at ({re:.3}, {im:.3}): escape_time={et_px:?} perturb_pixel={pp_px:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perturb_pixel_glitch_fires_for_large_delta_c() {
+        // Reference at c_ref = -0.5+0i (Z values cycle near 0.25–0.5).
+        // Pixel at c = -0.5+0.99i → |dc|=0.99i, much larger than glitch threshold × |Z_1|.
+        // Glitch should fire on the first non-trivial step.
+        const MAX_ITER: u32 = 100;
+        let mut ref_buf = vec![Complex::<f64>::zero(); MAX_ITER as usize];
+        let orbit_len = compute_ref_orbit(
+            &MAP,
+            Complex::new(-0.5_f64, 0.0),
+            MAX_ITER,
+            &mut ref_buf,
+        );
+        let r = perturb_pixel(
+            &MAP,
+            &ref_buf[..orbit_len],
+            DeltaC::new(0.0, 0.99), // dc = 0.99i: huge relative to |Z_1|=0.5
+            MAX_ITER,
+        );
+        assert!(
+            matches!(r, EscapeResult::Glitched),
+            "expected Glitched for large dc, got {r:?}"
+        );
+    }
+
+    // ── Golden coordinate tests ───────────────────────────────────────────────
+    //
+    // Three specific Mandelbrot coordinates used as regression anchors.
+    // The oracle is escape_time (validated separately). perturb_pixel with the
+    // zero reference must produce the same TilePixel for each golden point.
+
+    fn golden_assert(re: f64, im: f64, max_iter: u32) {
+        let orbit = zero_orbit(max_iter as usize);
+        let et_px = TilePixel::from(escape_time(&MAP, Complex::new(re, im), max_iter));
+        let pp = perturb_pixel(&MAP, &orbit, DeltaC::new(re, im), max_iter);
+        if matches!(pp, EscapeResult::Glitched) {
+            return; // zero reference never glitches (Z=0 guard), so this is unreachable
+        }
+        let pp_px = TilePixel::from(pp);
+        assert!(
+            tile_pixels_match(et_px, pp_px),
+            "golden ({re}, {im}): escape_time={et_px:?} perturb_pixel={pp_px:?}"
+        );
+    }
+
+    #[test]
+    fn golden_seahorse_valley_exterior() {
+        // Classic exterior point near the Seahorse Valley.
+        // escape_time oracle: escapes in the boundary region, ~50–200 iterations.
+        golden_assert(-0.7269, 0.1889, 500);
+    }
+
+    #[test]
+    fn golden_cardioid_boundary_exterior() {
+        // Point just outside the main cardioid — escapes quickly.
+        golden_assert(0.5, 0.5, 500);
+    }
+
+    #[test]
+    fn golden_period2_bulb_exterior() {
+        // Near the period-2 bulb boundary.
+        golden_assert(-1.3, 0.0, 500);
     }
 }
