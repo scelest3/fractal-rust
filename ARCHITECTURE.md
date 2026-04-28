@@ -142,16 +142,29 @@ Key `kernel` entry points:
 
 ```rust
 // Phase 1: plain escape-time render for one tile
-pub fn render_tile_escape<M: IterationMap>(map: &M, coords: &[Complex<f64>], max_iter: u32, out: &mut [TilePixel]);
+pub fn render_tile_escape<M: IterationMap>(
+    map: &M, coords: &[Complex<f64>], max_iter: u32, out: &mut [TilePixel]);
 
-// Phase 2: compute reference orbit at precision T (generic; wasm-bridge monomorphizes for N=2,4,8)
-pub fn compute_ref_orbit<T: Precision, M: PerturbationSupport>(c: Complex<T>, max_iter: u32, out: &mut [Complex<f64>]) -> u32;
+// Phase 2: compute reference orbit at precision T (generic; wasm-bridge monomorphises for N=2,4,8).
+// Returns the number of non-escaped entries written to `out`.
+// Terminates early if the reference point itself escapes before max_iter.
+pub fn compute_ref_orbit<T: Precision, M: PerturbationSupport>(
+    map: &M, c: Complex<T>, max_iter: u32, out: &mut [Complex<f64>]) -> usize;
 
-// Phase 2: per-pixel perturbation hot path
-pub fn perturb_pixel<M: PerturbationSupport>(map: &M, orbit: &[Complex<f64>], bla: &[BlaEntry], dc: DeltaC, max_iter: u32) -> EscapeResult;
+// Phase 2: per-pixel perturbation hot path (no BLA; each step is a direct f64 recurrence).
+// Returns Glitched when |δz_n|² > threshold² · |Z_n|².
+pub fn perturb_pixel<M: PerturbationSupport>(
+    map: &M, ref_orbit: &[Complex<f64>], delta_c: DeltaC, max_iter: u32) -> EscapeResult;
 
-// Phase 2: build BLA table from f64 orbit (called once by Orbit Worker after compute_ref_orbit)
-pub fn build_bla_table(orbit: &[Complex<f64>], out: &mut [BlaEntry]) -> usize;
+// Phase 2: BLA-accelerated perturbation. ref_orbit.len() must equal bla_table.len().
+// Falls back to direct perturbation when |δz_n| ≥ bla_table[n].valid_radius.
+pub fn perturb_pixel_bla<M: PerturbationSupport>(
+    map: &M, ref_orbit: &[Complex<f64>], bla_table: &[BlaEntry],
+    delta_c: DeltaC, max_iter: u32) -> EscapeResult;
+
+// Phase 2: build BLA table from f64 orbit (called once by Orbit Worker after compute_ref_orbit).
+// Returns one BlaEntry per orbit position; valid_radius = 0 means no BLA applicable there.
+pub fn build_bla_table(orbit: &[Complex<f64>]) -> Vec<BlaEntry>;
 ```
 
 #### 4.2.1 Mandelbrot / Julia Kernel
@@ -183,18 +196,31 @@ The BLA table lives in the shared `WebAssembly.Memory` BLA region alongside the 
 
 ### 4.3 `crate: coloring`
 
-Coloring is separated from escape computation. The `EscapeResult` struct carries all raw orbit data:
+Coloring is separated from escape computation. `EscapeResult` is an enum with three mutually exclusive outcomes:
 
 ```rust
-pub struct EscapeResult {
-    pub iter:          u32,
-    pub escaped:       bool,
-    pub smooth_t:      f64,        // fractional escape for smooth coloring
-    pub orbit_min_r:   f64,        // orbit-trap: min |z| reached
-    pub orbit_min_z:   Complex<f64>,
-    pub angle_final:   f64,        // arg(z) at escape
+pub enum EscapeResult {
+    /// Orbit escaped within max_iter steps.
+    Escaped {
+        iter:        u32,      // orbit index at which z_n first exceeded escape radius
+        smooth_t:    f64,      // fractional escape for band-free coloring
+        orbit_min_r: f64,      // orbit-trap: min |z| over {z_1, z_2, …}
+        orbit_min_z: Complex<f64>,
+        angle_final: f64,      // arg(z) at escape
+    },
+    /// Orbit did not escape (interior or convergent point).
+    Interior {
+        orbit_min_r: f64,
+        orbit_min_z: Complex<f64>,
+    },
+    /// Pixel needs re-rendering with a better reference orbit.
+    /// `From<EscapeResult> for TilePixel` panics on this variant —
+    /// glitched pixels must be resolved before GPU upload.
+    Glitched,
 }
 ```
+
+`orbit_min_r` and `orbit_min_z` are populated for both `Escaped` and `Interior` so the coloring crate can apply orbit-trap overlays to all pixels. `Interior` deliberately omits `iter` — the coloring crate does not need it, and removing it makes the type harder to misuse.
 
 | Algorithm | Formula | Notes |
 |---|---|---|
@@ -512,55 +538,61 @@ Every pixel `C = C_ref + ΔC`. The perturbation `δₙ = Zₙ − Z_ref,n` evolv
 
 ### 9.2 Implementation
 
-// EscapeResult is an enum — three mutually exclusive outcomes:
-//
-//   Escaped  { iter, smooth_t, orbit_min_r, orbit_min_z, angle_final }
-//   Interior { orbit_min_r, orbit_min_z }
-//   Glitched
-//
-// orbit_min_r / orbit_min_z are tracked for both Escaped and Interior so
-// the coloring crate can apply orbit-trap overlays to all pixels.
-// From<EscapeResult> for TilePixel panics on Glitched — glitched pixels
-// are re-rendered via a secondary orbit before GPU upload.
+The perturbation loop uses a **pre-step escape check**: escape is tested on `z_n = Z_n + δz_n`
+(the current full orbit value) _before_ computing `δz_{n+1}`. This aligns with `escape_time`'s
+post-step convention when the smooth-t formula uses `n` instead of `n + 1` — the same escaped
+z is used in both cases, so `TilePixel` output is bit-for-bit identical when `c_ref = 0`
+(verified by the 16×16 grid test and three golden-coordinate regression tests).
+
+`orbit_min_r` is tracked over `{z_1, z_2, …}`, excluding z_0 = 0, to match `escape_time`'s
+convention and avoid a trivial orbit-trap hit at the fixed starting point.
+
+The Pauldelbrot glitch criterion `|δz_n|² > 1e-6 · |Z_n|²` skips positions where `|Z_n| ≈ 0`
+(guarded by `|Z_n|² > 1e-30`). Without this guard, the criterion fires incorrectly at orbit
+positions where the reference passes near the origin — most notably at `n = 0` where `Z_0 = 0`
+always. This is a common implementation pitfall.
 
 ```rust
-pub fn perturb_pixel(
+pub fn perturb_pixel<M: PerturbationSupport>(
+    map: &M,
     ref_orbit: &[Complex<f64>],
     delta_c: DeltaC,       // opaque type; f64 pair in v1
     max_iter: u32,
 ) -> EscapeResult {
-    let mut delta = Complex::new(0.0, 0.0);
+    let dc = delta_c.as_complex_f64();
+    let mut dz = Complex::<f64>::zero();
     let mut orbit_min_r = f64::MAX;
     let mut orbit_min_z = Complex::<f64>::zero();
 
-    for (n, &z_ref) in ref_orbit.iter().enumerate() {
-        delta = 2.0 * z_ref * delta + delta * delta + delta_c.as_complex_f64();
+    for (n, &z_ref) in ref_orbit[..limit].iter().enumerate() {
+        let z_n = z_ref + dz;
 
-        let z_approx = z_ref + delta;
-
-        // Track orbit minimum for orbit-trap coloring.
-        let r = z_approx.norm_sqr().sqrt();
-        if r < orbit_min_r { orbit_min_r = r; orbit_min_z = z_approx; }
-
-        // Glitch detection (Pauldelbrot criterion: |δ| > 1e-3 · |Z_ref|,
-        // equivalently |δ|² > 1e-6 · |Z_ref|²).
-        if delta.norm_sqr() > 1e-6 * z_ref.norm_sqr() {
-            return EscapeResult::Glitched;
+        // Track orbit_min over {z_1, z_2, …} — z_0 = 0 excluded.
+        if n > 0 {
+            let r = z_n.norm_sqr().sqrt();
+            if r < orbit_min_r { orbit_min_r = r; orbit_min_z = z_n; }
         }
 
-        // Escape test on approximated full orbit.
-        if z_approx.norm_sqr() > 4.0 {
-            let smooth_t = (n as f64 + 1.0)
-                - (z_approx.norm_sqr().sqrt().ln().ln() / core::f64::consts::LN_2);
+        // Pre-step escape check on z_n = Z_n + δz_n.
+        // smooth_t = n − ln(ln|z_n|)/ln 2 equals escape_time's (iter+1) − …
+        // for the same escaped z (escape_time's iter = n − 1 for the same z).
+        let r_sq = z_n.norm_sqr();
+        if r_sq > map.escape_radius_sq() {
+            let smooth_t = n as f64 - r_sq.sqrt().ln().ln() / LN_2;
             return EscapeResult::Escaped {
                 iter: n as u32, smooth_t, orbit_min_r, orbit_min_z,
-                angle_final: z_approx.im.atan2(z_approx.re),
+                angle_final: z_n.im.atan2(z_n.re),
             };
         }
 
-        if n == ref_orbit.len() - 1 {
-            return EscapeResult::Interior { orbit_min_r, orbit_min_z };
+        // Pauldelbrot glitch criterion: |δz_n|² > threshold² · |Z_n|².
+        // Guard: skip when Z_n ≈ 0 (criterion undefined near origin).
+        let ref_sq = z_ref.norm_sqr();
+        if ref_sq > 1e-30 && dz.norm_sqr() > glitch_thresh_sq * ref_sq {
+            return EscapeResult::Glitched;
         }
+
+        dz = map.perturb_step(dz, dc, z_ref);
     }
     EscapeResult::Interior { orbit_min_r, orbit_min_z }
 }
@@ -571,13 +603,17 @@ pub fn perturb_pixel(
 In smooth regions, `δₙ₊ₖ ≈ A·δₙ + B·ΔC`. The BLA table precomputes valid `(A, B, skip, valid_radius)` entries for each starting iteration using Zhuoran's level-doubling algorithm.
 
 ```rust
+// repr(C); total size 48 bytes (verified by size_of test).
 pub struct BlaEntry {
-    pub a: Complex<f64>,
-    pub b: Complex<f64>,
-    pub skip: u32,
-    pub valid_radius: f64,
+    pub a:            Complex<f64>,   // 16 B — δz coefficient
+    pub b:            Complex<f64>,   // 16 B — δc coefficient
+    pub skip:         u32,            //  4 B — steps this entry covers
+    _pad:             u32,            //  4 B — alignment padding before f64
+    pub valid_radius: f64,            //  8 B — max |δz_n| for valid approximation
 }
 ```
+
+**Level-0 initialisation:** `a = 2·Z_n` (the Jacobian of one perturbation step w.r.t. δz), `b = 1`, `skip = 1`, `valid_radius = |Z_n|`. Positions where `Z_n = 0` (always true at `n = 0`) get `valid_radius = 0` — the BLA entry is never applicable there, and the rendering loop does a direct step.
 
 **Merge formula (level-doubling):** When merging two consecutive entries `(A₀, B₀, skip₀, r₀)` and `(A₁, B₁, skip₁, r₁)`:
 
@@ -588,7 +624,19 @@ skip_merged = skip₀ + skip₁
 valid_radius_merged = min(r₀,  r₁ / |A₀|)   ← divide by |A₀|; omitting this is a common bug
 ```
 
-The `/ |A₀|` factor accounts for perturbation amplification through the first half-skip. Using `min(r₀, r₁)` instead produces subtly wrong escape counts in smooth regions, visible as faint false banding. Validate BLA output against a full-perturbation reference render before shipping Phase 2.
+The `/ |A₀|` factor accounts for the amplification of δz_n through the first half-skip before
+it must satisfy the second half-skip's radius constraint. The reasoning: the second entry is
+valid when `|δz_{n+skip₀}| < r₁`; since `δz_{n+skip₀} ≈ A₀·δz_n`, we need `|A₀|·|δz_n| < r₁`,
+i.e. `|δz_n| < r₁/|A₀|`. Using `min(r₀, r₁)` instead produces subtly wrong escape counts in
+smooth regions, visible as faint false banding. This is validated by a mandatory pixel-exact
+comparison test (`bla_pixel_exact_256x256_tile_at_interior_ref`) that fails if the merge formula
+is wrong.
+
+**Build algorithm:** `build_bla_table` constructs `⌈log₂(N)⌉` levels of entries and stores the
+highest-level valid entry per orbit position. Only positions where _both_ halves have
+`valid_radius > 0` are merged; otherwise a sentinel entry with `valid_radius = 0` is stored for
+that level. The final table has the same length as the input orbit; entries near the end have
+smaller skip values because fewer remaining orbit steps are available.
 
 BLA operates entirely on f64 — it is built from the already-downcast `Vec<Complex<f64>>` reference orbit and never touches `BigFloat`. The BLA table lives in the shared `WebAssembly.Memory` BLA region; Tile Workers read it with zero copy via the byte offset from `layout()`.
 
@@ -596,15 +644,20 @@ Pixel loop with BLA:
 
 ```rust
 let mut n = 0;
-while n < ref_orbit.len() {
-    let entry = &bla_table[n];
-    if delta.norm() < entry.valid_radius {
-        // Skip k iterations in one step
-        delta = entry.a * delta + entry.b * delta_c.as_complex_f64();
-        n += entry.skip as usize;
+while n < orbit_len {
+    // … escape and glitch checks on z_n = ref_orbit[n] + dz …
+
+    let entry = bla_table[n];
+    let next_n = n + entry.skip as usize;
+    if entry.valid_radius > 0.0 && dz.norm_sqr().sqrt() < entry.valid_radius
+        && next_n <= orbit_len
+    {
+        // Skip entry.skip iterations in one multiply-add.
+        dz = entry.a * dz + entry.b * dc;
+        n = next_n;
     } else {
-        // Full perturbation step
-        delta = 2.0 * ref_orbit[n] * delta + delta * delta + delta_c.as_complex_f64();
+        // Direct perturbation step.
+        dz = map.perturb_step(dz, dc, ref_orbit[n]);
         n += 1;
     }
 }
@@ -663,17 +716,22 @@ pub trait PerturbationSupport: IterationMap {
     /// Complex<f64> for most maps; (Complex<f64>, Complex<f64>) for Phoenix.
     type RefOrbitEntry: Copy + Default;
 
-    fn ref_state(&self, z_ref: Complex<f64>) -> Self::RefState;
+    /// One step of the reference orbit in high-precision T.
+    /// Generic over T so the same trait impl drives compute_ref_orbit for
+    /// T = f64, F64x2, or BigFloat<N> without branching on precision.
+    fn ref_step<T: Precision>(&self, z: Complex<T>, c: Complex<T>) -> Complex<T>;
 
+    /// One step of the perturbation recurrence in f64 (the hot path).
     fn perturb_step(
         &self,
-        z_ref: Complex<f64>,
-        state: Self::RefState,
-        delta: Complex<f64>,
-        delta_c: DeltaC,
+        dz: Complex<f64>,
+        dc: Complex<f64>,
+        ref_z: Complex<f64>,
     ) -> Complex<f64>;
 
     fn glitch_threshold(&self) -> f64 { 1e-3 }
+
+    fn ref_state(&self, z_ref: Complex<f64>) -> Self::RefState;
 }
 
 /// Axis 3: What raw data the orbit emits for coloring.
@@ -893,12 +951,32 @@ This runs before `fetch`, so non-SIMD browsers never request the SIMD bundle. Sh
 
 ## 18. References
 
-- Pauldelbrot — "Superfractalthing Arbitrary Size Mandelbrot Renderer" (perturbation theory, BLA)
-- Zhuoran — BLA table construction algorithm (fractalforums.org, 2021)
-- Hida, Li, Bailey — "Quad-Double Arithmetic: Algorithms, Implementation, and Application" (LBNL 2000)
-- Shewchuk — "Adaptive Precision Floating-Point Arithmetic" (1997)
-- wasm-bindgen Reference — <https://rustwasm.github.io/docs/wasm-bindgen/>
-- WebGL 2 Specification — <https://registry.khronos.org/webgl/specs/latest/2.0/>
-- wasm-pack Book — <https://rustwasm.github.io/docs/wasm-pack/>
-- ACES Filmic Tone Mapping — Narkowicz & Evangelista (2015)
-- WebAssembly Threads proposal — <https://github.com/WebAssembly/threads>
+### Perturbation Theory & BLA
+
+- **K.I. Martin ("Superfractalthing")** — Original description of perturbation theory applied to the Mandelbrot set; introduced the core formula `δₙ₊₁ = 2·Z_n·δₙ + δₙ² + ΔC` and the glitch-detection criterion. Fractalforums.org, 2013. <https://fractalforums.org/index.php?topic=4022>
+- **Pauldelbrot** — Extended Superfractalthing with BLA (Bilinear Approximation), secondary orbit correction, and practical glitch-threshold guidance. Fractalforums.org, 2013–2021. <https://fractalforums.org/index.php?topic=4353>
+- **Zhuoran** — Level-doubling algorithm for BLA table construction; the `valid_radius` merge formula `min(r₀, r₁ / |A₀|)` presented here. Fractalforums.org, 2021.
+- **Claude Heiland-Allen** — "Perturbation Theory for the Mandelbrot Set" — clear mathematical writeup of the BLA derivation and glitch correction. <https://mathr.co.uk/mandelbrot/perturbation-theory.html>
+- **Kalles Fraktaler 2** — Open-source deep-zoom renderer; reference implementation for BLA and glitch correction in C++. <https://fractalwiki.org/wiki/Kalles_Fraktaler>
+
+### Extended-Precision Arithmetic
+
+- **Dekker, T.J.** — "A Floating-Point Technique for Extending the Available Precision." *Numerische Mathematik* 18(3), 1971. Introduces Veltkamp splitting (the `2²⁷ + 1` constant) and the TwoProd exact-product algorithm used in `F64x2::mul`.
+- **Knuth, D.E.** — *The Art of Computer Programming, Volume 2: Seminumerical Algorithms*, §4.2.2. Addison-Wesley, 1969 (3rd ed. 1997). Source of the TwoSum algorithm (`s = a + b; e = (a − (s − v)) + (b − v)`).
+- **Shewchuk, J.R.** — "Adaptive Precision Floating-Point Arithmetic and Fast Robust Geometric Predicates." *Discrete & Computational Geometry* 18(3), 1997. Comprehensive treatment of error-free transformations including TwoSum and TwoProd. <https://people.eecs.berkeley.edu/~jrs/papers/robustr.pdf>
+- **Hida, Li, Bailey** — "Quad-Double Arithmetic: Algorithms, Implementation, and Application." LBNL Technical Report, 2000. Extends double-double to quad-double; useful background on the F64x2 invariant `|lo| ≤ ½ ulp(hi)`.
+- **Fousse, Hanrot, Lefèvre, Pélissier, Zimmermann** — "MPFR: A Multiple-Precision Binary Floating-Point Library with Correct Rounding." *ACM TOMS* 33(2), 2007. The MPFR library (via the `rug` Rust crate) is used as the oracle in `arith` property-based tests for `F64x2` and `BigFloat<N>`.
+
+### WebAssembly & Web Platform
+
+- **wasm-bindgen Reference** — <https://rustwasm.github.io/docs/wasm-bindgen/>
+- **wasm-pack Book** — <https://rustwasm.github.io/docs/wasm-pack/>
+- **WebAssembly Threads proposal** — Atomics, `SharedArrayBuffer` as WASM memory, `wait`/`notify`. <https://github.com/WebAssembly/threads>
+- **WebAssembly SIMD proposal** — `v128` type and intrinsics used by the `simd` feature gate on `F64x2` hot loops. <https://github.com/WebAssembly/simd>
+- **WebGL 2 Specification** — <https://registry.khronos.org/webgl/specs/latest/2.0/>
+
+### Coloring & Rendering
+
+- **Linas Vepstas** — "Renormalising the Mandelbrot Escape" — derivation of the smooth iteration count formula `iter + 1 − log₂(log|z|)`. <https://linas.org/art-gallery/escape/escape.html>
+- **Narkowicz & Evangelista** — "ACES Filmic Tone Mapping Curve." 2015. The approximation used in the post-process pass. <https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/>
+- **Inigo Quilez** — Orbit trap techniques and coloring methods for escape-time fractals. <https://iquilezles.org/articles/> (various articles on Mandelbrot coloring)
