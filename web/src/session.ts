@@ -15,6 +15,7 @@ import { ZoomPanFSM, DEFAULT_VIEW, pixelToFractal, pixelStep } from "./viewport.
 import { BoxZoom } from "./box-zoom.ts";
 import { GlPipeline } from "./gl-pipeline.ts";
 import { wasmBundleUrl } from "./detect-simd.ts";
+import { buildLut, CLASSIC } from "./palette.ts";
 
 const BASE_ITER = 256;
 const ITER_PER_DECADE = 64;
@@ -78,28 +79,6 @@ type OrbitWorkerInMsg =
   | { type: "orbit_worker_ready" }
   | { type: "orbit_ready"; ref_orbit_id: number; orbit_len: number; bla_len: number };
 
-function buildDefaultLut(): Float32Array {
-  const SIZE = 4096;
-  const stops = [
-    [0.0, 0.0, 0.5, 1.0],
-    [0.0, 0.8, 1.0, 1.0],
-    [1.0, 1.0, 1.0, 1.0],
-    [1.0, 0.6, 0.0, 1.0],
-    [0.0, 0.0, 0.5, 1.0],
-  ];
-  const data = new Float32Array(SIZE * 4);
-  const nSeg = stops.length - 1;
-  for (let i = 0; i < SIZE; i++) {
-    const t = i / SIZE;
-    const pos = t * nSeg;
-    const seg = Math.min(Math.floor(pos), stops.length - 2);
-    const f = pos - seg;
-    const a = stops[seg], b = stops[seg + 1];
-    for (let ch = 0; ch < 4; ch++) data[i * 4 + ch] = a[ch] + (b[ch] - a[ch]) * f;
-  }
-  return data;
-}
-
 function makeOverlay(): HTMLElement {
   const el = document.createElement("div");
   Object.assign(el.style, {
@@ -143,7 +122,7 @@ export class FractalSession {
     this.tileSab = new SharedArrayBuffer(RING_SLOTS * TILE_SLOT_BYTES);
     this.orbitSab = new SharedArrayBuffer(orbitSabSize(MAX_ORBIT_ITER));
     this.gl = new GlPipeline(canvas);
-    this.gl.uploadLut(buildDefaultLut());
+    this.gl.uploadLut(buildLut(CLASSIC));
 
     this.fsm = new ZoomPanFSM(DEFAULT_VIEW, {
       onViewChange: () => {
