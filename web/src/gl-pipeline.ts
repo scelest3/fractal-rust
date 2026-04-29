@@ -198,6 +198,21 @@ export class GlPipeline {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
+  /**
+   * Resize the accumFBO to match a new canvas size.
+   * Call after changing canvas.width/height; triggers a clear.
+   */
+  resize(width: number, height: number): void {
+    const { gl } = this;
+    gl.bindTexture(gl.TEXTURE_2D, this.accumTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0, gl.RGBA, gl.FLOAT, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFBO);
+    gl.viewport(0, 0, width, height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
   /** Update the band-width uniform. Call blit() afterwards to see the change. */
   setCycleLen(value: number): void {
     const { gl } = this;

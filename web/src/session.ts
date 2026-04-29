@@ -103,6 +103,7 @@ export class FractalSession {
   private readonly overlay: HTMLElement;
   private readonly statsEl: HTMLElement;
   private readonly paletteEditor: PaletteEditor;
+  private hiDpi: boolean;
 
   private readonly busyWorkers = new Set<number>();
   private workerInitCount = 0;
@@ -134,6 +135,9 @@ export class FractalSession {
     });
     this.overlay.appendChild(this.paletteEditor.getToggleButton());
     document.body.appendChild(this.paletteEditor.getPanel());
+
+    this.hiDpi = (window.devicePixelRatio ?? 1) > 1;
+    this.overlay.appendChild(this.buildDprToggle(canvas));
 
     this.fsm = new ZoomPanFSM(DEFAULT_VIEW, {
       onViewChange: () => {
@@ -232,6 +236,33 @@ export class FractalSession {
     } else if (msg.type === "tile_ready") {
       this.onTileReady(workerIndex, msg);
     }
+  }
+
+  private buildDprToggle(canvas: HTMLCanvasElement): HTMLButtonElement {
+    const dpr = Math.min(window.devicePixelRatio ?? 1, 2);
+    const btn = document.createElement("button");
+    const update = () => { btn.textContent = this.hiDpi ? `HiDPI ${dpr}×` : "HiDPI off"; };
+    update();
+    Object.assign(btn.style, {
+      display: "block", marginTop: "4px", cursor: "pointer",
+      background: "rgba(255,255,255,0.15)", color: "white",
+      border: "1px solid rgba(255,255,255,0.3)", borderRadius: "3px",
+      fontFamily: "monospace", fontSize: "12px", padding: "2px 6px",
+      width: "100%", boxSizing: "border-box", pointerEvents: "auto",
+    });
+    btn.addEventListener("click", () => {
+      this.hiDpi = !this.hiDpi;
+      const scale = this.hiDpi ? dpr : 1;
+      canvas.width  = Math.round(window.innerWidth  * scale);
+      canvas.height = Math.round(window.innerHeight * scale);
+      canvas.style.width  = window.innerWidth  + "px";
+      canvas.style.height = window.innerHeight + "px";
+      this.gl.resize(canvas.width, canvas.height);
+      this.fsm.setCanvasSize(canvas.width, canvas.height);
+      update();
+      this.scheduleDispatch();
+    });
+    return btn;
   }
 
   private updateOverlay(): void {
