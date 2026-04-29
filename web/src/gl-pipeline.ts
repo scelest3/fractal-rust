@@ -37,16 +37,31 @@ uniform sampler2D uAccum;
 uniform sampler2D uLut;
 uniform float uCycleLen;
 uniform int uColorMode;
+uniform float uTrapRadius;
+uniform float uTrapStrength;
+uniform vec3  uTrapColor;
+uniform vec3  uInteriorColor;
+uniform vec3  uShadingColor;
+uniform float uDistanceStrength;
+uniform float uDistancePow;
+uniform float uAngleStrength;
 out vec4 fragColor;
 void main() {
     vec4 data = texture(uAccum, vUv);
     if (data.a < 0.5) {
-        fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        float dist = pow(clamp(data.g, 0.0, 1.0), uDistancePow);
+        vec3 col = mix(uInteriorColor, uShadingColor, uDistanceStrength * dist);
+        float t = fract((data.b + 3.14159265) / 6.28318530);
+        vec3 angleCol = texture(uLut, vec2(t, 0.5)).rgb;
+        col = mix(col, angleCol, uAngleStrength);
+        fragColor = vec4(col, 1.0);
         return;
     }
     if (uColorMode == 0) {
         float t = fract(data.r / uCycleLen);
-        fragColor = vec4(texture(uLut, vec2(t, 0.5)).rgb, 1.0);
+        vec3 escapeColor = texture(uLut, vec2(t, 0.5)).rgb;
+        float blend = uTrapStrength * smoothstep(uTrapRadius, 0.0, data.g);
+        fragColor = vec4(mix(escapeColor, uTrapColor, blend), 1.0);
     } else {
         fragColor = vec4(0.5, 0.5, 0.5, 1.0);
     }
@@ -70,6 +85,14 @@ export class GlPipeline {
   private readonly uLut: WebGLUniformLocation;
   private readonly uCycleLen: WebGLUniformLocation;
   private readonly uColorMode: WebGLUniformLocation;
+  private readonly uTrapRadius:      WebGLUniformLocation;
+  private readonly uTrapStrength:    WebGLUniformLocation;
+  private readonly uTrapColor:       WebGLUniformLocation;
+  private readonly uInteriorColor:    WebGLUniformLocation;
+  private readonly uShadingColor:     WebGLUniformLocation;
+  private readonly uDistanceStrength: WebGLUniformLocation;
+  private readonly uDistancePow:      WebGLUniformLocation;
+  private readonly uAngleStrength:    WebGLUniformLocation;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -117,6 +140,22 @@ export class GlPipeline {
     this.uColorMode = gl.getUniformLocation(this.blitProgram, "uColorMode")!;
     gl.uniform1f(this.uCycleLen, 64.0);
     gl.uniform1i(this.uColorMode, 0);
+    this.uTrapRadius   = gl.getUniformLocation(this.blitProgram, "uTrapRadius")!;
+    this.uTrapStrength = gl.getUniformLocation(this.blitProgram, "uTrapStrength")!;
+    this.uTrapColor    = gl.getUniformLocation(this.blitProgram, "uTrapColor")!;
+    gl.uniform1f(this.uTrapRadius,   0.5);
+    gl.uniform1f(this.uTrapStrength, 0.0);
+    gl.uniform3f(this.uTrapColor,    1.0, 1.0, 0.0); // default: yellow
+    this.uInteriorColor    = gl.getUniformLocation(this.blitProgram, "uInteriorColor")!;
+    this.uShadingColor     = gl.getUniformLocation(this.blitProgram, "uShadingColor")!;
+    this.uDistanceStrength = gl.getUniformLocation(this.blitProgram, "uDistanceStrength")!;
+    this.uDistancePow      = gl.getUniformLocation(this.blitProgram, "uDistancePow")!;
+    this.uAngleStrength    = gl.getUniformLocation(this.blitProgram, "uAngleStrength")!;
+    gl.uniform3f(this.uInteriorColor, 0.0, 0.0, 0.0); // default: black
+    gl.uniform3f(this.uShadingColor,  1.0, 1.0, 1.0); // default: white
+    gl.uniform1f(this.uDistanceStrength, 0.0);
+    gl.uniform1f(this.uDistancePow,      1.0);
+    gl.uniform1f(this.uAngleStrength,    0.0);
 
     // ── Tile program uniform ──────────────────────────────────────────────────
     gl.useProgram(this.tileProgram);
@@ -218,6 +257,54 @@ export class GlPipeline {
     const { gl } = this;
     gl.useProgram(this.blitProgram);
     gl.uniform1f(this.uCycleLen, value);
+  }
+
+  setTrapRadius(v: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1f(this.uTrapRadius, v);
+  }
+
+  setTrapStrength(v: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1f(this.uTrapStrength, v);
+  }
+
+  setTrapColor(r: number, g: number, b: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform3f(this.uTrapColor, r, g, b);
+  }
+
+  setInteriorColor(r: number, g: number, b: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform3f(this.uInteriorColor, r, g, b);
+  }
+
+  setShadingColor(r: number, g: number, b: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform3f(this.uShadingColor, r, g, b);
+  }
+
+  setDistanceStrength(v: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1f(this.uDistanceStrength, v);
+  }
+
+  setDistancePow(v: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1f(this.uDistancePow, v);
+  }
+
+  setAngleStrength(v: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1f(this.uAngleStrength, v);
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────

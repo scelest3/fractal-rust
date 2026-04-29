@@ -61,6 +61,14 @@ export class PaletteEditor {
   private palette: Palette;
   private selectedStop = 0;
   private readonly onChange: (lut: Float32Array, cycleLen: number) => void;
+  private readonly onTrapChange?: (trapColor: [number, number, number], trapRadius: number, trapStrength: number) => void;
+  private readonly onInteriorChange?: (
+    interiorColor: [number, number, number],
+    shadingColor: [number, number, number],
+    distanceStrength: number,
+    distancePow: number,
+    angleStrength: number,
+  ) => void;
 
   private readonly panel: HTMLElement;
   private readonly toggleBtn: HTMLButtonElement;
@@ -72,9 +80,22 @@ export class PaletteEditor {
   private readonly cycleLenLabel: HTMLSpanElement;
   private readonly cycleLenSlider: HTMLInputElement;
 
-  constructor(initial: Palette, onChange: (lut: Float32Array, cycleLen: number) => void) {
+  constructor(
+    initial: Palette,
+    onChange: (lut: Float32Array, cycleLen: number) => void,
+    onTrapChange?: (trapColor: [number, number, number], trapRadius: number, trapStrength: number) => void,
+    onInteriorChange?: (
+      interiorColor: [number, number, number],
+      shadingColor: [number, number, number],
+      distanceStrength: number,
+      distancePow: number,
+      angleStrength: number,
+    ) => void,
+  ) {
     this.palette = deepCopyPalette(initial);
     this.onChange = onChange;
+    this.onTrapChange = onTrapChange;
+    this.onInteriorChange = onInteriorChange;
 
     const refs = this.buildPanel();
     this.panel       = refs.panel;
@@ -189,7 +210,173 @@ export class PaletteEditor {
       presetRow.appendChild(sw);
     }
 
-    panel.append(barCanvas, handleRow, stopListEl, cycleLenRow, presetRow);
+    // ── Orbit Trap ────────────────────────────────────────────────────────────
+    const trapSection = document.createElement("div");
+    trapSection.style.cssText = "margin-top:8px; border-top:1px solid rgba(255,255,255,0.2); padding-top:6px;";
+
+    const trapHeader = document.createElement("div");
+    trapHeader.textContent = "Orbit Trap";
+    trapHeader.style.cssText = "font-weight:bold; margin-bottom:4px; font-size:11px; opacity:0.7;";
+    trapSection.appendChild(trapHeader);
+
+    const trapColorInput = document.createElement("input");
+    trapColorInput.type = "color"; trapColorInput.value = "#ffff00";
+    trapColorInput.style.cssText = "width:28px; height:22px; padding:1px; cursor:pointer; border:1px solid #555; border-radius:2px; background:none;";
+
+    const trapRadiusSlider = document.createElement("input");
+    trapRadiusSlider.type = "range"; trapRadiusSlider.min = "0"; trapRadiusSlider.max = "2"; trapRadiusSlider.step = "0.01";
+    trapRadiusSlider.value = "0.5";
+    trapRadiusSlider.style.cssText = "width:120px; vertical-align:middle;";
+    const trapRadiusLabel = document.createElement("span");
+    trapRadiusLabel.textContent = "0.50";
+
+    const trapStrengthSlider = document.createElement("input");
+    trapStrengthSlider.type = "range"; trapStrengthSlider.min = "0"; trapStrengthSlider.max = "1"; trapStrengthSlider.step = "0.01";
+    trapStrengthSlider.value = "0";
+    trapStrengthSlider.style.cssText = "width:120px; vertical-align:middle;";
+    const trapStrengthLabel = document.createElement("span");
+    trapStrengthLabel.textContent = "0.00";
+
+    const fireTrap = () => {
+      const [r, g, b] = hexToRgb(trapColorInput.value);
+      this.onTrapChange?.([r, g, b], parseFloat(trapRadiusSlider.value), parseFloat(trapStrengthSlider.value));
+    };
+
+    trapColorInput.addEventListener("input", fireTrap);
+    trapRadiusSlider.addEventListener("input", () => {
+      trapRadiusLabel.textContent = parseFloat(trapRadiusSlider.value).toFixed(2);
+      fireTrap();
+    });
+    trapStrengthSlider.addEventListener("input", () => {
+      trapStrengthLabel.textContent = parseFloat(trapStrengthSlider.value).toFixed(2);
+      fireTrap();
+    });
+
+    const trapColorRow = document.createElement("div");
+    trapColorRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    trapColorRow.append("Color: ", trapColorInput);
+
+    const trapRadiusRow = document.createElement("div");
+    trapRadiusRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    trapRadiusRow.append("Radius: ", trapRadiusSlider, trapRadiusLabel);
+
+    const trapStrengthRow = document.createElement("div");
+    trapStrengthRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    trapStrengthRow.append("Strength: ", trapStrengthSlider, trapStrengthLabel);
+
+    trapSection.append(trapColorRow, trapRadiusRow, trapStrengthRow);
+
+    // ── Interior ──────────────────────────────────────────────────────────────
+    const interiorSection = document.createElement("div");
+    interiorSection.style.cssText = "margin-top:8px; border-top:1px solid rgba(255,255,255,0.2); padding-top:6px;";
+
+    const interiorHeader = document.createElement("div");
+    interiorHeader.textContent = "Interior";
+    interiorHeader.style.cssText = "font-weight:bold; margin-bottom:4px; font-size:11px; opacity:0.7;";
+    interiorSection.appendChild(interiorHeader);
+
+    // Base color
+    const interiorColorInput = document.createElement("input");
+    interiorColorInput.type = "color"; interiorColorInput.value = "#000000";
+    interiorColorInput.style.cssText = "width:28px; height:22px; padding:1px; cursor:pointer; border:1px solid #555; border-radius:2px; background:none;";
+
+    // Distance shading
+    const distanceToggle = document.createElement("input");
+    distanceToggle.type = "checkbox";
+    distanceToggle.style.cssText = "cursor:pointer; vertical-align:middle;";
+
+    const distanceStrengthSlider = document.createElement("input");
+    distanceStrengthSlider.type = "range"; distanceStrengthSlider.min = "0"; distanceStrengthSlider.max = "1"; distanceStrengthSlider.step = "0.01";
+    distanceStrengthSlider.value = "0.5";
+    distanceStrengthSlider.style.cssText = "width:90px; vertical-align:middle; display:none;";
+    const distanceStrengthLabel = document.createElement("span");
+    distanceStrengthLabel.textContent = "0.50"; distanceStrengthLabel.style.display = "none";
+
+    // Shade-toward color (visible when distance on)
+    const shadingColorInput = document.createElement("input");
+    shadingColorInput.type = "color"; shadingColorInput.value = "#ffffff";
+    shadingColorInput.style.cssText = "width:28px; height:22px; padding:1px; cursor:pointer; border:1px solid #555; border-radius:2px; background:none; display:none;";
+
+    // Power curve slider (visible when distance on)
+    const distancePowSlider = document.createElement("input");
+    distancePowSlider.type = "range"; distancePowSlider.min = "0.1"; distancePowSlider.max = "3"; distancePowSlider.step = "0.05";
+    distancePowSlider.value = "1";
+    distancePowSlider.style.cssText = "width:90px; vertical-align:middle; display:none;";
+    const distancePowLabel = document.createElement("span");
+    distancePowLabel.textContent = "1.00"; distancePowLabel.style.display = "none";
+
+    // Angle coloring
+    const angleToggle = document.createElement("input");
+    angleToggle.type = "checkbox";
+    angleToggle.style.cssText = "cursor:pointer; vertical-align:middle;";
+
+    const angleStrengthSlider = document.createElement("input");
+    angleStrengthSlider.type = "range"; angleStrengthSlider.min = "0"; angleStrengthSlider.max = "1"; angleStrengthSlider.step = "0.01";
+    angleStrengthSlider.value = "1";
+    angleStrengthSlider.style.cssText = "width:90px; vertical-align:middle; display:none;";
+    const angleStrengthLabel = document.createElement("span");
+    angleStrengthLabel.textContent = "1.00"; angleStrengthLabel.style.display = "none";
+
+    const fireInterior = () => {
+      const [r, g, b]     = hexToRgb(interiorColorInput.value);
+      const [sr, sg, sb]  = hexToRgb(shadingColorInput.value);
+      const distStrength  = distanceToggle.checked ? parseFloat(distanceStrengthSlider.value) : 0.0;
+      const distPow       = parseFloat(distancePowSlider.value);
+      const angStrength   = angleToggle.checked ? parseFloat(angleStrengthSlider.value) : 0.0;
+      this.onInteriorChange?.([r, g, b], [sr, sg, sb], distStrength, distPow, angStrength);
+    };
+
+    const setDistanceVisible = (on: boolean) => {
+      distanceStrengthSlider.style.display = on ? "" : "none";
+      distanceStrengthLabel.style.display  = on ? "" : "none";
+      shadingColorInput.style.display      = on ? "" : "none";
+      distancePowSlider.style.display      = on ? "" : "none";
+      distancePowLabel.style.display       = on ? "" : "none";
+    };
+
+    interiorColorInput.addEventListener("input", fireInterior);
+    shadingColorInput.addEventListener("input", fireInterior);
+
+    distanceToggle.addEventListener("change", () => { setDistanceVisible(distanceToggle.checked); fireInterior(); });
+    distanceStrengthSlider.addEventListener("input", () => {
+      distanceStrengthLabel.textContent = parseFloat(distanceStrengthSlider.value).toFixed(2);
+      fireInterior();
+    });
+    distancePowSlider.addEventListener("input", () => {
+      distancePowLabel.textContent = parseFloat(distancePowSlider.value).toFixed(2);
+      fireInterior();
+    });
+
+    angleToggle.addEventListener("change", () => {
+      const on = angleToggle.checked;
+      angleStrengthSlider.style.display = on ? "" : "none";
+      angleStrengthLabel.style.display  = on ? "" : "none";
+      fireInterior();
+    });
+    angleStrengthSlider.addEventListener("input", () => {
+      angleStrengthLabel.textContent = parseFloat(angleStrengthSlider.value).toFixed(2);
+      fireInterior();
+    });
+
+    const interiorColorRow = document.createElement("div");
+    interiorColorRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    interiorColorRow.append("Color: ", interiorColorInput);
+
+    const distanceRow = document.createElement("div");
+    distanceRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0; flex-wrap:wrap;";
+    distanceRow.append("Distance: ", distanceToggle, distanceStrengthSlider, distanceStrengthLabel, " → ", shadingColorInput);
+
+    const curveRow = document.createElement("div");
+    curveRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    curveRow.append("Curve: ", distancePowSlider, distancePowLabel);
+
+    const angleRow = document.createElement("div");
+    angleRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    angleRow.append("Angle: ", angleToggle, angleStrengthSlider, angleStrengthLabel);
+
+    interiorSection.append(interiorColorRow, distanceRow, curveRow, angleRow);
+
+    panel.append(barCanvas, handleRow, stopListEl, cycleLenRow, presetRow, trapSection, interiorSection);
 
     return { panel, barCanvas, handleRow, stopListEl, cycleLenLabel, cycleLenSlider };
   }

@@ -128,16 +128,33 @@ export class FractalSession {
     this.tileSab = new SharedArrayBuffer(RING_SLOTS * TILE_SLOT_BYTES);
     this.orbitSab = new SharedArrayBuffer(orbitSabSize(MAX_ORBIT_ITER));
     this.gl = new GlPipeline(canvas);
-    this.paletteEditor = new PaletteEditor(CLASSIC, (lut, cycleLen) => {
-      this.gl.uploadLut(lut);
-      this.gl.setCycleLen(cycleLen);
-      this.gl.blit();
-    });
-    this.overlay.appendChild(this.paletteEditor.getToggleButton());
+    this.paletteEditor = new PaletteEditor(
+      CLASSIC,
+      (lut, cycleLen) => {
+        this.gl.uploadLut(lut);
+        this.gl.setCycleLen(cycleLen);
+        this.gl.blit();
+      },
+      ([r, g, b], trapRadius, trapStrength) => {
+        this.gl.setTrapColor(r, g, b);
+        this.gl.setTrapRadius(trapRadius);
+        this.gl.setTrapStrength(trapStrength);
+        this.gl.blit();
+      },
+      ([r, g, b], [sr, sg, sb], distanceStrength, distancePow, angleStrength) => {
+        this.gl.setInteriorColor(r, g, b);
+        this.gl.setShadingColor(sr, sg, sb);
+        this.gl.setDistanceStrength(distanceStrength);
+        this.gl.setDistancePow(distancePow);
+        this.gl.setAngleStrength(angleStrength);
+        this.gl.blit();
+      },
+    );
     document.body.appendChild(this.paletteEditor.getPanel());
 
     this.hiDpi = (window.devicePixelRatio ?? 1) > 1;
     this.overlay.appendChild(this.buildDprToggle(canvas));
+    this.overlay.appendChild(this.paletteEditor.getToggleButton());
 
     this.fsm = new ZoomPanFSM(DEFAULT_VIEW, {
       onViewChange: () => {
