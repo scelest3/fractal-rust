@@ -198,6 +198,13 @@ export class GlPipeline {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
+  /** Update the band-width uniform. Call blit() afterwards to see the change. */
+  setCycleLen(value: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1f(this.uCycleLen, value);
+  }
+
   // ── Private helpers ────────────────────────────────────────────────────────
 
   private buildProgram(vertSrc: string, fragSrc: string): WebGLProgram {

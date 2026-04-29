@@ -15,7 +15,8 @@ import { ZoomPanFSM, DEFAULT_VIEW, pixelToFractal, pixelStep } from "./viewport.
 import { BoxZoom } from "./box-zoom.ts";
 import { GlPipeline } from "./gl-pipeline.ts";
 import { wasmBundleUrl } from "./detect-simd.ts";
-import { buildLut, CLASSIC } from "./palette.ts";
+import { CLASSIC } from "./palette.ts";
+import { PaletteEditor } from "./palette-editor.ts";
 
 const BASE_ITER = 256;
 const ITER_PER_DECADE = 64;
@@ -100,6 +101,7 @@ export class FractalSession {
   private readonly orbitSab: SharedArrayBuffer;
   private readonly orbitWorker: Worker;
   private readonly overlay: HTMLElement;
+  private readonly paletteEditor: PaletteEditor;
 
   private readonly busyWorkers = new Set<number>();
   private workerInitCount = 0;
@@ -122,7 +124,13 @@ export class FractalSession {
     this.tileSab = new SharedArrayBuffer(RING_SLOTS * TILE_SLOT_BYTES);
     this.orbitSab = new SharedArrayBuffer(orbitSabSize(MAX_ORBIT_ITER));
     this.gl = new GlPipeline(canvas);
-    this.gl.uploadLut(buildLut(CLASSIC));
+    this.paletteEditor = new PaletteEditor(CLASSIC, (lut, cycleLen) => {
+      this.gl.uploadLut(lut);
+      this.gl.setCycleLen(cycleLen);
+      this.gl.blit();
+    });
+    this.overlay.appendChild(this.paletteEditor.getToggleButton());
+    document.body.appendChild(this.paletteEditor.getPanel());
 
     this.fsm = new ZoomPanFSM(DEFAULT_VIEW, {
       onViewChange: () => {

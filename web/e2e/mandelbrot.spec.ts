@@ -10,13 +10,13 @@ test.describe("Mandelbrot default view", () => {
   });
 
   test("renders a recognizable Mandelbrot set", async ({ page }) => {
-    const canvas = page.locator("canvas");
+    const canvas = page.locator("#canvas");
     await expect(canvas).toHaveScreenshot("mandelbrot-default.png");
   });
 
   test("canvas[data-rendered] is set after all tiles complete", async ({ page }) => {
     // Verifies the session's completion signal — used by the beforeEach wait.
-    const gen = await page.locator("canvas").getAttribute("data-rendered");
+    const gen = await page.locator("#canvas").getAttribute("data-rendered");
     expect(Number(gen)).toBeGreaterThanOrEqual(1);
   });
 });
