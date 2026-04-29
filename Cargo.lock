@@ -751,7 +751,6 @@ name = "wasm-bridge"
 version = "0.1.0"
 dependencies = [
  "arith",
- "coloring",
  "kernel",
  "wasm-bindgen",
  "wasm-bindgen-test",

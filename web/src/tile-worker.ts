@@ -92,7 +92,6 @@ interface WasmExports {
 }
 
 interface WasmGlue {
-  build_lut: (palette: null) => Float32Array;
   install_orbit: (orbitF64: Float64Array, blaBytes: Uint8Array) => void;
 }
 
@@ -127,10 +126,7 @@ async function handleInit(msg: InitMsg): Promise<void> {
   wasm = (await glue.default({ module_or_path: msg.wasmUrl })) as WasmExports;
   glueModule = glue as WasmGlue;
 
-  const lutView = glueModule.build_lut(null);
-  const lut = new Float32Array(lutView);
-
-  (self as unknown as Worker).postMessage({ type: "init_done", lut });
+  (self as unknown as Worker).postMessage({ type: "init_done" });
 }
 
 function handleOrbitReady(msg: OrbitReadyMsg): void {

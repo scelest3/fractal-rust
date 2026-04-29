@@ -1,12 +1,15 @@
 /**
- * WebGL 2 pipeline — Phase 1 smooth-coloring pass.
+ * WebGL 2 pipeline — two-pass architecture.
  *
- * Two textures:
- *   uTile  — 256×256 RGBA32F: (smooth_t, orbit_min_r, angle, escaped) per pixel
- *   uLut   — 4096×1  RGBA32F: pre-built color LUT from build_lut()
+ * Pass 1 (tile pass): each 256×256 tile is uploaded as RGBA32F and drawn
+ *   into the accumFBO (canvas-sized RGBA32F framebuffer). No coloring here —
+ *   raw (smooth_t, orbit_min_r, angle, escaped) data is stored.
  *
- * Fragment shader indexes the LUT by fract(smooth_t / CYCLE_LEN) for smooth
- * cyclic coloring. Interior pixels (escaped == 0) are drawn black.
+ * Pass 2 (blit pass): a fullscreen quad reads the accumFBO and applies the
+ *   LUT + uCycleLen to produce the final colored output on the canvas.
+ *
+ * This separation means palette changes only require a blit() call —
+ * no tile re-upload or WASM re-render.
  */
 
 const VERT_SRC = /* glsl */ `#version 300 es
@@ -18,71 +21,128 @@ void main() {
     vUv = vec2(x * 0.5 + 0.5, y * 0.5 + 0.5);
 }`;
 
-const FRAG_SRC = /* glsl */ `#version 300 es
+const TILE_FRAG_SRC = /* glsl */ `#version 300 es
 precision highp float;
 in vec2 vUv;
 uniform sampler2D uTile;
-uniform sampler2D uLut;
-uniform float uCycleLen;
 out vec4 fragColor;
 void main() {
-    vec4 data = texture(uTile, vUv);
-    float escaped = data.a;
-    if (escaped < 0.5) {
+    fragColor = texture(uTile, vUv);
+}`;
+
+const BLIT_FRAG_SRC = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uAccum;
+uniform sampler2D uLut;
+uniform float uCycleLen;
+uniform int uColorMode;
+out vec4 fragColor;
+void main() {
+    vec4 data = texture(uAccum, vUv);
+    if (data.a < 0.5) {
         fragColor = vec4(0.0, 0.0, 0.0, 1.0);
-    } else {
+        return;
+    }
+    if (uColorMode == 0) {
         float t = fract(data.r / uCycleLen);
         fragColor = vec4(texture(uLut, vec2(t, 0.5)).rgb, 1.0);
+    } else {
+        fragColor = vec4(0.5, 0.5, 0.5, 1.0);
     }
 }`;
 
 export class GlPipeline {
   readonly canvas: HTMLCanvasElement;
   private readonly gl: WebGL2RenderingContext;
-  private readonly program: WebGLProgram;
-  private readonly tileTexture: WebGLTexture;
-  private readonly lutTexture: WebGLTexture;
-  private readonly uTile: WebGLUniformLocation;
+
+  private readonly tileProgram: WebGLProgram;
+  private readonly blitProgram: WebGLProgram;
+  private readonly tileTexture: WebGLTexture;   // 256×256 RGBA32F per tile
+  private readonly lutTexture: WebGLTexture;    // 4096×1 RGBA32F LUT
+  private readonly accumTexture: WebGLTexture;  // canvas-sized RGBA32F
+  private readonly accumFBO: WebGLFramebuffer;
+
+  // tile program uniforms
+  private readonly uTileTex: WebGLUniformLocation;
+  // blit program uniforms
+  private readonly uAccum: WebGLUniformLocation;
   private readonly uLut: WebGLUniformLocation;
   private readonly uCycleLen: WebGLUniformLocation;
+  private readonly uColorMode: WebGLUniformLocation;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     const gl = canvas.getContext("webgl2", { preserveDrawingBuffer: true });
     if (!gl) throw new Error("WebGL2 not available");
     this.gl = gl;
-    this.program = this.buildProgram(VERT_SRC, FRAG_SRC);
-    // NEAREST required for RGBA32F tiles — LINEAR needs OES_texture_float_linear.
-    this.tileTexture = this.makeTexture(gl.NEAREST);
+
+    // Required for RGBA32F as FBO color attachment.
+    gl.getExtension("EXT_color_buffer_float");
     // Enable float-texture linear filtering for the LUT if available.
     gl.getExtension("OES_texture_float_linear");
-    this.lutTexture = this.makeTexture(gl.LINEAR);
 
-    gl.useProgram(this.program);
-    this.uTile = gl.getUniformLocation(this.program, "uTile")!;
-    this.uLut = gl.getUniformLocation(this.program, "uLut")!;
-    this.uCycleLen = gl.getUniformLocation(this.program, "uCycleLen")!;
+    // ── Programs ──────────────────────────────────────────────────────────────
+    this.tileProgram = this.buildProgram(VERT_SRC, TILE_FRAG_SRC);
+    this.blitProgram = this.buildProgram(VERT_SRC, BLIT_FRAG_SRC);
+
+    // ── Textures ──────────────────────────────────────────────────────────────
+    this.tileTexture = this.makeTexture(gl.NEAREST);   // filled per tile
+    this.lutTexture = this.makeTexture(gl.LINEAR);     // filled by uploadLut()
+    this.accumTexture = this.makeTexture(gl.NEAREST);  // canvas-sized accumulator
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA32F,
+      canvas.width, canvas.height,
+      0, gl.RGBA, gl.FLOAT, null,
+    );
+
+    // ── accumFBO ──────────────────────────────────────────────────────────────
+    this.accumFBO = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFBO);
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D, this.accumTexture, 0,
+    );
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      throw new Error(`accumFBO incomplete (0x${status.toString(16)}) — EXT_color_buffer_float may be unsupported`);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    // ── Blit program uniforms ─────────────────────────────────────────────────
+    gl.useProgram(this.blitProgram);
+    this.uAccum    = gl.getUniformLocation(this.blitProgram, "uAccum")!;
+    this.uLut      = gl.getUniformLocation(this.blitProgram, "uLut")!;
+    this.uCycleLen = gl.getUniformLocation(this.blitProgram, "uCycleLen")!;
+    this.uColorMode = gl.getUniformLocation(this.blitProgram, "uColorMode")!;
     gl.uniform1f(this.uCycleLen, 64.0);
+    gl.uniform1i(this.uColorMode, 0);
+
+    // ── Tile program uniform ──────────────────────────────────────────────────
+    gl.useProgram(this.tileProgram);
+    this.uTileTex = gl.getUniformLocation(this.tileProgram, "uTile")!;
   }
 
-  /** Upload the 4096-entry RGBA32F LUT, called once after worker init. */
+  /** Upload the 4096-entry RGBA32F LUT. Called once at startup and on palette change. */
   uploadLut(data: Float32Array): void {
     const { gl } = this;
     gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 4096, 1, 0, gl.RGBA, gl.FLOAT, data);
   }
 
-  /** Clear the canvas to black. Called at the start of each new dispatch generation. */
+  /** Clear the accumFBO (new generation — old tile data wiped). */
   clear(): void {
     const { gl } = this;
-    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
-    gl.clearColor(0, 0, 0, 1);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFBO);
+    gl.viewport(0, 0, gl.canvas.width as number, gl.canvas.height as number);
+    gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   /**
-   * Upload a 256×256 tile from the SAB slot and draw it at (tileX, tileY)
-   * in tile-grid coordinates (tileY=0 is the top of the canvas).
+   * Upload a 256×256 tile from the SAB slot into the accumFBO at (tileX, tileY),
+   * then blit the accumFBO to the canvas.
    */
   uploadAndDrawTile(
     tileSab: SharedArrayBuffer,
@@ -92,36 +152,50 @@ export class GlPipeline {
   ): void {
     const { gl } = this;
     const byteOffset = slotIndex * 256 * 256 * 4 * 4;
-    // Copy out of the SharedArrayBuffer — texImage2D may silently ignore SAB-backed arrays.
     const data = new Float32Array(new Float32Array(tileSab, byteOffset, 256 * 256 * 4));
 
-    // Flip Y so that tile row 0 (top of screen) maps to UV y=1 (texture top).
-    // Without this, each tile renders upside-down relative to its neighbours,
-    // causing a 511-step fractal jump at every tile boundary.
+    // Upload tile to tileTexture with Y-flip so row 0 = top of tile in texture.
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.bindTexture(gl.TEXTURE_2D, this.tileTexture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 256, 256, 0, gl.RGBA, gl.FLOAT, data);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
 
-    // WebGL Y is bottom-up; tileY=0 is the top row, so flip.
+    // Draw tile into accumFBO at the correct canvas region.
     const canvasH = gl.canvas.height as number;
     const x = tileX * 256;
-    const y = canvasH - (tileY + 1) * 256;
+    const y = canvasH - (tileY + 1) * 256; // WebGL Y is bottom-up
 
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.accumFBO);
     gl.viewport(x, y, 256, 256);
     gl.scissor(x, y, 256, 256);
     gl.enable(gl.SCISSOR_TEST);
 
-    gl.useProgram(this.program);
+    gl.useProgram(this.tileProgram);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.tileTexture);
-    gl.uniform1i(this.uTile, 0);
+    gl.uniform1i(this.uTileTex, 0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.disable(gl.SCISSOR_TEST);
+
+    this.blit();
+  }
+
+  /**
+   * Blit the accumFBO to the canvas, applying the LUT.
+   * Called after each tile and will be called directly by session.ts on palette change.
+   */
+  blit(): void {
+    const { gl } = this;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, gl.canvas.width as number, gl.canvas.height as number);
+    gl.useProgram(this.blitProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.accumTexture);
+    gl.uniform1i(this.uAccum, 0);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
     gl.uniform1i(this.uLut, 1);
-
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    gl.disable(gl.SCISSOR_TEST);
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────

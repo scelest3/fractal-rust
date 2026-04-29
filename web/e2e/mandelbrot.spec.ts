@@ -5,6 +5,8 @@ test.describe("Mandelbrot default view", () => {
     await page.goto("/");
     // Wait for all tiles in the first generation to finish rendering.
     await page.waitForSelector("canvas[data-rendered]", { timeout: 20_000 });
+    // Wait one animation frame so the GPU blit commits to the canvas backing buffer.
+    await page.evaluate(() => new Promise<void>(r => requestAnimationFrame(() => r())));
   });
 
   test("renders a recognizable Mandelbrot set", async ({ page }) => {

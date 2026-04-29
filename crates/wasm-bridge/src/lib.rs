@@ -157,21 +157,6 @@ pub fn write_solid_tile(slot_byte_offset: u32, r: f32, g: f32, b: f32, a: f32) {
     }
 }
 
-/// Build the 4096-entry RGBA f32 LUT and return it as a `Float32Array`.
-///
-/// Uploaded once at session startup to the WebGL `lut1D` texture.
-/// The fragment shader samples it by `smooth_t` to apply smooth coloring.
-///
-/// Phase 1: `palette` is ignored — always returns the default gradient.
-/// Phase 4 will parse palette JSON and produce a custom gradient.
-#[wasm_bindgen]
-pub fn build_lut(_palette: JsValue) -> Box<[f32]> {
-    coloring::Lut::default_gradient()
-        .as_slice()
-        .to_vec()
-        .into_boxed_slice()
-}
-
 // ── render_tile ────────────────────────────────────────────────────────────
 
 const TILE_SIZE: usize = 256;

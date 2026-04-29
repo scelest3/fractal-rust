@@ -494,8 +494,7 @@ pub fn compute_secondary_orbit<M: PerturbationSupport>(
     let limit = (max_iter as usize + 1).min(primary_orbit.len());
     out.clear();
     out.reserve(limit);
-    for n in 0..limit {
-        let z_ref = primary_orbit[n];
+    for z_ref in primary_orbit.iter().copied().take(limit) {
         let z_sec = z_ref + dz;
         out.push(z_sec);
         if z_sec.norm_sqr() > map.escape_radius_sq() {

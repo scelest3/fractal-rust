@@ -93,6 +93,9 @@ export type FsmState = "IDLE" | "PANNING" | "ZOOMING";
  */
 const ZOOM_SPEED = 0.001;
 
+/** v1 precision cap: F64x2 renders cleanly to zoom_exp ≈ 17. */
+const MAX_ZOOM_EXP = 17;
+
 /**
  * Milliseconds of inactivity after the last wheel event before `onZoomSettled`
  * fires. This is the trigger for reference orbit recomputation in Phase 2.
@@ -154,7 +157,7 @@ export class ZoomPanFSM {
    * Cancels any active pan or zoom debounce and returns to IDLE.
    */
   setView(view: ViewState): void {
-    this.view = { ...view };
+    this.view = { ...view, zoom_exp: Math.min(MAX_ZOOM_EXP, view.zoom_exp) };
     this.state = "IDLE";
     if (this.zoomDebounceId !== null) {
       clearTimeout(this.zoomDebounceId);
@@ -253,7 +256,7 @@ export class ZoomPanFSM {
     );
 
     // Scroll down (deltaY > 0) = zoom out = zoom_exp decreases.
-    const zoom_exp = this.view.zoom_exp - deltaY * ZOOM_SPEED;
+    const zoom_exp = Math.min(MAX_ZOOM_EXP, this.view.zoom_exp - deltaY * ZOOM_SPEED);
 
     // Recompute center so that (fx, fy) remains at pixel (px, py).
     const newStep = pixelStep(zoom_exp, this.canvasHeight);
