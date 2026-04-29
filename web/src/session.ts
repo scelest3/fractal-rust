@@ -101,6 +101,7 @@ export class FractalSession {
   private readonly orbitSab: SharedArrayBuffer;
   private readonly orbitWorker: Worker;
   private readonly overlay: HTMLElement;
+  private readonly statsEl: HTMLElement;
   private readonly paletteEditor: PaletteEditor;
 
   private readonly busyWorkers = new Set<number>();
@@ -121,6 +122,8 @@ export class FractalSession {
 
   constructor(canvas: HTMLCanvasElement) {
     this.overlay = makeOverlay();
+    this.statsEl = document.createElement("div");
+    this.overlay.appendChild(this.statsEl);
     this.tileSab = new SharedArrayBuffer(RING_SLOTS * TILE_SLOT_BYTES);
     this.orbitSab = new SharedArrayBuffer(orbitSabSize(MAX_ORBIT_ITER));
     this.gl = new GlPipeline(canvas);
@@ -235,7 +238,7 @@ export class FractalSession {
     const v = this.fsm.getView();
     const state = this.fsm.getState();
     const mode = v.zoom_exp > F64X2_ZOOM_THRESHOLD ? "f64x2" : "f64";
-    this.overlay.innerHTML =
+    this.statsEl.innerHTML =
       `state: ${state} [${mode}]<br>` +
       `cx: ${parseFloat(v.cx).toFixed(8)}<br>` +
       `cy: ${parseFloat(v.cy).toFixed(8)}<br>` +

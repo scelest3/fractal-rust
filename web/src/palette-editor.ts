@@ -116,6 +116,7 @@ export class PaletteEditor {
       border: "1px solid rgba(255,255,255,0.3)", borderRadius: "3px",
       fontFamily: "monospace", fontSize: "12px", padding: "2px 6px",
       width: "100%", boxSizing: "border-box",
+      pointerEvents: "auto", // override overlay's pointer-events:none
     });
     btn.addEventListener("click", () => {
       const hidden = this.panel.style.display === "none";
