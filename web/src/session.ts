@@ -147,12 +147,13 @@ export class FractalSession {
       onZoomSettled: () => this.debouncedDispatch(0),
     });
     this.fsm.setCanvasSize(canvas.width, canvas.height);
+    this.fsm.setPixelScale(this.hiDpi ? Math.min(window.devicePixelRatio ?? 1, 2) : 1);
     this.fsm.attach(canvas);
 
     new BoxZoom(canvas, () => this.fsm.getView(), (view) => {
       this.fsm.setView(view);
       this.scheduleDispatch();
-    });
+    }, () => this.hiDpi ? Math.min(window.devicePixelRatio ?? 1, 2) : 1);
 
     const wasmUrl = wasmBundleUrl();
 
@@ -259,6 +260,7 @@ export class FractalSession {
       canvas.style.height = window.innerHeight + "px";
       this.gl.resize(canvas.width, canvas.height);
       this.fsm.setCanvasSize(canvas.width, canvas.height);
+      this.fsm.setPixelScale(scale);
       update();
       this.scheduleDispatch();
     });

@@ -125,6 +125,7 @@ export class ZoomPanFSM {
   private view: ViewState;
   private canvasWidth = 0;
   private canvasHeight = 0;
+  private pixelScale = 1; // CSS px → physical px multiplier for event coords
 
   // Pan tracking
   private panStartPx = 0;
@@ -166,6 +167,11 @@ export class ZoomPanFSM {
     this.notifyChange(this.view);
   }
 
+  /** Scale factor applied to CSS pointer-event coordinates (set to devicePixelRatio when HiDPI). */
+  setPixelScale(scale: number): void {
+    this.pixelScale = scale;
+  }
+
   /** Set canvas dimensions (required before any handle* calls). */
   setCanvasSize(width: number, height: number): void {
     this.canvasWidth = width;
@@ -181,16 +187,16 @@ export class ZoomPanFSM {
 
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      this.handleWheel(e.deltaY, e.offsetX, e.offsetY);
+      this.handleWheel(e.deltaY, e.offsetX * this.pixelScale, e.offsetY * this.pixelScale);
     };
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return; // ignore right-click (used by BoxZoom)
       canvas.setPointerCapture(e.pointerId);
-      this.handlePointerDown(e.offsetX, e.offsetY);
+      this.handlePointerDown(e.offsetX * this.pixelScale, e.offsetY * this.pixelScale);
     };
     const onPointerMove = (e: PointerEvent) => {
       if ((e.buttons & 1) === 0) return; // only track primary button
-      this.handlePointerMove(e.offsetX, e.offsetY);
+      this.handlePointerMove(e.offsetX * this.pixelScale, e.offsetY * this.pixelScale);
     };
     const onPointerUp = (e: PointerEvent) => {
       if (e.button !== 0) return;

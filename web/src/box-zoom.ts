@@ -20,6 +20,7 @@ export class BoxZoom {
     private readonly canvas: HTMLCanvasElement,
     private readonly getView: () => ViewState,
     private readonly onZoom: (view: ViewState) => void,
+    private readonly getPixelScale: () => number = () => 1,
   ) {
     this.box = this.makeBox();
 
@@ -49,7 +50,8 @@ export class BoxZoom {
     if (e.button !== 2) return;
     e.preventDefault();
     this.canvas.setPointerCapture(e.pointerId);
-    this.startOffset = { x: e.offsetX, y: e.offsetY };
+    const s = this.getPixelScale();
+    this.startOffset = { x: e.offsetX * s, y: e.offsetY * s };
     this.startClient = { x: e.clientX, y: e.clientY };
     this.active = true;
   }
@@ -72,7 +74,8 @@ export class BoxZoom {
   private onUp(e: PointerEvent): void {
     if (e.button !== 2 || !this.active) return;
     this.cancel();
-    this.commit({ x: e.offsetX, y: e.offsetY });
+    const s = this.getPixelScale();
+    this.commit({ x: e.offsetX * s, y: e.offsetY * s });
   }
 
   private cancel(): void {
