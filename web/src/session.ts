@@ -17,7 +17,12 @@ import { GlPipeline } from "./gl-pipeline.ts";
 import { wasmBundleUrl } from "./detect-simd.ts";
 import { CLASSIC } from "./palette.ts";
 import { PaletteEditor } from "./palette-editor.ts";
-import { newtonParamsZ3, type NewtonParams } from "./newton.ts";
+import {
+  newtonParamsZ3, defaultNewtonParams, newtonParamsFromPreset,
+  serializeNewtonState, deserializeNewtonState,
+  type NewtonParams,
+} from "./newton.ts";
+import { NewtonPanel } from "./newton-panel.ts";
 
 const BASE_ITER = 256;
 const ITER_PER_DECADE = 64;
@@ -81,7 +86,8 @@ type WorkerInMsg =
 
 type OrbitWorkerInMsg =
   | { type: "orbit_worker_ready" }
-  | { type: "orbit_ready"; ref_orbit_id: number; orbit_len: number; bla_len: number };
+  | { type: "orbit_ready"; ref_orbit_id: number; orbit_len: number; bla_len: number }
+  | { type: "roots_ready"; degree: number; rootsRe: number[]; rootsIm: number[] };
 
 function makeOverlay(): HTMLElement {
   const el = document.createElement("div");
@@ -124,9 +130,10 @@ export class FractalSession {
   private orbitReady = false;
   private pendingOrbitDispatch = false; // waiting for orbit_ready before dispatching
 
-  // Newton state (hardwired z³−1 for Phase 3 / Issue #30; UI wired in Issue #31)
-  private readonly fractalKind: "mandelbrot" | "newton" = "newton";
-  private readonly newtonParams: NewtonParams = newtonParamsZ3();
+  // Newton state
+  private fractalKind: "mandelbrot" | "newton" = "newton";
+  private newtonParams: NewtonParams = defaultNewtonParams();
+  private readonly newtonPanel: NewtonPanel;
 
   constructor(canvas: HTMLCanvasElement) {
     this.overlay = makeOverlay();
@@ -163,6 +170,19 @@ export class FractalSession {
       },
     );
     document.body.appendChild(this.paletteEditor.getPanel());
+
+    // Newton panel — preset picker + advanced coefficient inputs.
+    this.newtonPanel = new NewtonPanel((coeffs, degree) => {
+      this.onPolynomialCommit(coeffs, degree);
+    });
+    document.body.appendChild(this.newtonPanel.getElement());
+
+    // Restore Newton state from URL hash if present.
+    const hashParams = deserializeNewtonState(window.location.hash.slice(1));
+    if (hashParams) {
+      this.newtonParams = hashParams;
+    }
+    this.newtonPanel.setParams(this.newtonParams);
 
     this.hiDpi = (window.devicePixelRatio ?? 1) > 1;
     this.overlay.appendChild(this.buildDprToggle(canvas));
@@ -219,10 +239,46 @@ export class FractalSession {
     });
   }
 
+  /** Called when the user commits a polynomial change (blur/Enter in the panel). */
+  private onPolynomialCommit(coeffs: Float64Array, degree: number): void {
+    // Update params with zeroed roots; real roots arrive via roots_ready.
+    this.newtonParams = {
+      degree,
+      coeffs: new Float64Array(coeffs),
+      rootsRe: new Float64Array(degree),
+      rootsIm: new Float64Array(degree),
+    };
+    // Ask the orbit worker to compute roots (it has WASM; main thread doesn't).
+    this.orbitWorker.postMessage({
+      type: "compute_roots",
+      coeffs: Array.from(coeffs.subarray(0, degree + 1)),
+    });
+  }
+
   private onOrbitWorkerMessage(msg: OrbitWorkerInMsg): void {
+    if (msg.type === "roots_ready") {
+      // Roots computed — update params, write URL, re-render.
+      this.newtonParams = {
+        ...this.newtonParams,
+        rootsRe: new Float64Array(msg.rootsRe),
+        rootsIm: new Float64Array(msg.rootsIm),
+      };
+      this.newtonPanel.setParams(this.newtonParams);
+      this.writeUrlHash();
+      this.scheduleDispatch();
+      return;
+    }
+
     if (msg.type === "orbit_worker_ready") {
       console.log("[Session] orbit worker ready");
       this.orbitWorkerReady = true;
+      // If Newton params have zeroed roots (e.g. restored from URL), compute them now.
+      if (this.fractalKind === "newton" && this.newtonParams.rootsRe.every(r => r === 0)) {
+        this.orbitWorker.postMessage({
+          type: "compute_roots",
+          coeffs: Array.from(this.newtonParams.coeffs.subarray(0, this.newtonParams.degree + 1)),
+        });
+      }
       // Always retry — scheduleDispatch will request the orbit if needed.
       this.scheduleDispatch();
     } else if (msg.type === "orbit_ready") {
@@ -254,6 +310,12 @@ export class FractalSession {
     for (const w of this.workers) w.postMessage(orbitMsg);
 
     this.scheduleDispatch();
+  }
+
+  /** Write Newton state to window.location.hash without triggering a navigation. */
+  private writeUrlHash(): void {
+    const fragment = serializeNewtonState(this.newtonParams);
+    window.history.replaceState(null, "", `#${fragment}`);
   }
 
   private onWorkerMessage(workerIndex: number, msg: WorkerInMsg): void {

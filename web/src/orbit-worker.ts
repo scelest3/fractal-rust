@@ -39,10 +39,22 @@ interface ComputeOrbitMsg {
   ref_orbit_id: number;
 }
 
-type OrbitWorkerMsg = OrbitInitMsg | ComputeOrbitMsg;
+interface ComputeRootsMsg {
+  type: "compute_roots";
+  /** Polynomial coefficients ascending by degree (up to 11 elements). */
+  coeffs: number[];
+}
+
+type OrbitWorkerMsg = OrbitInitMsg | ComputeOrbitMsg | ComputeRootsMsg;
 
 interface WasmExports {
   memory: WebAssembly.Memory;
+}
+
+interface RootResult {
+  degree: number;
+  roots_re: () => Float64Array;
+  roots_im: () => Float64Array;
 }
 
 interface WasmGlue {
@@ -51,6 +63,7 @@ interface WasmGlue {
   orbit_data_len: () => number;
   bla_data_ptr: () => number;
   bla_data_len: () => number;
+  compute_roots: (coeffs: Float64Array) => RootResult;
 }
 
 let wasm: WasmExports | null = null;
@@ -65,6 +78,8 @@ self.onmessage = async (event: MessageEvent<OrbitWorkerMsg>) => {
     await handleInit(msg);
   } else if (msg.type === "compute_orbit") {
     handleComputeOrbit(msg);
+  } else if (msg.type === "compute_roots") {
+    handleComputeRoots(msg);
   }
 };
 
@@ -79,6 +94,24 @@ async function handleInit(msg: OrbitInitMsg): Promise<void> {
   glue = glueModule as WasmGlue;
 
   (self as unknown as Worker).postMessage({ type: "orbit_worker_ready" });
+}
+
+function handleComputeRoots(msg: ComputeRootsMsg): void {
+  if (!glue) {
+    console.error("[OrbitWorker] compute_roots called before init");
+    return;
+  }
+  try {
+    const result = glue.compute_roots(new Float64Array(msg.coeffs));
+    (self as unknown as Worker).postMessage({
+      type: "roots_ready",
+      degree:  result.degree,
+      rootsRe: Array.from(result.roots_re()),
+      rootsIm: Array.from(result.roots_im()),
+    });
+  } catch (err) {
+    console.error("[OrbitWorker] compute_roots failed:", err);
+  }
 }
 
 function handleComputeOrbit(msg: ComputeOrbitMsg): void {
