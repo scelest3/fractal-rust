@@ -64,6 +64,9 @@ Browser-based, high-resolution fractal explorer targeting sustained 60 fps inter
 - Server-side rendering / compute cluster offload
 - Mobile touch (planned v2)
 - WebGPU backend (planned v2 — architecture is abstraction-ready)
+- Complex polynomial coefficients for Newton (v2 — interesting in the context of Julia/Mandelbrot variants)
+- Transcendental Newton fractals (v2 — `sin(z)`, `exp(z)`, etc. require a different solver)
+- Per-root hue pickers and root re-ordering UI for Newton (v2 — auto-assigned hues ship in v1)
 
 ---
 
@@ -181,14 +184,33 @@ The reference orbit is computed once per zoom event at full `BigFloat<N>` precis
 
 #### 4.2.2 Newton Fractal Kernel
 
-For polynomial `p(z)`, Newton map is `N(z) = z − p(z) / p'(z)`. The kernel:
+For polynomial `p(z)`, Newton map is `N(z) = z − p(z) / p'(z)`.
 
-- Accepts `Vec<Complex<f64>>` polynomial coefficients
-- Auto-differentiates `p'(z)` symbolically at startup
-- Identifies roots via Durand-Kerner for root-index coloring
-- Iterates until `|p(z)| < ε`, recording convergence speed and attracting root
+**Polynomial representation.** Real coefficients only; `coeffs[k]` is the coefficient of `z^k`. Represented as a fixed `[f64; 11]` stack array with a `degree: usize` live-count field. Maximum degree 10. No heap allocation — consistent with the `arith` no-alloc constraint. Complex coefficients and transcendental Newton are v2.
 
-> Newton fractals do not require perturbation theory — they are not deep-zoom targets. Standard f64 is sufficient.
+**Derivative.** `p′(z)` computed by exact degree-reduction once at polynomial setup (not per-iteration).
+
+**Convergence criterion.** `|p(z)| < ε` where `ε = 1e-6`. Evaluated from the same Horner pass that computes the Newton step — no extra cost per iteration.
+
+**Divergence bailout.** `|z| > 1e8`. Prevents NaN/Inf propagation near roots of `p′` and unbounded orbits.
+
+**Root-finding.** Durand-Kerner run once per polynomial change via `compute_roots` in `wasm-bridge`. After convergence, roots are sorted by `arg(root)` ascending for a canonical, hue-stable ordering. All tile workers read the same sorted root list from the Newton params shared memory slot.
+
+**Return type.** Newton uses `NewtonResult`, a separate enum from `EscapeResult` — the two iteration models are semantically distinct and `EscapeResult`'s `Glitched` variant has no meaning for Newton:
+
+```rust
+pub enum NewtonResult {
+    /// Orbit converged to a root within max_iter steps.
+    Converged { root_index: u32, convergence_iter: u32 },
+    /// Diverged (|z| > bailout) or hit max_iter without converging.
+    /// Both failure modes map to a single `u_unresolved_color` uniform in the shader.
+    Unresolved,
+}
+```
+
+**Tile channel packing.** `r = convergence_t` (convergence_iter normalised to [0,1]), `g = 0.0` (unused), `b = root_index` (f32), `a = 1.0` if Converged else `0.0`. The GPU shader branches on `a` to choose between Newton HSL coloring and the unresolved uniform.
+
+Newton fractals do not require perturbation theory — they are not deep-zoom targets. Standard f64 is sufficient.
 
 #### 4.2.3 Bilinear Approximation (BLA)
 
@@ -292,6 +314,14 @@ pub fn render_tile(job: JsValue, layout: &MemoryLayout) -> TileResult;
 /// Main thread (or any worker): build the LUT from palette parameters.
 #[wasm_bindgen]
 pub fn build_lut(palette: JsValue) -> Float32Array;
+
+/// Called once per polynomial change (blur/enter in the UI).
+/// Runs Durand-Kerner on the supplied real coefficients (ascending by degree),
+/// then sorts the roots by arg(root) ascending for a canonical hue-stable ordering.
+/// session.ts writes the returned roots + coefficients into the newton_params shared memory slot
+/// before dispatching tiles.
+#[wasm_bindgen]
+pub fn compute_roots(coeffs: &[f64]) -> RootResult;
 ```
 
 `FractalKind` is a `#[wasm_bindgen]` enum. `wasm-pack` automatically emits the corresponding TypeScript union type in the generated `.d.ts` — no custom codegen required.
@@ -331,6 +361,7 @@ After each worker calls `layout(n_workers, max_iter)` it obtains byte offsets us
 | **Primary orbit** | 8 B header + `MAX_ITER × 32` B | Header: `{ entry_bytes: u32, orbit_len: u32 }`. Max entry = 32 B (`(Complex<f64>, Complex<f64>)` for Phoenix) |
 | **BLA table** | `MAX_ITER × 48` B | `BlaEntry` = `{ a, b: Complex<f64>, skip: u32, _pad: u32, valid_radius: f64 }` — `repr(C)` with 4 B padding before `valid_radius` for f64 alignment |
 | **Secondary orbit ×3** | 3 × (8 B header + `MAX_ITER × 16` B) | f64 perturbation-speed orbits; no BigFloat |
+| **Newton params** | 264 B | `repr(C)`: `{ degree: u32, _pad: u32, epsilon: f64, coeffs: [f64; 11], roots: [Complex<f64>; 10] }`. Written once by `session.ts` after `compute_roots` returns; read by Tile Workers. Exposed via `layout().newton_params_offset`. |
 | **Slot state array** | `4 × MAX_WORKERS × 4` B | `Int32` per slot: `EMPTY=0 / WRITING=1 / READY=2` |
 | **Tile ring** | `4 × MAX_WORKERS × 256 × 256 × 4` B | RGBA f32 per pixel; 4× slots per worker absorbs burst latency |
 
@@ -406,18 +437,33 @@ When the Scheduler forwards a `READY` tile, the main thread calls `gl.texSubImag
 
 **Pass 2 — Smooth-Color Accumulation**
 
-Fullscreen quad reads from `tileTexArray` and `lut1D`:
+Fullscreen quad reads from `tileTexArray` and `lut1D`. Branches on `u_fractal_kind`:
 
 ```glsl
-float t = mod(smooth_t * palette_speed + palette_offset, 1.0);
-vec4 color = texture(u_lut, t);
+if (u_fractal_kind == FRACTAL_NEWTON) {
+    // a channel: 1.0 = Converged, 0.0 = Unresolved
+    if (tile.a < 0.5) {
+        fragColor = u_unresolved_color;
+    } else {
+        uint root_idx = uint(tile.b + 0.5);
+        float hue = float(root_idx) / float(u_newton_degree) * 360.0;
+        float lightness = mix(0.2, 0.8, tile.r);  // r = convergence_t
+        fragColor = hsl_to_rgb(hue, 0.8, lightness);
+    }
+} else {
+    // Mandelbrot / escape-time path
+    float t = mod(tile.r * palette_speed + palette_offset, 1.0);
+    vec4 color = texture(u_lut, t);
 
-// orbit trap blend
-float trap = 1.0 - smoothstep(0.0, trap_radius, orbit_min_r);
-color = mix(color, trap_color, trap_strength * trap);
+    // orbit trap blend
+    float trap = 1.0 - smoothstep(0.0, trap_radius, tile.g);
+    color = mix(color, trap_color, trap_strength * trap);
 
-fragColor = color;
+    fragColor = color;
+}
 ```
+
+Newton coloring uses auto-assigned evenly-spaced hues (`hue = root_index / degree * 360°`) with convergence speed encoded as lightness. No LUT is sampled for Newton pixels. Per-root hue overrides are a v2 addition to the palette editor.
 
 **Pass 3 — Post-Process & Tonemap**
 
@@ -773,21 +819,26 @@ The absolute values create fold discontinuities. The modified equation tracks si
 
 ### 10.4 Newton / Convergent Coloring Data
 
-```rust
-#[derive(Default)]
-pub struct NewtonOrbitData {
-    pub converged_to:     Option<usize>,  // root index
-    pub convergence_iter: u32,
-    pub final_z:          Complex<f64>,
-}
+Newton does not use `EscapeResult` or the `OrbitData` trait — it has its own return type. The kernel function returns `NewtonResult` directly:
 
-impl OrbitData for NewtonOrbitData {
-    fn accumulate(&mut self, step: &StepResult, n: u32) {
-        self.convergence_iter = n;
-        self.final_z = step.z;
-    }
+```rust
+pub enum NewtonResult {
+    Converged { root_index: u32, convergence_iter: u32 },
+    /// Diverged (|z| > 1e8) or reached max_iter without converging.
+    Unresolved,
 }
 ```
+
+`NewtonResult` is packed into the standard 4-channel `TilePixel` by a Newton-specific packing function (not `From<EscapeResult>`):
+
+| Channel | Value |
+|---|---|
+| `r` | `convergence_iter as f32 / max_iter as f32` (convergence_t) |
+| `g` | `0.0` (unused) |
+| `b` | `root_index as f32` |
+| `a` | `1.0` if `Converged`, `0.0` if `Unresolved` |
+
+The GPU shader reads these channels and computes HSL color directly (see §6.2). No LUT is sampled for Newton pixels. The `u_unresolved_color` uniform (dark, near-black by default) handles `Unresolved` pixels; a single uniform covers both divergent and max-iter-exceeded cases.
 
 ### 10.5 Registration
 
@@ -897,7 +948,7 @@ This runs before `fetch`, so non-SIMD browsers never request the SIMD bundle. Sh
 | Layer | Test type | Tool | Key assertions |
 |---|---|---|---|
 | `arith` | Unit + property | `cargo test` + `proptest` | `F64x2` / `BigFloat` arithmetic matches mpfr reference to full precision |
-| `kernel` | Unit + golden | `cargo-criterion` | Escape counts for known coordinates match published values; BLA skips ≥ 80%; BLA output matches full-perturbation render pixel-for-pixel |
+| `kernel` | Unit + golden | `cargo-criterion` | Escape counts for known coordinates match published values; BLA skips ≥ 80%; BLA output matches full-perturbation render pixel-for-pixel. Newton: Durand-Kerner finds roots of `z³−1` to `1e-10`; convergence to correct root for known basin points; `Unresolved` on boundary points; Horner evaluation correct at degree 5 and 10 |
 | `wasm-bridge` | Integration | `wasm-pack test --chrome` | JS API round-trips; shared memory writes correct data; `layout()` offsets consistent with actual writes |
 | GL pipeline | Screenshot regression | Playwright + pixelmatch | `|Δpixel| < 2 LSB` on 8-bit for canonical zoom coordinates |
 | UI shell | Component + E2E | vitest + Playwright | FSM state transitions; export produces correct file size / format |
@@ -925,7 +976,7 @@ This runs before `fetch`, so non-SIMD browsers never request the SIMD bundle. Sh
 | 1 — Mandelbrot f64 | Basic escape-time Mandelbrot, smooth coloring, pan/zoom | `kernel`, `coloring`, `gl-pipeline`, `viewport.ts` |
 | 2 — Deep Zoom (v1) | F64x2 escape-time for zoom_exp 15–20; automatic precision dispatch | `arith` (F64x2), `wasm-bridge` (F64x2 dispatch), `session.ts` |
 | 2b — Deep Zoom (v2) | Perturbation theory; BigFloat<N>; BLA; glitch correction / rebasing | `arith` (BigFloat), `kernel` (perturb, BLA), `scheduler` |
-| 3 — Newton | Newton fractal with polynomial config UI and root-index coloring | `kernel` (newton), `coloring` (root) |
+| 3 — Newton | Newton fractal: `NewtonResult` type, Durand-Kerner root-finding, Newton params shared memory slot, HSL shader branch, preset picker (`z³−1` default) with advanced coefficient overrides, `compute_roots` wasm-bridge entry point | `kernel` (newton), `wasm-bridge` (compute_roots, newton_params_offset), `gl-pipeline.ts` (shader branch), `session.ts` (polynomial change → compute_roots → tile dispatch) |
 | 4 — Color Editor | Full palette editor, orbit trap, LUT, preset library | `coloring`, `color-editor.ts` |
 | 5 — Export | PNG / JPEG / EXR export pipeline; PBO readback; large-image stitching | `export.ts`, `openexr-wasm` |
 | 6 — Polish | Playwright golden tests, perf regression CI, URL bookmarks, Julia preview | All |
