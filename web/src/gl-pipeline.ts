@@ -36,7 +36,7 @@ in vec2 vUv;
 uniform sampler2D uAccum;
 uniform sampler2D uLut;
 uniform float uCycleLen;
-uniform int uColorMode;
+uniform int   uColorMode;
 uniform float uTrapRadius;
 uniform float uTrapStrength;
 uniform vec3  uTrapColor;
@@ -48,9 +48,42 @@ uniform float uAngleStrength;
 uniform float uPeriodStrength;
 uniform float uPeriodCycleLen;
 uniform float uDistWeight;
+// Newton uniforms
+uniform int   uFractalKind;   // 0 = Mandelbrot, 1 = Newton
+uniform int   uNewtonDegree;
+uniform vec3  uUnresolvedColor;
 out vec4 fragColor;
+
+vec3 hsl_to_rgb(float h, float s, float l) {
+    float c = (1.0 - abs(2.0 * l - 1.0)) * s;
+    float x = c * (1.0 - abs(mod(h / 60.0, 2.0) - 1.0));
+    float m = l - c * 0.5;
+    vec3 rgb;
+    if      (h < 60.0)  rgb = vec3(c, x, 0.0);
+    else if (h < 120.0) rgb = vec3(x, c, 0.0);
+    else if (h < 180.0) rgb = vec3(0.0, c, x);
+    else if (h < 240.0) rgb = vec3(0.0, x, c);
+    else if (h < 300.0) rgb = vec3(x, 0.0, c);
+    else                rgb = vec3(c, 0.0, x);
+    return rgb + m;
+}
+
 void main() {
     vec4 data = texture(uAccum, vUv);
+
+    // ── Newton branch ────────────────────────────────────────────────────────
+    if (uFractalKind == 1) {
+        if (data.a < 0.5) {
+            fragColor = vec4(uUnresolvedColor, 1.0);
+            return;
+        }
+        float hue = (data.b / float(uNewtonDegree)) * 360.0;
+        float lightness = mix(0.2, 0.8, data.r);
+        fragColor = vec4(hsl_to_rgb(hue, 0.8, lightness), 1.0);
+        return;
+    }
+
+    // ── Mandelbrot / escape-time branch ──────────────────────────────────────
     if (data.a < 0.5) {
         float dist   = pow(clamp(data.g, 0.0, 1.0), uDistancePow);
         vec3  col    = mix(uInteriorColor, uShadingColor, uDistanceStrength * dist);
@@ -69,7 +102,6 @@ void main() {
         float blend = uTrapStrength * smoothstep(uTrapRadius, 0.0, data.g);
         fragColor = vec4(mix(escapeColor, uTrapColor, blend), 1.0);
     } else if (uColorMode == 2) {
-        // Pure distance estimate (debug / console access only)
         float t = fract(data.b / uCycleLen);
         fragColor = vec4(texture(uLut, vec2(t, 0.5)).rgb, 1.0);
     } else {
@@ -106,6 +138,9 @@ export class GlPipeline {
   private readonly uPeriodStrength:   WebGLUniformLocation;
   private readonly uPeriodCycleLen:   WebGLUniformLocation;
   private readonly uDistWeight:       WebGLUniformLocation;
+  private readonly uFractalKind:      WebGLUniformLocation;
+  private readonly uNewtonDegree:     WebGLUniformLocation;
+  private readonly uUnresolvedColor:  WebGLUniformLocation;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -175,6 +210,12 @@ export class GlPipeline {
     gl.uniform1f(this.uPeriodCycleLen,   8.0);
     this.uDistWeight = gl.getUniformLocation(this.blitProgram, "uDistWeight")!;
     gl.uniform1f(this.uDistWeight, 0.0);
+    this.uFractalKind     = gl.getUniformLocation(this.blitProgram, "uFractalKind")!;
+    this.uNewtonDegree    = gl.getUniformLocation(this.blitProgram, "uNewtonDegree")!;
+    this.uUnresolvedColor = gl.getUniformLocation(this.blitProgram, "uUnresolvedColor")!;
+    gl.uniform1i(this.uFractalKind,     0);
+    gl.uniform1i(this.uNewtonDegree,    3);
+    gl.uniform3f(this.uUnresolvedColor, 0.05, 0.05, 0.05); // near-black
 
     // ── Tile program uniform ──────────────────────────────────────────────────
     gl.useProgram(this.tileProgram);
@@ -348,6 +389,27 @@ export class GlPipeline {
     const { gl } = this;
     gl.useProgram(this.blitProgram);
     gl.uniform1f(this.uDistWeight, v);
+  }
+
+  /** Switch between Mandelbrot (0) and Newton (1) coloring. */
+  setFractalKind(kind: 0 | 1): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1i(this.uFractalKind, kind);
+  }
+
+  /** Number of roots for Newton coloring — controls hue step size. */
+  setNewtonDegree(degree: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1i(this.uNewtonDegree, degree);
+  }
+
+  /** Color for Newton pixels that did not converge (diverged or max-iter). */
+  setUnresolvedColor(r: number, g: number, b: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform3f(this.uUnresolvedColor, r, g, b);
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────

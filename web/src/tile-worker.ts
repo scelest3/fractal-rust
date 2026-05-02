@@ -43,6 +43,13 @@ interface OrbitReadyMsg {
   cy_ref: number;
 }
 
+interface NewtonRenderParams {
+  degree: number;
+  coeffs: number[];
+  rootsRe: number[];
+  rootsIm: number[];
+}
+
 interface RenderTileMsg {
   type: "render_tile";
   deltaRe: number;
@@ -56,6 +63,8 @@ interface RenderTileMsg {
   useF64x2: boolean;
   cxRef: number;
   cyRef: number;
+  fractalKind: "mandelbrot" | "newton";
+  newton?: NewtonRenderParams;
 }
 
 type WorkerMsg = InitMsg | OrbitReadyMsg | RenderTileMsg;
@@ -93,6 +102,18 @@ interface WasmExports {
 
 interface WasmGlue {
   install_orbit: (orbitF64: Float64Array, blaBytes: Uint8Array) => void;
+  // Slice parameters (&[f64]) require the JS glue wrapper, not the raw WASM export.
+  render_tile_newton_to_ptr: (
+    degree: number,
+    coeffs: Float64Array,
+    rootsRe: Float64Array,
+    rootsIm: Float64Array,
+    deltaRe: number,
+    deltaIm: number,
+    pixelStep: number,
+    maxIter: number,
+    ptr: number,
+  ) => void;
 }
 
 let wasm: WasmExports | null = null;
@@ -161,12 +182,22 @@ function handleRenderTile(msg: RenderTileMsg): void {
     return;
   }
 
-  const { deltaRe, deltaIm, step, slotIndex, tileX, tileY, generation, useF64x2, cxRef, cyRef } = msg;
+  const { deltaRe, deltaIm, step, slotIndex, tileX, tileY, generation,
+          useF64x2, cxRef, cyRef, fractalKind } = msg;
   const maxIter = msg.maxIter ?? 256;
 
   const ptr = wasm.alloc_tile_buf();
 
-  if (useF64x2) {
+  if (fractalKind === "newton" && msg.newton && glueModule) {
+    const { degree, coeffs, rootsRe, rootsIm } = msg.newton;
+    glueModule.render_tile_newton_to_ptr(
+      degree,
+      new Float64Array(coeffs),
+      new Float64Array(rootsRe),
+      new Float64Array(rootsIm),
+      deltaRe, deltaIm, step, maxIter, ptr,
+    );
+  } else if (useF64x2) {
     wasm.render_tile_f64x2(cxRef, cyRef, deltaRe, deltaIm, step, maxIter, ptr);
   } else {
     wasm.render_tile_to_ptr(deltaRe, deltaIm, step, maxIter, ptr);

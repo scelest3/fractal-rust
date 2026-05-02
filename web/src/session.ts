@@ -17,6 +17,7 @@ import { GlPipeline } from "./gl-pipeline.ts";
 import { wasmBundleUrl } from "./detect-simd.ts";
 import { CLASSIC } from "./palette.ts";
 import { PaletteEditor } from "./palette-editor.ts";
+import { newtonParamsZ3, type NewtonParams } from "./newton.ts";
 
 const BASE_ITER = 256;
 const ITER_PER_DECADE = 64;
@@ -70,6 +71,8 @@ interface TileDesc {
   useF64x2: boolean;
   cxRef: number;
   cyRef: number;
+  fractalKind: "mandelbrot" | "newton";
+  newton?: { degree: number; coeffs: number[]; rootsRe: number[]; rootsIm: number[] };
 }
 
 type WorkerInMsg =
@@ -120,6 +123,10 @@ export class FractalSession {
   private currentOrbitId = 0;
   private orbitReady = false;
   private pendingOrbitDispatch = false; // waiting for orbit_ready before dispatching
+
+  // Newton state (hardwired z³−1 for Phase 3 / Issue #30; UI wired in Issue #31)
+  private readonly fractalKind: "mandelbrot" | "newton" = "newton";
+  private readonly newtonParams: NewtonParams = newtonParamsZ3();
 
   constructor(canvas: HTMLCanvasElement) {
     this.overlay = makeOverlay();
@@ -325,6 +332,12 @@ export class FractalSession {
     const gen = this.generation;
     this.pendingTiles = [];
 
+    // Sync shader with current fractal kind.
+    this.gl.setFractalKind(this.fractalKind === "newton" ? 1 : 0);
+    if (this.fractalKind === "newton") {
+      this.gl.setNewtonDegree(this.newtonParams.degree);
+    }
+
     const canvas = this.gl.canvas;
     const W = canvas.width as number;
     const H = canvas.height as number;
@@ -357,6 +370,13 @@ export class FractalSession {
           deltaIm = fy;
         }
 
+        const newton = this.fractalKind === "newton" ? {
+          degree:  this.newtonParams.degree,
+          coeffs:  Array.from(this.newtonParams.coeffs),
+          rootsRe: Array.from(this.newtonParams.rootsRe),
+          rootsIm: Array.from(this.newtonParams.rootsIm),
+        } : undefined;
+
         this.pendingTiles.push({
           deltaRe, deltaIm, step, maxIter,
           tileX: tx, tileY: ty,
@@ -365,6 +385,8 @@ export class FractalSession {
           useF64x2,
           cxRef,
           cyRef,
+          fractalKind: this.fractalKind,
+          newton,
         });
       }
     }

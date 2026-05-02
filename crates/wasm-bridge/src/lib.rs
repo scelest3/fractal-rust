@@ -250,6 +250,132 @@ pub fn render_tile(job: &TileJob, layout: &MemoryLayout) -> TileResult {
     render_tile_impl(job, out)
 }
 
+// ── compute_roots ──────────────────────────────────────────────────────────
+
+/// Roots of a Newton polynomial returned to the Tile Worker.
+#[wasm_bindgen]
+pub struct RootResult {
+    /// Number of roots found (= degree of the polynomial).
+    pub degree: u32,
+    roots_re: [f64; 10],
+    roots_im: [f64; 10],
+}
+
+#[wasm_bindgen]
+impl RootResult {
+    /// Real parts of the roots, sorted by arg(root) ascending.
+    pub fn roots_re(&self) -> Vec<f64> {
+        self.roots_re[..self.degree as usize].to_vec()
+    }
+    /// Imaginary parts of the roots, sorted by arg(root) ascending.
+    pub fn roots_im(&self) -> Vec<f64> {
+        self.roots_im[..self.degree as usize].to_vec()
+    }
+}
+
+/// Inner logic for `compute_roots`, testable without a browser.
+///
+/// `coeffs` is ascending by degree (coeffs[k] = coefficient of z^k).
+/// Returns (roots_re, roots_im, degree). Unused root slots are zeroed.
+pub fn compute_roots_inner(coeffs: &[f64]) -> ([f64; 10], [f64; 10], u32) {
+    let degree = (coeffs.len().saturating_sub(1)).clamp(1, 10);
+    let mut full_coeffs = [0.0f64; 11];
+    for (i, &c) in coeffs.iter().take(11).enumerate() {
+        full_coeffs[i] = c;
+    }
+    let map = kernel::maps::NewtonMap::new(full_coeffs, degree);
+    let roots = kernel::maps::find_roots(&map);
+    let mut roots_re = [0.0f64; 10];
+    let mut roots_im = [0.0f64; 10];
+    for i in 0..degree {
+        roots_re[i] = roots[i].re;
+        roots_im[i] = roots[i].im;
+    }
+    (roots_re, roots_im, degree as u32)
+}
+
+/// Compute roots of a real polynomial and return them sorted by arg ascending.
+///
+/// `coeffs` is ascending by degree. Called once per polynomial change by
+/// `session.ts`; the returned roots are written to the Newton params shared
+/// memory slot before tiles are dispatched.
+#[wasm_bindgen]
+pub fn compute_roots(coeffs: &[f64]) -> RootResult {
+    let (roots_re, roots_im, degree) = compute_roots_inner(coeffs);
+    RootResult { degree, roots_re, roots_im }
+}
+
+// ── render_tile_newton ─────────────────────────────────────────────────────
+
+/// Inner Newton tile render — testable natively without shared memory.
+///
+/// `roots_re` / `roots_im` are the sorted root components from `compute_roots`.
+/// Each pixel is iterated from its absolute fractal coordinate; the nearest
+/// root after convergence determines `root_index`.
+pub fn render_tile_newton_impl(
+    degree: u32,
+    coeffs: &[f64],
+    roots_re: &[f64],
+    roots_im: &[f64],
+    delta_re: f64,
+    delta_im: f64,
+    pixel_step: f64,
+    max_iter: u32,
+    out: &mut [kernel::TilePixel],
+) {
+    debug_assert_eq!(out.len(), TILE_PIXELS);
+
+    let mut full_coeffs = [0.0f64; 11];
+    for (i, &c) in coeffs.iter().take(11).enumerate() {
+        full_coeffs[i] = c;
+    }
+    let map = kernel::maps::NewtonMap::new(full_coeffs, degree as usize);
+
+    let mut roots = [arith::Complex::<f64>::zero(); 10];
+    let n = degree as usize;
+    for i in 0..n.min(roots_re.len()).min(roots_im.len()) {
+        roots[i] = arith::Complex::new(roots_re[i], roots_im[i]);
+    }
+
+    for row in 0..TILE_SIZE {
+        for col in 0..TILE_SIZE {
+            let z0 = arith::Complex::new(
+                delta_re + col as f64 * pixel_step,
+                delta_im + row as f64 * pixel_step,
+            );
+            let result = kernel::maps::iterate_newton(&map, z0, &roots, max_iter);
+            out[row * TILE_SIZE + col] = kernel::maps::newton_tile_pixel(result, max_iter);
+        }
+    }
+}
+
+/// Render a 256×256 Newton tile into the WASM heap buffer at `ptr`.
+///
+/// `ptr` must be a byte offset returned by `alloc_tile_buf()`.
+/// `coeffs` is ascending by degree; `roots_re` / `roots_im` come from
+/// `compute_roots()`. Called once per tile by the Tile Worker.
+#[wasm_bindgen]
+pub fn render_tile_newton_to_ptr(
+    degree: u32,
+    coeffs: &[f64],
+    roots_re: &[f64],
+    roots_im: &[f64],
+    delta_re: f64,
+    delta_im: f64,
+    pixel_step: f64,
+    max_iter: u32,
+    ptr: u32,
+) {
+    // Safety: ptr is from alloc_tile_buf() — a valid TILE_PIXELS-sized heap buffer.
+    let out = unsafe {
+        core::slice::from_raw_parts_mut(ptr as *mut kernel::TilePixel, TILE_PIXELS)
+    };
+    render_tile_newton_impl(
+        degree, coeffs, roots_re, roots_im,
+        delta_re, delta_im, pixel_step, max_iter, out,
+    );
+}
+
 // ── Phase 2: reference orbit + perturbation rendering ─────────────────────
 
 // Thread-local storage shared between the orbit-compute path (Orbit Worker)
@@ -552,4 +678,118 @@ pub fn render_tile_perturb(
             fallback_count
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── compute_roots ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn compute_roots_z3_minus_1_returns_degree_3() {
+        // p(z) = z³ − 1: coeffs = [−1, 0, 0, 1]
+        let coeffs = [-1.0_f64, 0.0, 0.0, 1.0];
+        let (_, _, degree) = compute_roots_inner(&coeffs);
+        assert_eq!(degree, 3);
+    }
+
+    #[test]
+    fn compute_roots_z3_minus_1_finds_roots_near_exact() {
+        let coeffs = [-1.0_f64, 0.0, 0.0, 1.0];
+        let (re, im, degree) = compute_roots_inner(&coeffs);
+        let sqrt3_2 = 3.0_f64.sqrt() / 2.0;
+        let expected = [
+            (-0.5_f64, -sqrt3_2),
+            ( 1.0_f64,  0.0),
+            (-0.5_f64,  sqrt3_2),
+        ];
+        for (i, &(exp_re, exp_im)) in expected.iter().enumerate() {
+            let dist = ((re[i] - exp_re).powi(2) + (im[i] - exp_im).powi(2)).sqrt();
+            assert!(dist < 1e-10,
+                "root {i}: got ({}, {}), expected ({exp_re}, {exp_im})", re[i], im[i]);
+        }
+        let _ = degree;
+    }
+
+    #[test]
+    fn compute_roots_sorted_by_arg_ascending() {
+        let coeffs = [-1.0_f64, 0.0, 0.0, 1.0];
+        let (re, im, degree) = compute_roots_inner(&coeffs);
+        let args: Vec<f64> = (0..degree as usize)
+            .map(|i| im[i].atan2(re[i]))
+            .collect();
+        for w in args.windows(2) {
+            assert!(w[0] <= w[1], "roots not sorted by arg: {:?}", args);
+        }
+    }
+
+    // ── render_tile_newton_impl ───────────────────────────────────────────────
+
+    fn z3_minus_1_params() -> (u32, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let coeffs = vec![-1.0_f64, 0.0, 0.0, 1.0];
+        let (re, im, degree) = compute_roots_inner(&coeffs);
+        let n = degree as usize;
+        (degree, coeffs, re[..n].to_vec(), im[..n].to_vec())
+    }
+
+    #[test]
+    fn newton_tile_basin_pixels_have_converged_flag() {
+        // Render a 1-pixel "tile" centred on z₀ = 2+0i — deep in the real basin.
+        // a channel = 1.0 means Converged.
+        let (degree, coeffs, re, im) = z3_minus_1_params();
+        let mut out = vec![kernel::TilePixel::default(); TILE_PIXELS];
+        render_tile_newton_impl(
+            degree, &coeffs, &re, &im,
+            2.0, 0.0, 1e-6, 200, &mut out,
+        );
+        // Top-left pixel is at (2.0, 0.0) — should converge.
+        assert_eq!(out[0].escaped, 1.0, "basin pixel must have a=1.0 (Converged)");
+    }
+
+    #[test]
+    fn newton_tile_converged_pixel_has_nonzero_convergence_t() {
+        let (degree, coeffs, re, im) = z3_minus_1_params();
+        let mut out = vec![kernel::TilePixel::default(); TILE_PIXELS];
+        render_tile_newton_impl(
+            degree, &coeffs, &re, &im,
+            2.0, 0.0, 1e-6, 200, &mut out,
+        );
+        // r channel = convergence_t > 0 (took more than 0 iterations).
+        assert!(out[0].smooth_t > 0.0, "convergence_t must be > 0");
+        assert!(out[0].smooth_t <= 1.0, "convergence_t must be <= 1");
+    }
+
+    #[test]
+    fn newton_tile_root_index_in_range() {
+        let (degree, coeffs, re, im) = z3_minus_1_params();
+        let mut out = vec![kernel::TilePixel::default(); TILE_PIXELS];
+        render_tile_newton_impl(
+            degree, &coeffs, &re, &im,
+            2.0, 0.0, 1e-6, 200, &mut out,
+        );
+        // b channel = root_index, must be in 0..degree for converged pixels.
+        let root_idx = out[0].angle as u32;
+        assert!(root_idx < degree, "root_index {root_idx} out of range for degree {degree}");
+    }
+
+    #[test]
+    fn newton_tile_unresolved_pixel_has_zero_flag() {
+        // z₀ = 0 is a critical point of z³−1 (p′(0)=0), always Unresolved.
+        let (degree, coeffs, re, im) = z3_minus_1_params();
+        let mut out = vec![kernel::TilePixel::default(); TILE_PIXELS];
+        render_tile_newton_impl(
+            degree, &coeffs, &re, &im,
+            0.0, 0.0, 1e-6, 200, &mut out,
+        );
+        assert_eq!(out[0].escaped, 0.0, "critical point must have a=0.0 (Unresolved)");
+    }
+
+    #[test]
+    fn compute_roots_degree_clamped_to_10() {
+        // 12 coefficients → degree clamped to 10
+        let coeffs = vec![1.0_f64; 12];
+        let (_, _, degree) = compute_roots_inner(&coeffs);
+        assert_eq!(degree, 10);
+    }
 }
