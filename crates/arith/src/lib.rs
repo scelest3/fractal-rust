@@ -9,7 +9,7 @@
 //! `arith::{Complex, DeltaC, Precision}`.
 #![no_std]
 
-use core::ops::{Add, Mul, Neg, Sub};
+use core::ops::{Add, Div, Mul, Neg, Sub};
 
 // ── Precision trait ────────────────────────────────────────────────────────────
 
@@ -148,6 +148,25 @@ impl<T: Precision> Neg for Complex<T> {
 
 /// `2.0 * z_ref` in the perturbation hot loop: `δ = 2·Z_ref·δ + δ² + ΔC`.
 /// Only defined for `f64` scalar — the perturbation loop is always f64.
+impl Div for Complex<f64> {
+    type Output = Self;
+    /// `a / b = a · conj(b) / |b|²`
+    #[inline(always)]
+    fn div(self, rhs: Self) -> Self {
+        let denom = rhs.norm_sqr();
+        let numer = self * rhs.conj();
+        Complex::new(numer.re / denom, numer.im / denom)
+    }
+}
+
+impl Div<f64> for Complex<f64> {
+    type Output = Self;
+    #[inline(always)]
+    fn div(self, rhs: f64) -> Self {
+        Complex::new(self.re / rhs, self.im / rhs)
+    }
+}
+
 impl Mul<Complex<f64>> for f64 {
     type Output = Complex<f64>;
     #[inline(always)]
@@ -735,6 +754,35 @@ mod tests {
     fn scalar_mul_zero_gives_zero() {
         let z = Complex::new(3.0_f64, 4.0_f64);
         assert_eq!(0.0_f64 * z, Complex::zero());
+    }
+
+    // ── complex division ──────────────────────────────────────────────────────
+
+    #[test]
+    fn complex_div_complex_basic() {
+        // (4 + 2i) / (1 + i) = (4+2i)(1-i) / |1+i|² = (6 - 2i) / 2 = 3 - i
+        let a = Complex::new(4.0_f64, 2.0);
+        let b = Complex::new(1.0_f64, 1.0);
+        let q = a / b;
+        assert!((q.re - 3.0).abs() < 1e-14, "re = {}", q.re);
+        assert!((q.im - (-1.0)).abs() < 1e-14, "im = {}", q.im);
+    }
+
+    #[test]
+    fn complex_div_self_gives_one() {
+        let z = Complex::new(3.0_f64, 4.0);
+        let q = z / z;
+        assert!((q.re - 1.0).abs() < 1e-14, "re = {}", q.re);
+        assert!(q.im.abs() < 1e-14, "im = {}", q.im);
+    }
+
+    #[test]
+    fn complex_div_f64_scalar() {
+        // (3 + 4i) / 5 = 0.6 + 0.8i
+        let z = Complex::new(3.0_f64, 4.0);
+        let q = z / 5.0_f64;
+        assert!((q.re - 0.6).abs() < 1e-14, "re = {}", q.re);
+        assert!((q.im - 0.8).abs() < 1e-14, "im = {}", q.im);
     }
 
     // ── DeltaC ────────────────────────────────────────────────────────────────
