@@ -70,6 +70,7 @@ export class PaletteEditor {
     angleStrength: number,
     periodStrength: number,
   ) => void;
+  private readonly onDistWeightChange?: (weight: number) => void;
 
   private readonly panel: HTMLElement;
   private readonly toggleBtn: HTMLButtonElement;
@@ -93,11 +94,13 @@ export class PaletteEditor {
       angleStrength: number,
       periodStrength: number,
     ) => void,
+    onDistWeightChange?: (weight: number) => void,
   ) {
     this.palette = deepCopyPalette(initial);
     this.onChange = onChange;
     this.onTrapChange = onTrapChange;
     this.onInteriorChange = onInteriorChange;
+    this.onDistWeightChange = onDistWeightChange;
 
     const refs = this.buildPanel();
     this.panel       = refs.panel;
@@ -406,7 +409,34 @@ export class PaletteEditor {
 
     interiorSection.append(interiorColorRow, distanceRow, curveRow, angleRow, periodRow);
 
-    panel.append(barCanvas, handleRow, stopListEl, cycleLenRow, presetRow, trapSection, interiorSection);
+    // ── Exterior coloring ─────────────────────────────────────────────────────
+    const exteriorSection = document.createElement("div");
+    exteriorSection.style.cssText = "margin-top:8px; border-top:1px solid rgba(255,255,255,0.2); padding-top:6px;";
+
+    const extHeader = document.createElement("div");
+    extHeader.textContent = "Exterior";
+    extHeader.style.cssText = "font-weight:bold; margin-bottom:4px; font-size:11px; opacity:0.7;";
+    exteriorSection.appendChild(extHeader);
+
+    const distWeightSlider = document.createElement("input");
+    distWeightSlider.type = "range"; distWeightSlider.min = "-2"; distWeightSlider.max = "2"; distWeightSlider.step = "0.05";
+    distWeightSlider.value = "0";
+    distWeightSlider.style.cssText = "width:130px; vertical-align:middle;";
+    const distWeightLabel = document.createElement("span");
+    distWeightLabel.textContent = "0.00";
+
+    distWeightSlider.addEventListener("input", () => {
+      const v = parseFloat(distWeightSlider.value);
+      distWeightLabel.textContent = v.toFixed(2);
+      this.onDistWeightChange?.(v);
+    });
+
+    const distWeightRow = document.createElement("div");
+    distWeightRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    distWeightRow.append("Dist: ", distWeightSlider, distWeightLabel);
+    exteriorSection.appendChild(distWeightRow);
+
+    panel.append(barCanvas, handleRow, stopListEl, cycleLenRow, presetRow, exteriorSection, trapSection, interiorSection);
 
     return { panel, barCanvas, handleRow, stopListEl, cycleLenLabel, cycleLenSlider };
   }

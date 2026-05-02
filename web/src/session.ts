@@ -95,7 +95,7 @@ function makeOverlay(): HTMLElement {
 
 export class FractalSession {
   private readonly fsm: ZoomPanFSM;
-  private readonly gl: GlPipeline;
+  readonly gl: GlPipeline;
   private readonly workers: Worker[];
   private readonly tileSab: SharedArrayBuffer;
   private readonly orbitSab: SharedArrayBuffer;
@@ -148,6 +148,10 @@ export class FractalSession {
         this.gl.setDistancePow(distancePow);
         this.gl.setAngleStrength(angleStrength);
         this.gl.setPeriodStrength(periodStrength);
+        this.gl.blit();
+      },
+      (weight) => {
+        this.gl.setDistWeight(weight);
         this.gl.blit();
       },
     );

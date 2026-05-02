@@ -47,6 +47,7 @@ uniform float uDistancePow;
 uniform float uAngleStrength;
 uniform float uPeriodStrength;
 uniform float uPeriodCycleLen;
+uniform float uDistWeight;
 out vec4 fragColor;
 void main() {
     vec4 data = texture(uAccum, vUv);
@@ -63,11 +64,12 @@ void main() {
         return;
     }
     if (uColorMode == 0) {
-        float t = fract(data.r / uCycleLen);
+        float t = fract((data.r + uDistWeight * data.b) / uCycleLen);
         vec3 escapeColor = texture(uLut, vec2(t, 0.5)).rgb;
         float blend = uTrapStrength * smoothstep(uTrapRadius, 0.0, data.g);
         fragColor = vec4(mix(escapeColor, uTrapColor, blend), 1.0);
     } else if (uColorMode == 2) {
+        // Pure distance estimate (debug / console access only)
         float t = fract(data.b / uCycleLen);
         fragColor = vec4(texture(uLut, vec2(t, 0.5)).rgb, 1.0);
     } else {
@@ -103,6 +105,7 @@ export class GlPipeline {
   private readonly uAngleStrength:    WebGLUniformLocation;
   private readonly uPeriodStrength:   WebGLUniformLocation;
   private readonly uPeriodCycleLen:   WebGLUniformLocation;
+  private readonly uDistWeight:       WebGLUniformLocation;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -170,6 +173,8 @@ export class GlPipeline {
     gl.uniform1f(this.uAngleStrength,    0.0);
     gl.uniform1f(this.uPeriodStrength,   0.0);
     gl.uniform1f(this.uPeriodCycleLen,   8.0);
+    this.uDistWeight = gl.getUniformLocation(this.blitProgram, "uDistWeight")!;
+    gl.uniform1f(this.uDistWeight, 0.0);
 
     // ── Tile program uniform ──────────────────────────────────────────────────
     gl.useProgram(this.tileProgram);
@@ -337,6 +342,12 @@ export class GlPipeline {
     const { gl } = this;
     gl.useProgram(this.blitProgram);
     gl.uniform1i(this.uColorMode, v);
+  }
+
+  setDistWeight(v: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1f(this.uDistWeight, v);
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────

@@ -15,5 +15,5 @@ if (typeof SharedArrayBuffer === "undefined") {
     "<p style='color:red;padding:1rem'>SharedArrayBuffer unavailable — " +
     "run with <code>npm run dev</code> (COOP/COEP headers required).</p>";
 } else {
-  new FractalSession(canvas);
+  (window as any).session = new FractalSession(canvas);
 }
