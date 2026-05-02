@@ -409,32 +409,51 @@ fn mandelbrot_f64x2(cr: arith::F64x2, ci: arith::F64x2, max_iter: u32, escape_r_
     use arith::{F64x2, Precision};
     let mut zr = F64x2::zero();
     let mut zi = F64x2::zero();
+    let mut dz_r: f64 = 0.0;
+    let mut dz_i: f64 = 0.0;
+    let mut zr_prev: f64 = 0.0;
+    let mut zi_prev: f64 = 0.0;
     let mut orbit_min_r = f64::MAX;
     let mut orbit_min_z = arith::Complex::<f64>::zero();
 
     for iter in 0..max_iter {
-        let zr2 = zr * zr;
-        let zi2 = zi * zi;
+        let zr2    = zr * zr;
+        let zi2    = zi * zi;
         let norm_sq = (zr2 + zi2).to_f64_lossy();
+        let zr_f   = zr.to_f64_lossy();
+        let zi_f   = zi.to_f64_lossy();
+
+        // dz_{n+1}/dc = 2·z_n·dz_n + 1  (f64 — sufficient for distance estimate)
+        let new_dz_r = 2.0 * (zr_f * dz_r - zi_f * dz_i) + 1.0;
+        let new_dz_i = 2.0 * (zr_f * dz_i + zi_f * dz_r);
+        dz_r = new_dz_r;
+        dz_i = new_dz_i;
 
         let r = norm_sq.sqrt();
         if iter > 0 && r < orbit_min_r {
             orbit_min_r = r;
-            orbit_min_z = arith::Complex::new(zr.to_f64_lossy(), zi.to_f64_lossy());
+            orbit_min_z = arith::Complex::new(zr_f, zi_f);
         }
 
         if norm_sq > escape_r_sq {
+            let norm     = r;
             let smooth_t = (iter as f64 + 1.0) - norm_sq.sqrt().ln().ln() / core::f64::consts::LN_2;
-            let zr_f64 = zr.to_f64_lossy();
-            let zi_f64 = zi.to_f64_lossy();
+            let dz_norm  = (dz_r * dz_r + dz_i * dz_i).sqrt().max(1e-300);
+            let log_dist = (dz_norm / (2.0 * norm * norm.ln().max(1e-300))).ln();
             return kernel::TilePixel::from(kernel::EscapeResult::Escaped {
-                iter,
-                smooth_t,
-                orbit_min_r,
-                orbit_min_z,
-                angle_final: zi_f64.atan2(zr_f64),
+                iter, smooth_t, orbit_min_r, orbit_min_z, log_dist,
             });
         }
+
+        // Period-1 convergence check.
+        if iter > 0 && (zr_f - zr_prev).hypot(zi_f - zi_prev) < 1e-10 {
+            return kernel::TilePixel::from(kernel::EscapeResult::Interior {
+                orbit_min_r, orbit_min_z, period: 1,
+            });
+        }
+
+        zr_prev = zr_f;
+        zi_prev = zi_f;
 
         // z ← z² + c
         let zr_new = zr2 - zi2 + cr;
@@ -442,7 +461,9 @@ fn mandelbrot_f64x2(cr: arith::F64x2, ci: arith::F64x2, max_iter: u32, escape_r_
         zr = zr_new;
     }
 
-    kernel::TilePixel::from(kernel::EscapeResult::Interior { orbit_min_r, orbit_min_z })
+    kernel::TilePixel::from(kernel::EscapeResult::Interior {
+        orbit_min_r, orbit_min_z, period: 0,
+    })
 }
 
 /// Render a 256×256 perturbation tile using the installed reference orbit.

@@ -68,6 +68,7 @@ export class PaletteEditor {
     distanceStrength: number,
     distancePow: number,
     angleStrength: number,
+    periodStrength: number,
   ) => void;
 
   private readonly panel: HTMLElement;
@@ -90,6 +91,7 @@ export class PaletteEditor {
       distanceStrength: number,
       distancePow: number,
       angleStrength: number,
+      periodStrength: number,
     ) => void,
   ) {
     this.palette = deepCopyPalette(initial);
@@ -317,13 +319,26 @@ export class PaletteEditor {
     const angleStrengthLabel = document.createElement("span");
     angleStrengthLabel.textContent = "1.00"; angleStrengthLabel.style.display = "none";
 
+    // Period coloring
+    const periodToggle = document.createElement("input");
+    periodToggle.type = "checkbox";
+    periodToggle.style.cssText = "cursor:pointer; vertical-align:middle;";
+
+    const periodStrengthSlider = document.createElement("input");
+    periodStrengthSlider.type = "range"; periodStrengthSlider.min = "0"; periodStrengthSlider.max = "1"; periodStrengthSlider.step = "0.01";
+    periodStrengthSlider.value = "1";
+    periodStrengthSlider.style.cssText = "width:90px; vertical-align:middle; display:none;";
+    const periodStrengthLabel = document.createElement("span");
+    periodStrengthLabel.textContent = "1.00"; periodStrengthLabel.style.display = "none";
+
     const fireInterior = () => {
       const [r, g, b]     = hexToRgb(interiorColorInput.value);
       const [sr, sg, sb]  = hexToRgb(shadingColorInput.value);
       const distStrength  = distanceToggle.checked ? parseFloat(distanceStrengthSlider.value) : 0.0;
       const distPow       = parseFloat(distancePowSlider.value);
       const angStrength   = angleToggle.checked ? parseFloat(angleStrengthSlider.value) : 0.0;
-      this.onInteriorChange?.([r, g, b], [sr, sg, sb], distStrength, distPow, angStrength);
+      const perStrength   = periodToggle.checked ? parseFloat(periodStrengthSlider.value) : 0.0;
+      this.onInteriorChange?.([r, g, b], [sr, sg, sb], distStrength, distPow, angStrength, perStrength);
     };
 
     const setDistanceVisible = (on: boolean) => {
@@ -358,6 +373,17 @@ export class PaletteEditor {
       fireInterior();
     });
 
+    periodToggle.addEventListener("change", () => {
+      const on = periodToggle.checked;
+      periodStrengthSlider.style.display = on ? "" : "none";
+      periodStrengthLabel.style.display  = on ? "" : "none";
+      fireInterior();
+    });
+    periodStrengthSlider.addEventListener("input", () => {
+      periodStrengthLabel.textContent = parseFloat(periodStrengthSlider.value).toFixed(2);
+      fireInterior();
+    });
+
     const interiorColorRow = document.createElement("div");
     interiorColorRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
     interiorColorRow.append("Color: ", interiorColorInput);
@@ -374,7 +400,11 @@ export class PaletteEditor {
     angleRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
     angleRow.append("Angle: ", angleToggle, angleStrengthSlider, angleStrengthLabel);
 
-    interiorSection.append(interiorColorRow, distanceRow, curveRow, angleRow);
+    const periodRow = document.createElement("div");
+    periodRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    periodRow.append("Period: ", periodToggle, periodStrengthSlider, periodStrengthLabel);
+
+    interiorSection.append(interiorColorRow, distanceRow, curveRow, angleRow, periodRow);
 
     panel.append(barCanvas, handleRow, stopListEl, cycleLenRow, presetRow, trapSection, interiorSection);
 

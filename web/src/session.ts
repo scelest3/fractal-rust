@@ -141,12 +141,13 @@ export class FractalSession {
         this.gl.setTrapStrength(trapStrength);
         this.gl.blit();
       },
-      ([r, g, b], [sr, sg, sb], distanceStrength, distancePow, angleStrength) => {
+      ([r, g, b], [sr, sg, sb], distanceStrength, distancePow, angleStrength, periodStrength) => {
         this.gl.setInteriorColor(r, g, b);
         this.gl.setShadingColor(sr, sg, sb);
         this.gl.setDistanceStrength(distanceStrength);
         this.gl.setDistancePow(distancePow);
         this.gl.setAngleStrength(angleStrength);
+        this.gl.setPeriodStrength(periodStrength);
         this.gl.blit();
       },
     );

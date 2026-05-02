@@ -45,15 +45,20 @@ uniform vec3  uShadingColor;
 uniform float uDistanceStrength;
 uniform float uDistancePow;
 uniform float uAngleStrength;
+uniform float uPeriodStrength;
+uniform float uPeriodCycleLen;
 out vec4 fragColor;
 void main() {
     vec4 data = texture(uAccum, vUv);
     if (data.a < 0.5) {
-        float dist = pow(clamp(data.g, 0.0, 1.0), uDistancePow);
-        vec3 col = mix(uInteriorColor, uShadingColor, uDistanceStrength * dist);
-        float t = fract((data.b + 3.14159265) / 6.28318530);
-        vec3 angleCol = texture(uLut, vec2(t, 0.5)).rgb;
-        col = mix(col, angleCol, uAngleStrength);
+        float dist   = pow(clamp(data.g, 0.0, 1.0), uDistancePow);
+        vec3  col    = mix(uInteriorColor, uShadingColor, uDistanceStrength * dist);
+        float tAngle = fract((data.b + 3.14159265) / 6.28318530);
+        col = mix(col, texture(uLut, vec2(tAngle, 0.5)).rgb, uAngleStrength);
+        if (data.r >= 0.5 && uPeriodStrength > 0.0) {
+            float tPer = fract(data.r / uPeriodCycleLen);
+            col = mix(col, texture(uLut, vec2(tPer, 0.5)).rgb, uPeriodStrength);
+        }
         fragColor = vec4(col, 1.0);
         return;
     }
@@ -62,6 +67,9 @@ void main() {
         vec3 escapeColor = texture(uLut, vec2(t, 0.5)).rgb;
         float blend = uTrapStrength * smoothstep(uTrapRadius, 0.0, data.g);
         fragColor = vec4(mix(escapeColor, uTrapColor, blend), 1.0);
+    } else if (uColorMode == 2) {
+        float t = fract(data.b / uCycleLen);
+        fragColor = vec4(texture(uLut, vec2(t, 0.5)).rgb, 1.0);
     } else {
         fragColor = vec4(0.5, 0.5, 0.5, 1.0);
     }
@@ -93,6 +101,8 @@ export class GlPipeline {
   private readonly uDistanceStrength: WebGLUniformLocation;
   private readonly uDistancePow:      WebGLUniformLocation;
   private readonly uAngleStrength:    WebGLUniformLocation;
+  private readonly uPeriodStrength:   WebGLUniformLocation;
+  private readonly uPeriodCycleLen:   WebGLUniformLocation;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -151,11 +161,15 @@ export class GlPipeline {
     this.uDistanceStrength = gl.getUniformLocation(this.blitProgram, "uDistanceStrength")!;
     this.uDistancePow      = gl.getUniformLocation(this.blitProgram, "uDistancePow")!;
     this.uAngleStrength    = gl.getUniformLocation(this.blitProgram, "uAngleStrength")!;
+    this.uPeriodStrength   = gl.getUniformLocation(this.blitProgram, "uPeriodStrength")!;
+    this.uPeriodCycleLen   = gl.getUniformLocation(this.blitProgram, "uPeriodCycleLen")!;
     gl.uniform3f(this.uInteriorColor, 0.0, 0.0, 0.0); // default: black
     gl.uniform3f(this.uShadingColor,  1.0, 1.0, 1.0); // default: white
     gl.uniform1f(this.uDistanceStrength, 0.0);
     gl.uniform1f(this.uDistancePow,      1.0);
     gl.uniform1f(this.uAngleStrength,    0.0);
+    gl.uniform1f(this.uPeriodStrength,   0.0);
+    gl.uniform1f(this.uPeriodCycleLen,   8.0);
 
     // ── Tile program uniform ──────────────────────────────────────────────────
     gl.useProgram(this.tileProgram);
@@ -305,6 +319,24 @@ export class GlPipeline {
     const { gl } = this;
     gl.useProgram(this.blitProgram);
     gl.uniform1f(this.uAngleStrength, v);
+  }
+
+  setPeriodStrength(v: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1f(this.uPeriodStrength, v);
+  }
+
+  setPeriodCycleLen(v: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1f(this.uPeriodCycleLen, v);
+  }
+
+  setColorMode(v: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1i(this.uColorMode, v);
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────
