@@ -78,12 +78,7 @@ void main() {
             return;
         }
         float hue = (data.b / float(uNewtonDegree)) * 360.0;
-        // data.r = log_deriv: accumulated log|N'(z)|, negative deep in basin.
-        // Rational sigmoid maps (-inf, 0] → [1, 0]: deep basin = bright, boundary = dark.
-        float depth = max(0.0, -data.r);
-        float dist_t = depth / (depth + 15.0);
-        float lightness = mix(0.15, 0.90, dist_t);
-        fragColor = vec4(hsl_to_rgb(hue, 0.85, lightness), 1.0);
+        fragColor = vec4(hsl_to_rgb(hue, 0.85, 0.55), 1.0);
         return;
     }
 

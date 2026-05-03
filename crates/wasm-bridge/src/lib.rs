@@ -748,15 +748,19 @@ mod tests {
     }
 
     #[test]
-    fn newton_tile_converged_pixel_has_negative_log_deriv() {
+    fn newton_tile_converged_pixel_has_positive_iter_and_negative_log_p() {
         let (degree, coeffs, re, im) = z3_minus_1_params();
         let mut out = vec![kernel::TilePixel::default(); TILE_PIXELS];
         render_tile_newton_impl(
             degree, &coeffs, &re, &im,
             2.0, 0.0, 1e-6, 200, &mut out,
         );
-        // r channel = log_deriv: negative for a deep basin point.
-        assert!(out[0].smooth_t < 0.0, "log_deriv must be negative for a converged basin pixel, got {}", out[0].smooth_t);
+        // smooth_t (r) = convergence_iter: positive integer step count.
+        assert!(out[0].smooth_t > 0.0,
+            "convergence_iter must be positive, got {}", out[0].smooth_t);
+        // orbit_min_r (g) = log_p_norm = ln|p(z_N)|: negative since |p| < ε < 1.
+        assert!(out[0].orbit_min_r < 0.0,
+            "log_p_norm must be negative for a converged pixel, got {}", out[0].orbit_min_r);
     }
 
     #[test]
