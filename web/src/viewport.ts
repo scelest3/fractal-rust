@@ -93,8 +93,9 @@ export type FsmState = "IDLE" | "PANNING" | "ZOOMING";
  */
 const ZOOM_SPEED = 0.001;
 
-/** v1 precision cap: F64x2 renders cleanly to zoom_exp ≈ 17. */
-const MAX_ZOOM_EXP = 17;
+/** Default precision cap: F64x2 renders cleanly to zoom_exp ≈ 17. */
+const DEFAULT_MAX_ZOOM_EXP = 17;
+const DEFAULT_MIN_ZOOM_EXP = -7;
 
 /**
  * Milliseconds of inactivity after the last wheel event before `onZoomSettled`
@@ -127,6 +128,10 @@ export class ZoomPanFSM {
   private canvasHeight = 0;
   private pixelScale = 1; // CSS px → physical px multiplier for event coords
 
+  // Zoom range
+  private minZoomExp = DEFAULT_MIN_ZOOM_EXP;
+  private maxZoomExp = DEFAULT_MAX_ZOOM_EXP;
+
   // Pan tracking
   private panStartPx = 0;
   private panStartPy = 0;
@@ -158,13 +163,32 @@ export class ZoomPanFSM {
    * Cancels any active pan or zoom debounce and returns to IDLE.
    */
   setView(view: ViewState): void {
-    this.view = { ...view, zoom_exp: Math.min(MAX_ZOOM_EXP, view.zoom_exp) };
+    this.view = { ...view, zoom_exp: this.clampZoom(view.zoom_exp) };
     this.state = "IDLE";
     if (this.zoomDebounceId !== null) {
       clearTimeout(this.zoomDebounceId);
       this.zoomDebounceId = null;
     }
     this.notifyChange(this.view);
+  }
+
+  /**
+   * Constrain the zoom range. Call with fractal-specific limits — e.g. Newton
+   * uses (-7, 14) since only f64 is implemented; Mandelbrot uses (-7, 17).
+   */
+  setZoomExpRange(min: number, max: number): void {
+    this.minZoomExp = min;
+    this.maxZoomExp = max;
+    // Re-clamp the current view if it's now out of range.
+    const clamped = this.clampZoom(this.view.zoom_exp);
+    if (clamped !== this.view.zoom_exp) {
+      this.view = { ...this.view, zoom_exp: clamped };
+      this.notifyChange(this.view);
+    }
+  }
+
+  private clampZoom(exp: number): number {
+    return Math.max(this.minZoomExp, Math.min(this.maxZoomExp, exp));
   }
 
   /** Scale factor applied to CSS pointer-event coordinates (set to devicePixelRatio when HiDPI). */
@@ -262,7 +286,7 @@ export class ZoomPanFSM {
     );
 
     // Scroll down (deltaY > 0) = zoom out = zoom_exp decreases.
-    const zoom_exp = Math.min(MAX_ZOOM_EXP, this.view.zoom_exp - deltaY * ZOOM_SPEED);
+    const zoom_exp = this.clampZoom(this.view.zoom_exp - deltaY * ZOOM_SPEED);
 
     // Recompute center so that (fx, fy) remains at pixel (px, py).
     const newStep = pixelStep(zoom_exp, this.canvasHeight);

@@ -197,6 +197,8 @@ export class FractalSession {
     });
     this.fsm.setCanvasSize(canvas.width, canvas.height);
     this.fsm.setPixelScale(this.hiDpi ? Math.min(window.devicePixelRatio ?? 1, 2) : 1);
+    // Newton uses f64 only — clamp to the precision range.
+    if (this.fractalKind === "newton") this.fsm.setZoomExpRange(-7, 14);
     this.fsm.attach(canvas);
 
     new BoxZoom(canvas, () => this.fsm.getView(), (view) => {
@@ -208,7 +210,7 @@ export class FractalSession {
 
     // Orbit Worker — one dedicated worker for BigFloat reference orbit computation.
     this.orbitWorker = new Worker(
-      new URL("./orbit-worker.ts", import.meta.url),
+      new URL("./math-worker.ts", import.meta.url),
       { type: "module" },
     );
     this.orbitWorker.onerror = (e) => console.error("[FractalSession] orbit worker error", e);
