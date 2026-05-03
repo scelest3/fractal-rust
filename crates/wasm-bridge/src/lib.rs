@@ -344,7 +344,7 @@ pub fn render_tile_newton_impl(
                 delta_im + row as f64 * pixel_step,
             );
             let result = kernel::maps::iterate_newton(&map, z0, &roots, max_iter);
-            out[row * TILE_SIZE + col] = kernel::maps::newton_tile_pixel(result, max_iter);
+            out[row * TILE_SIZE + col] = kernel::maps::newton_tile_pixel(result);
         }
     }
 }
@@ -748,16 +748,15 @@ mod tests {
     }
 
     #[test]
-    fn newton_tile_converged_pixel_has_nonzero_convergence_t() {
+    fn newton_tile_converged_pixel_has_negative_log_deriv() {
         let (degree, coeffs, re, im) = z3_minus_1_params();
         let mut out = vec![kernel::TilePixel::default(); TILE_PIXELS];
         render_tile_newton_impl(
             degree, &coeffs, &re, &im,
             2.0, 0.0, 1e-6, 200, &mut out,
         );
-        // r channel = convergence_t > 0 (took more than 0 iterations).
-        assert!(out[0].smooth_t > 0.0, "convergence_t must be > 0");
-        assert!(out[0].smooth_t <= 1.0, "convergence_t must be <= 1");
+        // r channel = log_deriv: negative for a deep basin point.
+        assert!(out[0].smooth_t < 0.0, "log_deriv must be negative for a converged basin pixel, got {}", out[0].smooth_t);
     }
 
     #[test]

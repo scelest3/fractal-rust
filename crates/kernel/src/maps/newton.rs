@@ -9,8 +9,10 @@ pub struct NewtonMap {
     pub coeffs: [f64; 11],
     /// Live degree of the polynomial (1–10).
     pub degree: usize,
-    /// Precomputed derivative coefficients: `dcoeffs[k] = (k+1) * coeffs[k+1]`.
+    /// First derivative coefficients: `dcoeffs[k] = (k+1) * coeffs[k+1]`.
     dcoeffs: [f64; 10],
+    /// Second derivative coefficients: `dcoeffs2[k] = (k+2)*(k+1) * coeffs[k+2]`.
+    dcoeffs2: [f64; 9],
 }
 
 impl NewtonMap {
@@ -19,28 +21,53 @@ impl NewtonMap {
         for k in 0..degree {
             dcoeffs[k] = (k + 1) as f64 * coeffs[k + 1];
         }
-        Self { coeffs, degree, dcoeffs }
+        let mut dcoeffs2 = [0.0f64; 9];
+        if degree >= 2 {
+            for k in 0..degree - 1 {
+                dcoeffs2[k] = (k + 2) as f64 * (k + 1) as f64 * coeffs[k + 2];
+            }
+        }
+        Self { coeffs, degree, dcoeffs, dcoeffs2 }
     }
 
-    /// Evaluate `p(z)` and `p′(z)` simultaneously via Horner's method.
-    pub fn eval(&self, z: Complex<f64>) -> (Complex<f64>, Complex<f64>) {
+    /// Evaluate `p(z)`, `p′(z)`, and `p″(z)` simultaneously via Horner's method.
+    pub fn eval(&self, z: Complex<f64>) -> (Complex<f64>, Complex<f64>, Complex<f64>) {
         let mut p = Complex::new(self.coeffs[self.degree], 0.0);
         for k in (0..self.degree).rev() {
             p = p * z + Complex::new(self.coeffs[k], 0.0);
         }
+
         let dp_degree = self.degree - 1;
         let mut dp = Complex::new(self.dcoeffs[dp_degree], 0.0);
         for k in (0..dp_degree).rev() {
             dp = dp * z + Complex::new(self.dcoeffs[k], 0.0);
         }
-        (p, dp)
+
+        let ddp = if self.degree >= 2 {
+            let ddp_degree = self.degree - 2;
+            let mut ddp = Complex::new(self.dcoeffs2[ddp_degree], 0.0);
+            for k in (0..ddp_degree).rev() {
+                ddp = ddp * z + Complex::new(self.dcoeffs2[k], 0.0);
+            }
+            ddp
+        } else {
+            Complex::zero()
+        };
+
+        (p, dp, ddp)
     }
 }
 
 // ── NewtonResult ──────────────────────────────────────────────────────────────
 
 pub enum NewtonResult {
-    Converged { root_index: u32, convergence_iter: u32 },
+    /// Orbit converged to a root.
+    ///
+    /// `log_deriv` is the accumulated log|N′(z)| over the orbit — a negative
+    /// number whose magnitude encodes basin depth. Deep inside a basin the
+    /// Newton derivative |N′| → 0, making log_deriv very negative. Near the
+    /// basin boundary |N′| stays closer to 1, so log_deriv is near 0.
+    Converged { root_index: u32, log_deriv: f32 },
     /// Diverged (`|z| > 1e8`) or reached `max_iter` without converging.
     Unresolved,
 }
@@ -50,11 +77,12 @@ pub enum NewtonResult {
 const CONVERGENCE_EPS: f64 = 1e-6;
 const DIVERGENCE_RADIUS_SQ: f64 = 1e16; // |z| > 1e8
 
-/// Iterate the Newton map from `z0` until convergence or failure.
+/// Iterate the Newton map from `z0`, tracking the derivative for distance estimation.
 ///
-/// `roots` is the sorted root array from `find_roots`. The nearest root
-/// determines `root_index` in `Converged`. Pass `&[Complex::zero(); 10]`
-/// as a placeholder before Stage 4 wires real roots in.
+/// Accumulates `log|N′(z_k)|` at each step where `N′(z) = p(z)·p″(z) / p′(z)²`.
+/// This quantity is negative near roots (|N′| → 0) and near 0 near basin boundaries
+/// (|N′| ≈ 1). The result encodes geometric proximity to the basin boundary without
+/// dependence on `max_iter` or global position in the plane.
 pub fn iterate_newton(
     map: &NewtonMap,
     z0: Complex<f64>,
@@ -62,21 +90,37 @@ pub fn iterate_newton(
     max_iter: u32,
 ) -> NewtonResult {
     let mut z = z0;
-    for iter in 0..max_iter {
-        let (p, dp) = map.eval(z);
+    let mut log_w = 0.0f64;
 
-        if p.norm_sqr().sqrt() < CONVERGENCE_EPS {
+    for _ in 0..max_iter {
+        let (p, dp, ddp) = map.eval(z);
+
+        let p_norm      = p.norm_sqr().sqrt();
+        let dp_norm_sq  = dp.norm_sqr();
+        let ddp_norm    = ddp.norm_sqr().sqrt();
+
+        // Accumulate log|N′(z)| = log(|p|·|p″| / |p′|²).
+        // Guard against zero denominator (critical points) and zero ddp (low degree).
+        if dp_norm_sq > 1e-30 && ddp_norm > 0.0 {
+            let n_prime = p_norm * ddp_norm / dp_norm_sq;
+            if n_prime > 0.0 {
+                log_w += n_prime.ln();
+            }
+        }
+
+        if p_norm < CONVERGENCE_EPS {
             let root_index = nearest_root_index(z, roots, map.degree);
-            return NewtonResult::Converged { root_index, convergence_iter: iter };
+            return NewtonResult::Converged { root_index, log_deriv: log_w as f32 };
         }
 
         if z.norm_sqr() > DIVERGENCE_RADIUS_SQ {
             return NewtonResult::Unresolved;
         }
 
-        if dp.norm_sqr() < 1e-30 {
+        if dp_norm_sq < 1e-30 {
             return NewtonResult::Unresolved;
         }
+
         z = z - p / dp;
     }
     NewtonResult::Unresolved
@@ -93,15 +137,10 @@ const DK_EPS: f64 = 1e-12;
 /// Unused slots (indices `degree..10`) are zeroed.
 pub fn find_roots(map: &NewtonMap) -> [Complex<f64>; 10] {
     let n = map.degree;
-    // Monic scaling: divide by leading coefficient so the polynomial is monic.
     let lead = map.coeffs[n];
 
-    // Initial estimates: successive powers of an off-axis seed scaled to a
-    // radius derived from the coefficient ratio heuristic. Using a non-symmetric
-    // seed (0.4 + 0.9i) rather than equally-spaced angles avoids collapse for
-    // symmetric polynomials like z³−1 whose roots lie at the seed positions.
     let radius = (map.coeffs[0] / lead).abs().powf(1.0 / n as f64).max(0.5);
-    let seed = Complex::new(0.4, 0.9); // |seed| ≈ 0.985, off-axis
+    let seed = Complex::new(0.4, 0.9);
     let mut roots = [Complex::<f64>::zero(); 10];
     let mut seed_power = Complex::new(radius, 0.0);
     for k in 0..n {
@@ -109,12 +148,10 @@ pub fn find_roots(map: &NewtonMap) -> [Complex<f64>; 10] {
         seed_power = seed_power * seed;
     }
 
-    // Durand-Kerner iteration.
     for _ in 0..DK_MAX_ITER {
         let mut max_step = 0.0f64;
         for i in 0..n {
-            let (p, _) = map.eval(roots[i]);
-            // Denominator: ∏_{j≠i} (roots[i] − roots[j])
+            let (p, _, _) = map.eval(roots[i]);
             let mut denom = Complex::new(1.0, 0.0);
             for j in 0..n {
                 if j != i {
@@ -130,7 +167,6 @@ pub fn find_roots(map: &NewtonMap) -> [Complex<f64>; 10] {
         if max_step < DK_EPS { break; }
     }
 
-    // Sort by arg(root) ascending for canonical hue-stable ordering.
     roots[..n].sort_by(|a, b| {
         let arg_a = a.im.atan2(a.re);
         let arg_b = b.im.atan2(b.re);
@@ -145,14 +181,14 @@ pub fn find_roots(map: &NewtonMap) -> [Complex<f64>; 10] {
 /// Pack a `NewtonResult` into the standard 4-channel `TilePixel`.
 ///
 /// Channel layout (matches the fragment shader's Newton branch in §6.2):
-///   r = convergence_t (convergence_iter / max_iter)
+///   r = log_deriv (accumulated log|N′|; negative = deep in basin)
 ///   g = 0.0
 ///   b = root_index as f32
 ///   a = 1.0 (Converged) | 0.0 (Unresolved)
-pub fn newton_tile_pixel(result: NewtonResult, max_iter: u32) -> TilePixel {
+pub fn newton_tile_pixel(result: NewtonResult) -> TilePixel {
     match result {
-        NewtonResult::Converged { root_index, convergence_iter } => TilePixel {
-            smooth_t:    convergence_iter as f32 / max_iter as f32,
+        NewtonResult::Converged { root_index, log_deriv } => TilePixel {
+            smooth_t:    log_deriv,
             orbit_min_r: 0.0,
             angle:       root_index as f32,
             escaped:     1.0,
@@ -184,10 +220,6 @@ mod tests {
     use super::*;
     use arith::Complex;
 
-    // ── Stage 1: NewtonMap + Horner eval ─────────────────────────────────────
-
-    // ── Stage 2: iterate_newton ───────────────────────────────────────────────
-
     fn z3_minus_1() -> NewtonMap {
         let mut coeffs = [0.0f64; 11];
         coeffs[0] = -1.0;
@@ -195,195 +227,203 @@ mod tests {
         NewtonMap::new(coeffs, 3)
     }
 
-    // ── Stage 4: find_roots ───────────────────────────────────────────────────
-
-    fn close_enough(a: Complex<f64>, b: Complex<f64>, tol: f64) -> bool {
-        (a - b).norm_sqr().sqrt() < tol
-    }
-
-    fn find_root_in_set(
-        target: Complex<f64>,
-        roots: &[Complex<f64>; 10],
-        count: usize,
-        tol: f64,
-    ) -> bool {
-        roots[..count].iter().any(|&r| close_enough(r, target, tol))
-    }
+    // ── eval ──────────────────────────────────────────────────────────────────
 
     #[test]
-    fn find_roots_z4_minus_1_finds_four_roots() {
-        // z⁴ − 1 roots: 1, i, −1, −i
-        let mut coeffs = [0.0f64; 11];
-        coeffs[0] = -1.0;
-        coeffs[4] = 1.0;
-        let map = NewtonMap::new(coeffs, 4);
-        let roots = find_roots(&map);
-        assert!(find_root_in_set(Complex::new( 1.0,  0.0), &roots, 4, 1e-10), "root  1 not found");
-        assert!(find_root_in_set(Complex::new( 0.0,  1.0), &roots, 4, 1e-10), "root  i not found");
-        assert!(find_root_in_set(Complex::new(-1.0,  0.0), &roots, 4, 1e-10), "root −1 not found");
-        assert!(find_root_in_set(Complex::new( 0.0, -1.0), &roots, 4, 1e-10), "root −i not found");
-    }
-
-    #[test]
-    fn find_roots_degree1_z_minus_3() {
-        // p(z) = z − 3: single root at 3.
+    fn eval_degree1_z_minus_3_at_origin() {
         let mut coeffs = [0.0f64; 11];
         coeffs[0] = -3.0;
         coeffs[1] = 1.0;
         let map = NewtonMap::new(coeffs, 1);
+        let (p, dp, ddp) = map.eval(Complex::new(0.0, 0.0));
+        assert!((p.re - (-3.0)).abs() < 1e-15);
+        assert!((dp.re - 1.0).abs() < 1e-15);
+        assert_eq!(ddp.re, 0.0, "p''=0 for degree-1");
+    }
+
+    #[test]
+    fn eval_z_cubed_minus_1_at_1() {
+        // p(1)=0, p'(1)=3, p''(1)=6
+        let map = z3_minus_1();
+        let (p, dp, ddp) = map.eval(Complex::new(1.0, 0.0));
+        assert!(p.re.abs() < 1e-14);
+        assert!((dp.re - 3.0).abs() < 1e-14);
+        assert!((ddp.re - 6.0).abs() < 1e-14, "p''(1) = {}", ddp.re);
+    }
+
+    #[test]
+    fn eval_z_cubed_minus_1_at_origin() {
+        // p''(z) = 6z → p''(0) = 0
+        let map = z3_minus_1();
+        let (_, _, ddp) = map.eval(Complex::new(0.0, 0.0));
+        assert!(ddp.re.abs() < 1e-15, "p''(0) must be 0");
+    }
+
+    #[test]
+    fn eval_sparse_z5_minus_1_at_1() {
+        // p(1)=0, p'(1)=5, p''(1)=20
+        let mut coeffs = [0.0f64; 11];
+        coeffs[0] = -1.0;
+        coeffs[5] = 1.0;
+        let map = NewtonMap::new(coeffs, 5);
+        let (p, dp, ddp) = map.eval(Complex::new(1.0, 0.0));
+        assert!(p.re.abs() < 1e-14);
+        assert!((dp.re - 5.0).abs() < 1e-14);
+        assert!((ddp.re - 20.0).abs() < 1e-13, "p''(1) for z⁵−1 = {}", ddp.re);
+    }
+
+    #[test]
+    fn eval_degree10_at_z_equals_1() {
+        // p(1)=11, p'(1)=55, p''(1)=330
+        let coeffs = [1.0f64; 11];
+        let map = NewtonMap::new(coeffs, 10);
+        let (p, dp, ddp) = map.eval(Complex::new(1.0, 0.0));
+        assert!((p.re - 11.0).abs() < 1e-13);
+        assert!((dp.re - 55.0).abs() < 1e-13);
+        assert!((ddp.re - 330.0).abs() < 1e-11, "p''(1) = {}", ddp.re);
+    }
+
+    // ── log_deriv distance estimate ───────────────────────────────────────────
+
+    #[test]
+    fn log_deriv_negative_for_deep_basin_point() {
+        let map = z3_minus_1();
         let roots = find_roots(&map);
-        assert!(close_enough(roots[0], Complex::new(3.0, 0.0), 1e-10),
-            "root = {:?}", roots[0]);
+        let result = iterate_newton(&map, Complex::new(2.0, 0.0), &roots, 100);
+        match result {
+            NewtonResult::Converged { log_deriv, .. } => {
+                assert!(log_deriv < 0.0,
+                    "log_deriv must be negative for a deep basin point, got {log_deriv}");
+            }
+            NewtonResult::Unresolved => panic!("z₀=2 must converge"),
+        }
+    }
+
+    #[test]
+    fn deeper_basin_has_more_negative_log_deriv() {
+        // z=1.2 is physically closer to root=1 (deeper in the real basin) than z=2.
+        // Both converge; z=1.2 should have a more negative log_deriv.
+        let map = z3_minus_1();
+        let roots = find_roots(&map);
+        let r_near = iterate_newton(&map, Complex::new(1.2, 0.0), &roots, 100);
+        let r_far  = iterate_newton(&map, Complex::new(2.0, 0.0), &roots, 100);
+        let (ld_near, ld_far) = match (r_near, r_far) {
+            (NewtonResult::Converged { log_deriv: a, .. },
+             NewtonResult::Converged { log_deriv: b, .. }) => (a, b),
+            _ => panic!("both points must converge"),
+        };
+        assert!(ld_near < ld_far,
+            "z=1.2 (closer to root) should have more negative log_deriv: {ld_near} vs {ld_far}");
+    }
+
+    // ── newton_tile_pixel ─────────────────────────────────────────────────────
+
+    #[test]
+    fn tile_pixel_converged_packs_log_deriv_into_r_channel() {
+        let result = NewtonResult::Converged { root_index: 2, log_deriv: -7.5 };
+        let px = newton_tile_pixel(result);
+        assert!((px.smooth_t - (-7.5_f32)).abs() < 1e-6, "r = log_deriv, got {}", px.smooth_t);
+        assert_eq!(px.orbit_min_r, 0.0);
+        assert!((px.angle - 2.0_f32).abs() < 1e-6);
+        assert_eq!(px.escaped, 1.0);
+    }
+
+    #[test]
+    fn tile_pixel_unresolved_channels() {
+        let px = newton_tile_pixel(NewtonResult::Unresolved);
+        assert_eq!(px.smooth_t,    0.0);
+        assert_eq!(px.orbit_min_r, 0.0);
+        assert_eq!(px.angle,       0.0);
+        assert_eq!(px.escaped,     0.0);
+    }
+
+    // ── iterate_newton ────────────────────────────────────────────────────────
+
+    #[test]
+    fn iterate_converges_from_deep_basin_point() {
+        let map = z3_minus_1();
+        let roots = [Complex::<f64>::zero(); 10];
+        let result = iterate_newton(&map, Complex::new(2.0, 0.0), &roots, 100);
+        assert!(matches!(result, NewtonResult::Converged { .. }));
+    }
+
+    #[test]
+    fn iterate_unresolved_for_divergent_start() {
+        let map = z3_minus_1();
+        let roots = [Complex::<f64>::zero(); 10];
+        let result = iterate_newton(&map, Complex::new(1e9, 0.0), &roots, 100);
+        assert!(matches!(result, NewtonResult::Unresolved));
+    }
+
+    #[test]
+    fn iterate_unresolved_when_max_iter_exceeded() {
+        let map = z3_minus_1();
+        let roots = [Complex::<f64>::zero(); 10];
+        let result = iterate_newton(&map, Complex::new(0.0, 0.0), &roots, 100);
+        assert!(matches!(result, NewtonResult::Unresolved));
     }
 
     #[test]
     fn iterate_assigns_correct_root_index_with_real_roots() {
-        // z³ − 1: root 0 (most negative arg) = −½ − i√3/2, root 1 = 1, root 2 = −½ + i√3/2.
-        // z₀ = 2: real positive basin → converges to root at 1, which is index 1.
         let map = z3_minus_1();
         let roots = find_roots(&map);
         let result = iterate_newton(&map, Complex::new(2.0, 0.0), &roots, 100);
         match result {
             NewtonResult::Converged { root_index, .. } => {
-                // root at 1+0i has arg=0 — middle of the three args, so index 1.
-                assert_eq!(root_index, 1, "z₀=2 should converge to root index 1 (root=1+0i)");
+                assert_eq!(root_index, 1, "z₀=2 → root index 1 (root=1+0i, arg=0)");
             }
-            NewtonResult::Unresolved => panic!("expected Converged, got Unresolved"),
+            NewtonResult::Unresolved => panic!("expected Converged"),
         }
     }
 
-    #[test]
-    fn find_roots_sorted_by_arg_ascending() {
-        // z³ − 1: args are −2π/3, 0, +2π/3 → sorted order: arg(−½−i√3/2) < arg(1) < arg(−½+i√3/2)
-        let map = z3_minus_1();
-        let roots = find_roots(&map);
-        let args: Vec<f64> = roots[..3].iter()
-            .map(|r| r.im.atan2(r.re))
-            .collect();
-        assert!(args[0] <= args[1] && args[1] <= args[2],
-            "roots not sorted by arg: {:?}", args);
+    // ── find_roots ────────────────────────────────────────────────────────────
+
+    fn close_enough(a: Complex<f64>, b: Complex<f64>, tol: f64) -> bool {
+        (a - b).norm_sqr().sqrt() < tol
+    }
+
+    fn find_root_in_set(target: Complex<f64>, roots: &[Complex<f64>; 10], count: usize, tol: f64) -> bool {
+        roots[..count].iter().any(|&r| close_enough(r, target, tol))
     }
 
     #[test]
     fn find_roots_z3_minus_1_finds_three_roots() {
-        // z³ − 1 has roots: 1, −½ + i√3/2, −½ − i√3/2
         let map = z3_minus_1();
         let roots = find_roots(&map);
         let sqrt3_2 = 3.0_f64.sqrt() / 2.0;
-        assert!(find_root_in_set(Complex::new(1.0, 0.0), &roots, 3, 1e-10),
-            "root 1 not found");
-        assert!(find_root_in_set(Complex::new(-0.5, sqrt3_2), &roots, 3, 1e-10),
-            "root −½+i√3/2 not found");
-        assert!(find_root_in_set(Complex::new(-0.5, -sqrt3_2), &roots, 3, 1e-10),
-            "root −½−i√3/2 not found");
-    }
-
-    // ── Stage 3: newton_tile_pixel ────────────────────────────────────────────
-
-    #[test]
-    fn tile_pixel_converged_channels() {
-        // root_index=2, convergence_iter=10, max_iter=100
-        // r = 10/100 = 0.1,  g = 0.0,  b = 2.0,  a = 1.0
-        let result = NewtonResult::Converged { root_index: 2, convergence_iter: 10 };
-        let px = newton_tile_pixel(result, 100);
-        assert!((px.smooth_t - 0.1_f32).abs() < 1e-6, "r = {}", px.smooth_t);
-        assert_eq!(px.orbit_min_r, 0.0, "g must be 0");
-        assert!((px.angle - 2.0_f32).abs() < 1e-6, "b = {}", px.angle);
-        assert_eq!(px.escaped, 1.0, "a must be 1 for Converged");
+        assert!(find_root_in_set(Complex::new(1.0, 0.0), &roots, 3, 1e-10));
+        assert!(find_root_in_set(Complex::new(-0.5, sqrt3_2), &roots, 3, 1e-10));
+        assert!(find_root_in_set(Complex::new(-0.5, -sqrt3_2), &roots, 3, 1e-10));
     }
 
     #[test]
-    fn tile_pixel_unresolved_channels() {
-        let px = newton_tile_pixel(NewtonResult::Unresolved, 100);
-        assert_eq!(px.smooth_t,    0.0, "r must be 0 for Unresolved");
-        assert_eq!(px.orbit_min_r, 0.0, "g must be 0");
-        assert_eq!(px.angle,       0.0, "b must be 0");
-        assert_eq!(px.escaped,     0.0, "a must be 0 for Unresolved");
-    }
-
-    #[test]
-    fn iterate_unresolved_for_divergent_start() {
-        // z₀ = 1e9 is well past the bailout radius.
-        let map = z3_minus_1();
-        let roots = [Complex::<f64>::zero(); 10];
-        let result = iterate_newton(&map, Complex::new(1e9, 0.0), &roots, 100);
-        assert!(matches!(result, NewtonResult::Unresolved),
-            "z₀ beyond bailout should be Unresolved");
-    }
-
-    #[test]
-    fn iterate_unresolved_when_max_iter_exceeded() {
-        // p′(z) = 0 at z = 0 for z³−1, so the step is undefined and iteration stalls.
-        // With max_iter=1 and z₀=0, we immediately hit the dp≈0 guard → Unresolved.
-        let map = z3_minus_1();
-        let roots = [Complex::<f64>::zero(); 10];
-        let result = iterate_newton(&map, Complex::new(0.0, 0.0), &roots, 100);
-        assert!(matches!(result, NewtonResult::Unresolved),
-            "z₀ at critical point (p′=0) should be Unresolved");
-    }
-
-    #[test]
-    fn iterate_converges_from_deep_basin_point() {
-        // z₀ = 2 is clearly in the real-positive basin of z³−1 (root = 1).
-        // Expects Converged within 100 iterations.
-        let map = z3_minus_1();
-        let roots = [Complex::<f64>::zero(); 10]; // placeholder — root_index will be 0
-        let result = iterate_newton(&map, Complex::new(2.0, 0.0), &roots, 100);
-        assert!(matches!(result, NewtonResult::Converged { .. }),
-            "z₀=2 should converge for z³−1");
-    }
-
-    #[test]
-    fn eval_degree10_at_z_equals_1() {
-        // All coefficients = 1.0: p(z) = 1 + z + z² + … + z¹⁰
-        // p(1) = 11,  p′(1) = 0+1+2+…+10 = 55
-        let coeffs = [1.0f64; 11];
-        let map = NewtonMap::new(coeffs, 10);
-        let (p, dp) = map.eval(Complex::new(1.0, 0.0));
-        assert!((p.re - 11.0).abs() < 1e-13, "p(1) = {}", p.re);
-        assert!((dp.re - 55.0).abs() < 1e-13, "p'(1) = {}", dp.re);
-    }
-
-    #[test]
-    fn eval_sparse_z5_minus_1_at_1() {
-        // p(z) = z⁵ − 1, three zero middle coefficients
-        // p(1) = 0,  p′(1) = 5
+    fn find_roots_z4_minus_1_finds_four_roots() {
         let mut coeffs = [0.0f64; 11];
         coeffs[0] = -1.0;
-        coeffs[5] = 1.0;
-        let map = NewtonMap::new(coeffs, 5);
-        let (p, dp) = map.eval(Complex::new(1.0, 0.0));
-        assert!(p.re.abs() < 1e-14, "p(1) = {}", p.re);
-        assert!((dp.re - 5.0).abs() < 1e-14, "p'(1) = {}", dp.re);
+        coeffs[4] = 1.0;
+        let map = NewtonMap::new(coeffs, 4);
+        let roots = find_roots(&map);
+        assert!(find_root_in_set(Complex::new( 1.0,  0.0), &roots, 4, 1e-10));
+        assert!(find_root_in_set(Complex::new( 0.0,  1.0), &roots, 4, 1e-10));
+        assert!(find_root_in_set(Complex::new(-1.0,  0.0), &roots, 4, 1e-10));
+        assert!(find_root_in_set(Complex::new( 0.0, -1.0), &roots, 4, 1e-10));
     }
 
     #[test]
-    fn eval_z_cubed_minus_1_at_1() {
-        // p(z) = z³ − 1  →  coeffs = [−1, 0, 0, 1, 0, …]
-        // p(1) = 0,  p′(1) = 3
-        let mut coeffs = [0.0f64; 11];
-        coeffs[0] = -1.0;
-        coeffs[3] = 1.0;
-        let map = NewtonMap::new(coeffs, 3);
-        let (p, dp) = map.eval(Complex::new(1.0, 0.0));
-        assert!(p.re.abs() < 1e-14, "p(1) = {}", p.re);
-        assert!(p.im.abs() < 1e-14);
-        assert!((dp.re - 3.0).abs() < 1e-14, "p'(1) = {}", dp.re);
-        assert!(dp.im.abs() < 1e-14);
-    }
-
-    #[test]
-    fn eval_degree1_z_minus_3_at_origin() {
-        // p(z) = z − 3  →  coeffs = [−3, 1, 0, …]
-        // p(0) = −3,  p′(0) = 1
+    fn find_roots_degree1_z_minus_3() {
         let mut coeffs = [0.0f64; 11];
         coeffs[0] = -3.0;
         coeffs[1] = 1.0;
         let map = NewtonMap::new(coeffs, 1);
-        let (p, dp) = map.eval(Complex::new(0.0, 0.0));
-        assert!((p.re - (-3.0)).abs() < 1e-15, "p(0) = {}", p.re);
-        assert!(p.im.abs() < 1e-15);
-        assert!((dp.re - 1.0).abs() < 1e-15, "p'(0) = {}", dp.re);
-        assert!(dp.im.abs() < 1e-15);
+        let roots = find_roots(&map);
+        assert!(close_enough(roots[0], Complex::new(3.0, 0.0), 1e-10));
+    }
+
+    #[test]
+    fn find_roots_sorted_by_arg_ascending() {
+        let map = z3_minus_1();
+        let roots = find_roots(&map);
+        let args: Vec<f64> = roots[..3].iter().map(|r| r.im.atan2(r.re)).collect();
+        assert!(args[0] <= args[1] && args[1] <= args[2], "args: {:?}", args);
     }
 }
