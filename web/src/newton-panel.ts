@@ -25,6 +25,10 @@ export class NewtonPanel {
 
   getElement(): HTMLElement { return this.el; }
 
+  setVisible(visible: boolean): void {
+    this.el.style.display = visible ? "" : "none";
+  }
+
   /** Update inputs to reflect the given params (e.g. after compute_roots completes). */
   setParams(params: NewtonParams): void {
     this.currentDegree = params.degree;

@@ -25,6 +25,11 @@ import {
 import { NewtonPanel } from "./newton-panel.ts";
 
 const BASE_ITER = 256;
+
+const ZOOM_RANGES: Record<"mandelbrot" | "newton", [number, number]> = {
+  mandelbrot: [-7, 17],
+  newton:     [-7, 14],
+};
 const ITER_PER_DECADE = 64;
 const TILE_SIZE = 256;
 const TILE_SLOT_BYTES = TILE_SIZE * TILE_SIZE * 4 * 4; // 1 MiB per slot
@@ -130,13 +135,34 @@ export class FractalSession {
   private orbitReady = false;
   private pendingOrbitDispatch = false; // waiting for orbit_ready before dispatching
 
-  // Newton state
-  private fractalKind: "mandelbrot" | "newton" = "newton";
+  // Fractal kind + Newton state
+  private fractalKind: "mandelbrot" | "newton" = "mandelbrot";
   private newtonParams: NewtonParams = defaultNewtonParams();
   private readonly newtonPanel: NewtonPanel;
+  private modeSelectEl!: HTMLSelectElement;
 
   constructor(canvas: HTMLCanvasElement) {
     this.overlay = makeOverlay();
+
+    // Fractal mode selector — sits above the stats readout.
+    const modeRow = document.createElement("div");
+    modeRow.style.cssText = "pointer-events:auto;margin-bottom:4px;";
+    const modeSelect = document.createElement("select");
+    modeSelect.style.cssText = "background:#222;color:#eee;border:1px solid #555;border-radius:3px;padding:2px 6px;font-family:monospace;font-size:12px;cursor:pointer;";
+    (["mandelbrot", "newton"] as const).forEach(kind => {
+      const opt = document.createElement("option");
+      opt.value = kind;
+      opt.textContent = kind === "mandelbrot" ? "Mandelbrot" : "Newton";
+      modeSelect.appendChild(opt);
+    });
+    modeSelect.value = this.fractalKind;
+    modeSelect.addEventListener("change", () =>
+      this.switchFractalKind(modeSelect.value as "mandelbrot" | "newton"),
+    );
+    modeRow.appendChild(modeSelect);
+    this.overlay.appendChild(modeRow);
+    this.modeSelectEl = modeSelect;
+
     this.statsEl = document.createElement("div");
     this.overlay.appendChild(this.statsEl);
     this.tileSab = new SharedArrayBuffer(RING_SLOTS * TILE_SLOT_BYTES);
@@ -177,12 +203,15 @@ export class FractalSession {
     });
     document.body.appendChild(this.newtonPanel.getElement());
 
-    // Restore Newton state from URL hash if present.
+    // Restore fractal kind + Newton state from URL hash if present.
     const hashParams = deserializeNewtonState(window.location.hash.slice(1));
     if (hashParams) {
+      this.fractalKind = "newton";
       this.newtonParams = hashParams;
+      this.modeSelectEl.value = "newton";
     }
     this.newtonPanel.setParams(this.newtonParams);
+    this.newtonPanel.setVisible(this.fractalKind === "newton");
 
     this.hiDpi = (window.devicePixelRatio ?? 1) > 1;
     this.overlay.appendChild(this.buildDprToggle(canvas));
@@ -197,8 +226,7 @@ export class FractalSession {
     });
     this.fsm.setCanvasSize(canvas.width, canvas.height);
     this.fsm.setPixelScale(this.hiDpi ? Math.min(window.devicePixelRatio ?? 1, 2) : 1);
-    // Newton uses f64 only — clamp to the precision range.
-    if (this.fractalKind === "newton") this.fsm.setZoomExpRange(-7, 14);
+    this.fsm.setZoomExpRange(...ZOOM_RANGES[this.fractalKind]);
     this.fsm.attach(canvas);
 
     new BoxZoom(canvas, () => this.fsm.getView(), (view) => {
@@ -239,6 +267,34 @@ export class FractalSession {
       });
       return w;
     });
+  }
+
+  private switchFractalKind(kind: "mandelbrot" | "newton"): void {
+    if (kind === this.fractalKind) return;
+    this.fractalKind = kind;
+
+    // Apply the precision-appropriate zoom range and reset zoom to 0.
+    this.fsm.setZoomExpRange(...ZOOM_RANGES[kind]);
+    const view = this.fsm.getView();
+    this.fsm.setView({ ...view, zoom_exp: 0 });
+
+    this.newtonPanel.setVisible(kind === "newton");
+    this.modeSelectEl.value = kind;
+
+    if (kind === "newton") {
+      // Compute roots for the current Newton polynomial if needed.
+      if (this.newtonParams.rootsRe.every(r => r === 0) && this.orbitWorkerReady) {
+        this.orbitWorker.postMessage({
+          type: "compute_roots",
+          coeffs: Array.from(this.newtonParams.coeffs.subarray(0, this.newtonParams.degree + 1)),
+        });
+      }
+      this.writeUrlHash();
+    } else {
+      window.history.replaceState(null, "", window.location.pathname);
+    }
+
+    this.scheduleDispatch();
   }
 
   /** Called when the user commits a polynomial change (blur/Enter in the panel). */
