@@ -96,6 +96,7 @@ type OrbitWorkerInMsg =
 
 function makeOverlay(): HTMLElement {
   const el = document.createElement("div");
+  el.id = "stats-overlay";
   Object.assign(el.style, {
     position: "fixed", top: "8px", left: "8px",
     color: "white", fontFamily: "monospace", fontSize: "12px",

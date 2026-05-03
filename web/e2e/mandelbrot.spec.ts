@@ -11,7 +11,11 @@ test.describe("Mandelbrot default view", () => {
 
   test("renders a recognizable Mandelbrot set", async ({ page }) => {
     const canvas = page.locator("#canvas");
-    await expect(canvas).toHaveScreenshot("mandelbrot-default.png");
+    // Mask the stats overlay — it contains a live gen counter that changes
+    // between render passes and would cause spurious golden failures.
+    await expect(canvas).toHaveScreenshot("mandelbrot-default.png", {
+      mask: [page.locator("#stats-overlay")],
+    });
   });
 
   test("canvas[data-rendered] is set after all tiles complete", async ({ page }) => {
