@@ -37,7 +37,7 @@ pub enum EscapeResult {
         orbit_min_z: Complex<f64>,
         /// `log(|dz/dc| / (2|z|·ln|z|))` at escape — exterior distance estimate.
         /// Larger (less negative) means closer to the set boundary.
-        /// Stored in TilePixel channel `b`; used for distance-estimate coloring.
+        /// Stored in `PixelData[2]`; used for distance-estimate coloring.
         log_dist: f64,
     },
     /// Orbit did not escape within `max_iter` steps (interior or convergent).
@@ -47,46 +47,42 @@ pub enum EscapeResult {
         /// z at which `orbit_min_r` was attained.
         orbit_min_z: Complex<f64>,
         /// Detected period: 1 = fixed point, 2 = 2-cycle, 0 = reached max_iter.
-        /// Stored in TilePixel channel `r`; used for period coloring.
+        /// Stored in `PixelData[0]`; used for period coloring.
         period: u32,
     },
-    /// Pixel requires glitch correction; must not be converted to `TilePixel`
+    /// Pixel requires glitch correction; must not be converted to `PixelData`
     /// directly. Only produced by the perturbation path (Phase 2).
     Glitched,
 }
 
 /// Raw per-pixel data written into the tile ring slot.
-/// Four f32 channels map to the RGBA32F WebGL tile texture:
-///   r = smooth_t (escaped) | period (interior, 0 = unknown)
-///   g = orbit_min_r
-///   b = log_dist (escaped) | arg(orbit_min_z) (interior)
-///   a = escaped (1.0 / 0.0)
+///
+/// Four f32 channels packed as `[ch0, ch1, ch2, ch3]` — layout is fractal-specific.
+/// Uploaded to the WebGL RGBA32F tile texture; shader reads `.r/.g/.b/.a`.
+///
+/// Mandelbrot: `[smooth_t, orbit_min_r, log_dist/arg(orbit_min_z), escaped]`
+/// Newton:     `[convergence_iter, log_p_norm, root_index, converged]`
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
-pub struct TilePixel {
-    pub smooth_t: f32,
-    pub orbit_min_r: f32,
-    pub angle: f32,
-    pub escaped: f32,
-}
+pub struct PixelData(pub [f32; 4]);
 
-impl From<EscapeResult> for TilePixel {
+impl From<EscapeResult> for PixelData {
     fn from(r: EscapeResult) -> Self {
         match r {
-            EscapeResult::Escaped { smooth_t, orbit_min_r, log_dist, .. } => Self {
-                smooth_t:    smooth_t as f32,
-                orbit_min_r: orbit_min_r as f32,
-                angle:       log_dist as f32,
-                escaped:     1.0,
-            },
-            EscapeResult::Interior { orbit_min_r, orbit_min_z, period } => Self {
-                smooth_t:    period as f32,
-                orbit_min_r: orbit_min_r as f32,
-                angle:       (orbit_min_z.im.atan2(orbit_min_z.re)) as f32,
-                escaped:     0.0,
-            },
+            EscapeResult::Escaped { smooth_t, orbit_min_r, log_dist, .. } => Self([
+                smooth_t as f32,
+                orbit_min_r as f32,
+                log_dist as f32,
+                1.0,
+            ]),
+            EscapeResult::Interior { orbit_min_r, orbit_min_z, period } => Self([
+                period as f32,
+                orbit_min_r as f32,
+                orbit_min_z.im.atan2(orbit_min_z.re) as f32,
+                0.0,
+            ]),
             EscapeResult::Glitched => {
-                panic!("Glitched pixel must not be converted to TilePixel — apply glitch correction first")
+                panic!("Glitched pixel must not be converted to PixelData — apply glitch correction first")
             }
         }
     }
@@ -217,7 +213,7 @@ pub fn compute_ref_orbit<T: Precision, M: PerturbationSupport>(
 /// # Smooth-t alignment with `escape_time`
 /// `n − ln(ln(|z_n|)) / ln(2)` (pre-step index n) equals
 /// `(iter + 1) − ln(ln(|z_{iter+1}|)) / ln(2)` (escape_time's iter = n − 1)
-/// for the same escaped z, so `TilePixel` output matches escape_time bit-for-bit
+/// for the same escaped z, so `PixelData` output matches escape_time bit-for-bit
 /// when the zero-reference trick is used in tests.
 pub fn perturb_pixel<M: PerturbationSupport>(
     map: &M,
@@ -530,11 +526,11 @@ pub fn render_tile_escape<M: IterationMap>(
     map: &M,
     coords: &[Complex<f64>],
     max_iter: u32,
-    out: &mut [TilePixel],
+    out: &mut [PixelData],
 ) {
     debug_assert_eq!(coords.len(), out.len());
     for (c, slot) in coords.iter().zip(out.iter_mut()) {
-        *slot = TilePixel::from(escape_time(map, *c, max_iter));
+        *slot = PixelData::from(escape_time(map, *c, max_iter));
     }
 }
 
@@ -558,11 +554,11 @@ mod tests {
             orbit_min_z: Complex::new(0.1_f64, 0.2),
             log_dist: 0.7,
         };
-        let p = TilePixel::from(r);
-        assert_eq!(p.escaped, 1.0);
-        assert!((p.smooth_t - 1.5_f32).abs() < 1e-6);
-        assert!((p.orbit_min_r - 0.3_f32).abs() < 1e-6);
-        assert!((p.angle - 0.7_f32).abs() < 1e-6);
+        let p = PixelData::from(r);
+        assert_eq!(p.0[3], 1.0);
+        assert!((p.0[0] - 1.5_f32).abs() < 1e-6);
+        assert!((p.0[1] - 0.3_f32).abs() < 1e-6);
+        assert!((p.0[2] - 0.7_f32).abs() < 1e-6);
     }
 
     #[test]
@@ -572,10 +568,10 @@ mod tests {
             orbit_min_z: Complex::new(0.0_f64, 0.0),
             period: 0,
         };
-        let p = TilePixel::from(r);
-        assert_eq!(p.escaped, 0.0);
-        assert_eq!(p.smooth_t, 0.0); // period 0 → 0.0
-        assert!((p.orbit_min_r - 0.4_f32).abs() < 1e-6);
+        let p = PixelData::from(r);
+        assert_eq!(p.0[3], 0.0);
+        assert_eq!(p.0[0], 0.0); // period 0 → 0.0
+        assert!((p.0[1] - 0.4_f32).abs() < 1e-6);
     }
 
     #[test]
@@ -585,15 +581,15 @@ mod tests {
             orbit_min_z: Complex::new(0.0_f64, 0.0),
             period: 2,
         };
-        let p = TilePixel::from(r);
-        assert_eq!(p.smooth_t, 2.0_f32);
-        assert_eq!(p.escaped,  0.0_f32);
+        let p = PixelData::from(r);
+        assert_eq!(p.0[0], 2.0_f32);
+        assert_eq!(p.0[3], 0.0_f32);
     }
 
     #[test]
     #[should_panic(expected = "Glitched pixel")]
     fn tile_pixel_from_glitched_panics() {
-        let _ = TilePixel::from(EscapeResult::Glitched);
+        let _ = PixelData::from(EscapeResult::Glitched);
     }
 
     // ── escape_time: interior points ──────────────────────────────────────────
@@ -710,11 +706,11 @@ mod tests {
         }
     }
 
-    // ── TilePixel ─────────────────────────────────────────────────────────────
+    // ── PixelData ─────────────────────────────────────────────────────────────
 
     #[test]
     fn tile_pixel_is_16_bytes_repr_c() {
-        assert_eq!(core::mem::size_of::<TilePixel>(), 16);
+        assert_eq!(core::mem::size_of::<PixelData>(), 16);
     }
 
     // ── render_tile_escape ────────────────────────────────────────────────────
@@ -724,11 +720,11 @@ mod tests {
         let coords: Vec<Complex<f64>> = (-2..=1)
             .flat_map(|re| (-2..=1).map(move |im| Complex::new(re as f64, im as f64)))
             .collect();
-        let mut out = vec![TilePixel::default(); coords.len()];
+        let mut out = vec![PixelData::default(); coords.len()];
         render_tile_escape(&MAP, &coords, 100, &mut out);
 
-        let escaped_count = out.iter().filter(|p| p.escaped == 1.0).count();
-        let interior_count = out.iter().filter(|p| p.escaped == 0.0).count();
+        let escaped_count = out.iter().filter(|p| p.0[3] == 1.0).count();
+        let interior_count = out.iter().filter(|p| p.0[3] == 0.0).count();
         assert!(escaped_count > 0, "expected at least one escaped pixel");
         assert!(interior_count > 0, "expected at least one interior pixel");
     }
@@ -737,15 +733,15 @@ mod tests {
     fn render_tile_all_escaped_far_exterior() {
         let coords: Vec<Complex<f64>> =
             (0..16).map(|i| Complex::new(10.0 + i as f64, 0.0)).collect();
-        let mut out = vec![TilePixel::default(); coords.len()];
+        let mut out = vec![PixelData::default(); coords.len()];
         render_tile_escape(&MAP, &coords, 100, &mut out);
-        assert!(out.iter().all(|p| p.escaped == 1.0));
+        assert!(out.iter().all(|p| p.0[3] == 1.0));
     }
 
     #[test]
     fn render_tile_output_length_matches_coords() {
         let coords = vec![Complex::new(0.0_f64, 0.0); 64];
-        let mut out = vec![TilePixel::default(); 64];
+        let mut out = vec![PixelData::default(); 64];
         render_tile_escape(&MAP, &coords, 50, &mut out);
         assert_eq!(out.len(), 64);
     }
@@ -753,21 +749,21 @@ mod tests {
     #[test]
     fn render_tile_interior_smooth_t_is_period() {
         // c=0: orbit is z_0=0, z_1=0, immediately converges — period-1 fixed point.
-        // smooth_t now stores period as f32 for interior pixels.
+        // ch0 stores period as f32 for interior pixels.
         let coords = vec![Complex::new(0.0_f64, 0.0)];
-        let mut out = vec![TilePixel::default(); 1];
+        let mut out = vec![PixelData::default(); 1];
         render_tile_escape(&MAP, &coords, 100, &mut out);
-        assert_eq!(out[0].escaped, 0.0);
-        assert_eq!(out[0].smooth_t, 1.0); // period 1
+        assert_eq!(out[0].0[3], 0.0);
+        assert_eq!(out[0].0[0], 1.0); // period 1
     }
 
     #[test]
     fn render_tile_escaped_smooth_t_is_finite() {
         let coords = vec![Complex::new(2.0_f64, 0.0)];
-        let mut out = vec![TilePixel::default(); 1];
+        let mut out = vec![PixelData::default(); 1];
         render_tile_escape(&MAP, &coords, 100, &mut out);
-        assert_eq!(out[0].escaped, 1.0);
-        assert!(out[0].smooth_t.is_finite());
+        assert_eq!(out[0].0[3], 1.0);
+        assert!(out[0].0[0].is_finite());
     }
 
     // ── compute_ref_orbit ─────────────────────────────────────────────────────
@@ -855,15 +851,15 @@ mod tests {
         vec![Complex::new(0.0_f64, 0.0); len]
     }
 
-    fn tile_pixels_match(a: TilePixel, b: TilePixel) -> bool {
-        if a.escaped != b.escaped { return false; }
-        if (a.orbit_min_r - b.orbit_min_r).abs() >= 1e-6_f32 { return false; }
-        if a.escaped > 0.5 {
-            // Escaped: smooth_t must match. angle holds log_dist (escape_time) vs 0.0
+    fn tile_pixels_match(a: PixelData, b: PixelData) -> bool {
+        if a.0[3] != b.0[3] { return false; }
+        if (a.0[1] - b.0[1]).abs() >= 1e-6_f32 { return false; }
+        if a.0[3] > 0.5 {
+            // Escaped: ch0 (smooth_t) must match. ch2 holds log_dist (escape_time) vs 0.0
             // (perturb_pixel, which doesn't track dz) — intentional difference, skip.
-            if (a.smooth_t - b.smooth_t).abs() >= 1e-6_f32 { return false; }
+            if (a.0[0] - b.0[0]).abs() >= 1e-6_f32 { return false; }
         }
-        // Interior: smooth_t holds period (escape_time detects period-1, perturb_pixel
+        // Interior: ch0 holds period (escape_time detects period-1, perturb_pixel
         // always returns 0) — intentional difference, skip comparison.
         true
     }
@@ -918,11 +914,11 @@ mod tests {
         let orbit = zero_orbit(200);
         let et = escape_time(&MAP, Complex::new(2.0_f64, 0.0), 200);
         let pp = perturb_pixel(&MAP, &orbit, &[], &[], DeltaC::new(2.0, 0.0), DeltaC::new(0.0, 0.0), 200);
-        let et_px = TilePixel::from(et);
-        let pp_px = TilePixel::from(pp);
+        let et_px = PixelData::from(et);
+        let pp_px = PixelData::from(pp);
         assert!(
             tile_pixels_match(et_px, pp_px),
-            "TilePixel mismatch: escape_time={et_px:?} perturb_pixel={pp_px:?}"
+            "PixelData mismatch: escape_time={et_px:?} perturb_pixel={pp_px:?}"
         );
     }
 
@@ -932,11 +928,11 @@ mod tests {
         let orbit = zero_orbit(500);
         let et = escape_time(&MAP, Complex::new(-0.5_f64, 0.0), 500);
         let pp = perturb_pixel(&MAP, &orbit, &[], &[], DeltaC::new(-0.5, 0.0), DeltaC::new(0.0, 0.0), 500);
-        let et_px = TilePixel::from(et);
-        let pp_px = TilePixel::from(pp);
+        let et_px = PixelData::from(et);
+        let pp_px = PixelData::from(pp);
         assert!(
             tile_pixels_match(et_px, pp_px),
-            "TilePixel mismatch: escape_time={et_px:?} perturb_pixel={pp_px:?}"
+            "PixelData mismatch: escape_time={et_px:?} perturb_pixel={pp_px:?}"
         );
     }
 
@@ -955,14 +951,14 @@ mod tests {
                 let im = -1.25 + (row as f64 / (N - 1) as f64) * 2.5;
                 let c = Complex::new(re, im);
 
-                let et_px = TilePixel::from(escape_time(&MAP, c, MAX_ITER));
+                let et_px = PixelData::from(escape_time(&MAP, c, MAX_ITER));
                 let pp = perturb_pixel(&MAP, &orbit, &[], &[], DeltaC::new(re, im), DeltaC::new(0.0, 0.0), MAX_ITER);
                 // Glitched pixels are skipped: with Z=0 the glitch guard always fires
                 // for the zero-threshold check, so no glitches should occur.
                 if matches!(pp, EscapeResult::Glitched) {
                     continue;
                 }
-                let pp_px = TilePixel::from(pp);
+                let pp_px = PixelData::from(pp);
                 assert!(
                     tile_pixels_match(et_px, pp_px),
                     "mismatch at ({re:.3}, {im:.3}): escape_time={et_px:?} perturb_pixel={pp_px:?}"
@@ -1003,16 +999,16 @@ mod tests {
     //
     // Three specific Mandelbrot coordinates used as regression anchors.
     // The oracle is escape_time (validated separately). perturb_pixel with the
-    // zero reference must produce the same TilePixel for each golden point.
+    // zero reference must produce the same PixelData for each golden point.
 
     fn golden_assert(re: f64, im: f64, max_iter: u32) {
         let orbit = zero_orbit(max_iter as usize);
-        let et_px = TilePixel::from(escape_time(&MAP, Complex::new(re, im), max_iter));
+        let et_px = PixelData::from(escape_time(&MAP, Complex::new(re, im), max_iter));
         let pp = perturb_pixel(&MAP, &orbit, &[], &[], DeltaC::new(re, im), DeltaC::new(0.0, 0.0), max_iter);
         if matches!(pp, EscapeResult::Glitched) {
             return; // zero reference never glitches (Z=0 guard), so this is unreachable
         }
-        let pp_px = TilePixel::from(pp);
+        let pp_px = PixelData::from(pp);
         assert!(
             tile_pixels_match(et_px, pp_px),
             "golden ({re}, {im}): escape_time={et_px:?} perturb_pixel={pp_px:?}"
@@ -1245,12 +1241,12 @@ mod tests {
             let px_direct = if matches!(r_direct, EscapeResult::Glitched) {
                 continue;
             } else {
-                TilePixel::from(r_direct)
+                PixelData::from(r_direct)
             };
             if matches!(r_bla, EscapeResult::Glitched) {
                 continue;
             }
-            let px_bla = TilePixel::from(r_bla);
+            let px_bla = PixelData::from(r_bla);
 
             assert!(
                 tile_pixels_match(px_direct, px_bla),
@@ -1387,8 +1383,8 @@ mod tests {
             !matches!(result, EscapeResult::Glitched),
             "inline rebase must resolve the glitch"
         );
-        let et_px = TilePixel::from(escape_time(&MAP, Complex::new(0.5_f64, 0.0), MAX_ITER));
-        let pp_px = TilePixel::from(result);
+        let et_px = PixelData::from(escape_time(&MAP, Complex::new(0.5_f64, 0.0), MAX_ITER));
+        let pp_px = PixelData::from(result);
         assert!(
             tile_pixels_match(et_px, pp_px),
             "rebased result must match escape_time(0.5): et={et_px:?} pp={pp_px:?}"
@@ -1426,8 +1422,8 @@ mod tests {
         );
 
         // Result must match escape_time for c = 0.5.
-        let et_px = TilePixel::from(escape_time(&MAP, Complex::new(0.5_f64, 0.0), MAX_ITER));
-        let pp_px = TilePixel::from(r_secondary);
+        let et_px = PixelData::from(escape_time(&MAP, Complex::new(0.5_f64, 0.0), MAX_ITER));
+        let pp_px = PixelData::from(r_secondary);
         assert!(
             tile_pixels_match(et_px, pp_px),
             "secondary-corrected result must match escape_time: et={et_px:?} pp={pp_px:?}"

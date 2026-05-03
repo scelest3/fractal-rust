@@ -2,7 +2,7 @@
 
 use wasm_bindgen_test::*;
 use wasm_bridge::{TileJob, render_tile_impl};
-use kernel::TilePixel;
+use kernel::PixelData;
 
 // ── render_tile_impl: mixed interior and escaped pixels ───────────────────
 //
@@ -20,11 +20,11 @@ fn render_tile_produces_mixed_pixels() {
         slot_index: 0,
     };
 
-    let mut out = vec![TilePixel::default(); 256 * 256];
+    let mut out = vec![PixelData::default(); 256 * 256];
     render_tile_impl(&job, &mut out);
 
-    let escaped = out.iter().filter(|p| p.escaped == 1.0).count();
-    let interior = out.iter().filter(|p| p.escaped == 0.0).count();
+    let escaped = out.iter().filter(|p| p.0[3] == 1.0).count();
+    let interior = out.iter().filter(|p| p.0[3] == 0.0).count();
 
     assert!(escaped > 0, "expected at least one escaped pixel, got 0");
     assert!(interior > 0, "expected at least one interior pixel, got 0");
@@ -42,11 +42,11 @@ fn render_tile_far_exterior_all_escaped() {
         slot_index: 0,
     };
 
-    let mut out = vec![TilePixel::default(); 256 * 256];
+    let mut out = vec![PixelData::default(); 256 * 256];
     render_tile_impl(&job, &mut out);
 
     assert!(
-        out.iter().all(|p| p.escaped == 1.0),
+        out.iter().all(|p| p.0[3] == 1.0),
         "all pixels far outside the Mandelbrot set must be escaped"
     );
 }
@@ -63,7 +63,7 @@ fn render_tile_glitch_count_is_zero() {
         slot_index: 0,
     };
 
-    let mut out = vec![TilePixel::default(); 256 * 256];
+    let mut out = vec![PixelData::default(); 256 * 256];
     let result = render_tile_impl(&job, &mut out);
 
     assert_eq!(result.glitch_count, 0);

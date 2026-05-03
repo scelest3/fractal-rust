@@ -202,16 +202,16 @@ pub fn render_tile_to_ptr(
 ) {
     let job = TileJob { delta_re, delta_im, pixel_step, max_iter, slot_index: 0 };
     // Safety: ptr is from alloc_tile_buf() — a valid heap allocation of
-    // exactly TILE_PIXELS * size_of::<TilePixel>() bytes.
+    // exactly TILE_PIXELS * size_of::<PixelData>() bytes.
     let out =
-        unsafe { core::slice::from_raw_parts_mut(ptr as *mut kernel::TilePixel, TILE_PIXELS) };
+        unsafe { core::slice::from_raw_parts_mut(ptr as *mut kernel::PixelData, TILE_PIXELS) };
     render_tile_impl(&job, out);
 }
 
 /// Inner implementation: render one 256×256 tile into a caller-supplied
-/// `TilePixel` slice. Separated from the wasm export so integration tests
+/// `PixelData` slice. Separated from the wasm export so integration tests
 /// can pass a heap-allocated buffer without requiring shared memory layout.
-pub fn render_tile_impl(job: &TileJob, out: &mut [kernel::TilePixel]) -> TileResult {
+pub fn render_tile_impl(job: &TileJob, out: &mut [kernel::PixelData]) -> TileResult {
     debug_assert_eq!(out.len(), TILE_PIXELS);
 
     let mut coords = Vec::with_capacity(TILE_PIXELS);
@@ -231,7 +231,7 @@ pub fn render_tile_impl(job: &TileJob, out: &mut [kernel::TilePixel]) -> TileRes
 /// Render a 256×256 Mandelbrot tile into the shared memory ring slot.
 ///
 /// Computes per-pixel `Complex<f64>` coordinates from `job`, calls
-/// `kernel::render_tile_escape`, and writes `TilePixel` data directly
+/// `kernel::render_tile_escape`, and writes `PixelData` data directly
 /// into WASM linear memory at `tile_ring_offset + slot_index * tile_slot_bytes`.
 ///
 /// # Safety
@@ -243,7 +243,7 @@ pub fn render_tile_impl(job: &TileJob, out: &mut [kernel::TilePixel]) -> TileRes
 pub fn render_tile(job: &TileJob, layout: &MemoryLayout) -> TileResult {
     let byte_offset =
         (layout.tile_ring_offset + job.slot_index * layout.tile_slot_bytes) as usize;
-    let ptr = byte_offset as *mut kernel::TilePixel;
+    let ptr = byte_offset as *mut kernel::PixelData;
     // Safety: byte_offset is within the shared WebAssembly.Memory — the Tile
     // Worker verified the slot is EMPTY before calling and holds WRITING state.
     let out = unsafe { core::slice::from_raw_parts_mut(ptr, TILE_PIXELS) };
@@ -321,7 +321,7 @@ pub fn render_tile_newton_impl(
     delta_im: f64,
     pixel_step: f64,
     max_iter: u32,
-    out: &mut [kernel::TilePixel],
+    out: &mut [kernel::PixelData],
 ) {
     debug_assert_eq!(out.len(), TILE_PIXELS);
 
@@ -368,7 +368,7 @@ pub fn render_tile_newton_to_ptr(
 ) {
     // Safety: ptr is from alloc_tile_buf() — a valid TILE_PIXELS-sized heap buffer.
     let out = unsafe {
-        core::slice::from_raw_parts_mut(ptr as *mut kernel::TilePixel, TILE_PIXELS)
+        core::slice::from_raw_parts_mut(ptr as *mut kernel::PixelData, TILE_PIXELS)
     };
     render_tile_newton_impl(
         degree, coeffs, roots_re, roots_im,
@@ -517,7 +517,7 @@ pub fn render_tile_f64x2(
     use arith::{F64x2, Precision};
     // Safety: out_ptr is from alloc_tile_buf() — a valid TILE_PIXELS-sized heap buffer.
     let out = unsafe {
-        core::slice::from_raw_parts_mut(out_ptr as *mut kernel::TilePixel, TILE_PIXELS)
+        core::slice::from_raw_parts_mut(out_ptr as *mut kernel::PixelData, TILE_PIXELS)
     };
     let escape_r_sq = 4.0_f64;
     let cx0 = F64x2::from_f64(cx_ref);
@@ -531,7 +531,7 @@ pub fn render_tile_f64x2(
     }
 }
 
-fn mandelbrot_f64x2(cr: arith::F64x2, ci: arith::F64x2, max_iter: u32, escape_r_sq: f64) -> kernel::TilePixel {
+fn mandelbrot_f64x2(cr: arith::F64x2, ci: arith::F64x2, max_iter: u32, escape_r_sq: f64) -> kernel::PixelData {
     use arith::{F64x2, Precision};
     let mut zr = F64x2::zero();
     let mut zi = F64x2::zero();
@@ -566,14 +566,14 @@ fn mandelbrot_f64x2(cr: arith::F64x2, ci: arith::F64x2, max_iter: u32, escape_r_
             let smooth_t = (iter as f64 + 1.0) - norm_sq.sqrt().ln().ln() / core::f64::consts::LN_2;
             let dz_norm  = (dz_r * dz_r + dz_i * dz_i).sqrt().max(1e-300);
             let log_dist = (dz_norm / (2.0 * norm * norm.ln().max(1e-300))).ln();
-            return kernel::TilePixel::from(kernel::EscapeResult::Escaped {
+            return kernel::PixelData::from(kernel::EscapeResult::Escaped {
                 iter, smooth_t, orbit_min_r, orbit_min_z, log_dist,
             });
         }
 
         // Period-1 convergence check.
         if iter > 0 && (zr_f - zr_prev).hypot(zi_f - zi_prev) < 1e-10 {
-            return kernel::TilePixel::from(kernel::EscapeResult::Interior {
+            return kernel::PixelData::from(kernel::EscapeResult::Interior {
                 orbit_min_r, orbit_min_z, period: 1,
             });
         }
@@ -587,7 +587,7 @@ fn mandelbrot_f64x2(cr: arith::F64x2, ci: arith::F64x2, max_iter: u32, escape_r_
         zr = zr_new;
     }
 
-    kernel::TilePixel::from(kernel::EscapeResult::Interior {
+    kernel::PixelData::from(kernel::EscapeResult::Interior {
         orbit_min_r, orbit_min_z, period: 0,
     })
 }
@@ -627,7 +627,7 @@ pub fn render_tile_perturb(
             }
             // Safety: out_ptr is from alloc_tile_buf() — a valid TILE_PIXELS-sized heap buffer.
             let out = unsafe {
-                core::slice::from_raw_parts_mut(out_ptr as *mut kernel::TilePixel, TILE_PIXELS)
+                core::slice::from_raw_parts_mut(out_ptr as *mut kernel::PixelData, TILE_PIXELS)
             };
 
             // Precompute secondary orbit at the tile center δc.
@@ -664,13 +664,13 @@ pub fn render_tile_perturb(
                         kernel::EscapeResult::Glitched => {
                             fallback_count += 1;
                             let c_abs = arith::Complex::new(cx_ref + dc_re, cy_ref + dc_im);
-                            kernel::TilePixel::from(kernel::escape_time(
+                            kernel::PixelData::from(kernel::escape_time(
                                 &kernel::MandelbrotMap,
                                 c_abs,
                                 max_iter,
                             ))
                         }
-                        other => kernel::TilePixel::from(other),
+                        other => kernel::PixelData::from(other),
                     };
                 }
             }
@@ -738,41 +738,41 @@ mod tests {
         // Render a 1-pixel "tile" centred on z₀ = 2+0i — deep in the real basin.
         // a channel = 1.0 means Converged.
         let (degree, coeffs, re, im) = z3_minus_1_params();
-        let mut out = vec![kernel::TilePixel::default(); TILE_PIXELS];
+        let mut out = vec![kernel::PixelData::default(); TILE_PIXELS];
         render_tile_newton_impl(
             degree, &coeffs, &re, &im,
             2.0, 0.0, 1e-6, 200, &mut out,
         );
         // Top-left pixel is at (2.0, 0.0) — should converge.
-        assert_eq!(out[0].escaped, 1.0, "basin pixel must have a=1.0 (Converged)");
+        assert_eq!(out[0].0[3], 1.0, "basin pixel must have ch3=1.0 (Converged)");
     }
 
     #[test]
     fn newton_tile_converged_pixel_has_positive_iter_and_negative_log_p() {
         let (degree, coeffs, re, im) = z3_minus_1_params();
-        let mut out = vec![kernel::TilePixel::default(); TILE_PIXELS];
+        let mut out = vec![kernel::PixelData::default(); TILE_PIXELS];
         render_tile_newton_impl(
             degree, &coeffs, &re, &im,
             2.0, 0.0, 1e-6, 200, &mut out,
         );
-        // smooth_t (r) = convergence_iter: positive integer step count.
-        assert!(out[0].smooth_t > 0.0,
-            "convergence_iter must be positive, got {}", out[0].smooth_t);
-        // orbit_min_r (g) = log_p_norm = ln|p(z_N)|: negative since |p| < ε < 1.
-        assert!(out[0].orbit_min_r < 0.0,
-            "log_p_norm must be negative for a converged pixel, got {}", out[0].orbit_min_r);
+        // ch0 = convergence_iter: positive integer step count.
+        assert!(out[0].0[0] > 0.0,
+            "convergence_iter must be positive, got {}", out[0].0[0]);
+        // ch1 = log_p_norm = ln|p(z_N)|: negative since |p| < ε < 1.
+        assert!(out[0].0[1] < 0.0,
+            "log_p_norm must be negative for a converged pixel, got {}", out[0].0[1]);
     }
 
     #[test]
     fn newton_tile_root_index_in_range() {
         let (degree, coeffs, re, im) = z3_minus_1_params();
-        let mut out = vec![kernel::TilePixel::default(); TILE_PIXELS];
+        let mut out = vec![kernel::PixelData::default(); TILE_PIXELS];
         render_tile_newton_impl(
             degree, &coeffs, &re, &im,
             2.0, 0.0, 1e-6, 200, &mut out,
         );
-        // b channel = root_index, must be in 0..degree for converged pixels.
-        let root_idx = out[0].angle as u32;
+        // ch2 = root_index, must be in 0..degree for converged pixels.
+        let root_idx = out[0].0[2] as u32;
         assert!(root_idx < degree, "root_index {root_idx} out of range for degree {degree}");
     }
 
@@ -780,12 +780,12 @@ mod tests {
     fn newton_tile_unresolved_pixel_has_zero_flag() {
         // z₀ = 0 is a critical point of z³−1 (p′(0)=0), always Unresolved.
         let (degree, coeffs, re, im) = z3_minus_1_params();
-        let mut out = vec![kernel::TilePixel::default(); TILE_PIXELS];
+        let mut out = vec![kernel::PixelData::default(); TILE_PIXELS];
         render_tile_newton_impl(
             degree, &coeffs, &re, &im,
             0.0, 0.0, 1e-6, 200, &mut out,
         );
-        assert_eq!(out[0].escaped, 0.0, "critical point must have a=0.0 (Unresolved)");
+        assert_eq!(out[0].0[3], 0.0, "critical point must have ch3=0.0 (Unresolved)");
     }
 
     #[test]

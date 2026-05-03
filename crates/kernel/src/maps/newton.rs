@@ -1,6 +1,6 @@
 use arith::Complex;
 
-use crate::TilePixel;
+use crate::PixelData;
 
 // ── NewtonMap ─────────────────────────────────────────────────────────────────
 
@@ -141,27 +141,19 @@ pub fn find_roots(map: &NewtonMap) -> [Complex<f64>; 10] {
 
 // ── newton_tile_pixel ─────────────────────────────────────────────────────────
 
-/// Pack a `NewtonResult` into the standard 4-channel `TilePixel`.
+/// Pack a `NewtonResult` into the standard 4-channel `PixelData`.
 ///
 /// Channel layout:
 ///   r = convergence_iter as f32 (integer step count N)
 ///   g = log_p_norm (ln|p(z_N)|; used with r to compute smooth_f in shader)
 ///   b = root_index as f32
 ///   a = 1.0 (Converged) | 0.0 (Unresolved)
-pub fn newton_tile_pixel(result: NewtonResult) -> TilePixel {
+pub fn newton_tile_pixel(result: NewtonResult) -> PixelData {
     match result {
-        NewtonResult::Converged { root_index, convergence_iter, log_p_norm } => TilePixel {
-            smooth_t:    convergence_iter as f32,
-            orbit_min_r: log_p_norm,
-            angle:       root_index as f32,
-            escaped:     1.0,
-        },
-        NewtonResult::Unresolved => TilePixel {
-            smooth_t:    0.0,
-            orbit_min_r: 0.0,
-            angle:       0.0,
-            escaped:     0.0,
-        },
+        NewtonResult::Converged { root_index, convergence_iter, log_p_norm } =>
+            PixelData([convergence_iter as f32, log_p_norm, root_index as f32, 1.0]),
+        NewtonResult::Unresolved =>
+            PixelData([0.0, 0.0, 0.0, 0.0]),
     }
 }
 
@@ -314,19 +306,19 @@ mod tests {
             root_index: 2, convergence_iter: 7, log_p_norm: -18.4,
         };
         let px = newton_tile_pixel(result);
-        assert!((px.smooth_t    - 7.0_f32).abs()   < 1e-6, "r = convergence_iter");
-        assert!((px.orbit_min_r - (-18.4_f32)).abs() < 1e-4, "g = log_p_norm");
-        assert!((px.angle - 2.0_f32).abs()          < 1e-6, "b = root_index");
-        assert_eq!(px.escaped, 1.0, "a = 1 for Converged");
+        assert!((px.0[0] - 7.0_f32).abs()    < 1e-6, "ch0 = convergence_iter");
+        assert!((px.0[1] - (-18.4_f32)).abs() < 1e-4, "ch1 = log_p_norm");
+        assert!((px.0[2] - 2.0_f32).abs()    < 1e-6, "ch2 = root_index");
+        assert_eq!(px.0[3], 1.0,                       "ch3 = 1 for Converged");
     }
 
     #[test]
     fn tile_pixel_unresolved_channels() {
         let px = newton_tile_pixel(NewtonResult::Unresolved);
-        assert_eq!(px.smooth_t,    0.0);
-        assert_eq!(px.orbit_min_r, 0.0);
-        assert_eq!(px.angle,       0.0);
-        assert_eq!(px.escaped,     0.0);
+        assert_eq!(px.0[0], 0.0);
+        assert_eq!(px.0[1], 0.0);
+        assert_eq!(px.0[2], 0.0);
+        assert_eq!(px.0[3], 0.0);
     }
 
     // ── find_roots ────────────────────────────────────────────────────────────
