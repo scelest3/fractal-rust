@@ -23,7 +23,7 @@ import {
   type NewtonParams,
 } from "./newton.ts";
 import { NewtonPanel } from "./newton-panel.ts";
-import { ExportSession, type WorkerLease, type ExportParams } from "./export.ts";
+import { ExportDialog, type WorkerLease } from "./export.ts";
 
 const BASE_ITER = 256;
 
@@ -138,6 +138,8 @@ export class FractalSession {
   private orbitReady = false;
   private pendingOrbitDispatch = false; // waiting for orbit_ready before dispatching
 
+  private readonly exportDialog: ExportDialog;
+
   // Fractal kind + Newton state
   private fractalKind: "mandelbrot" | "newton" = "mandelbrot";
   private newtonParams: NewtonParams = defaultNewtonParams();
@@ -220,9 +222,29 @@ export class FractalSession {
     this.overlay.appendChild(this.buildDprToggle(canvas));
     this.overlay.appendChild(this.paletteEditor.getToggleButton());
 
+    this.exportDialog = new ExportDialog(
+      this.gl,
+      () => this.pause(),
+      (width, height, format, quality) => ({
+        width, height, format, quality,
+        view:        this.fsm.getView(),
+        fractalKind: this.fractalKind,
+        maxIter:     this.computeMaxIter(this.fsm.getView().zoom_exp),
+        useF64x2:    this.fsm.getView().zoom_exp > F64X2_ZOOM_THRESHOLD,
+        cxRef:       parseFloat(this.fsm.getView().cx),
+        cyRef:       parseFloat(this.fsm.getView().cy),
+        newton: this.fractalKind === "newton" ? {
+          degree:  this.newtonParams.degree,
+          coeffs:  Array.from(this.newtonParams.coeffs),
+          rootsRe: Array.from(this.newtonParams.rootsRe),
+          rootsIm: Array.from(this.newtonParams.rootsIm),
+        } : undefined,
+      }),
+    );
+
     document.addEventListener("keydown", (e: KeyboardEvent) => {
       if ((e.key === "e" || e.key === "E") && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        void this.triggerExport();
+        this.exportDialog.open();
       }
     });
 
@@ -546,41 +568,6 @@ export class FractalSession {
         self.scheduleDispatch();
       },
     };
-  }
-
-  private async triggerExport(): Promise<void> {
-    if (!this.lutReady) return;
-    const view  = this.fsm.getView();
-    const cxRef = parseFloat(view.cx);
-    const cyRef = parseFloat(view.cy);
-    const params: ExportParams = {
-      width:       1920,
-      height:      1080,
-      format:      "png",
-      view,
-      fractalKind: this.fractalKind,
-      maxIter:     this.computeMaxIter(view.zoom_exp),
-      useF64x2:    view.zoom_exp > F64X2_ZOOM_THRESHOLD,
-      cxRef,
-      cyRef,
-      newton: this.fractalKind === "newton" ? {
-        degree:  this.newtonParams.degree,
-        coeffs:  Array.from(this.newtonParams.coeffs),
-        rootsRe: Array.from(this.newtonParams.rootsRe),
-        rootsIm: Array.from(this.newtonParams.rootsIm),
-      } : undefined,
-    };
-    const lease = this.pause();
-    const session = new ExportSession(lease, this.gl, params, () => {});
-    const blob = await session.run();
-    if (blob) {
-      const url = URL.createObjectURL(blob);
-      const a   = document.createElement("a");
-      a.href     = url;
-      a.download = `fractal-${cxRef.toFixed(6)}-zoom${view.zoom_exp.toFixed(2)}.png`;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 0);
-    }
   }
 
   private dispatchPending(): void {

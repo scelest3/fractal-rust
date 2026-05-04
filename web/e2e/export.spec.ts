@@ -1,31 +1,73 @@
 import { test, expect } from "@playwright/test";
 import { readFile } from "fs/promises";
 
-test.describe("Export", () => {
-  test("E key downloads a 1920×1080 PNG", async ({ page }) => {
+async function waitForRender(page: import("@playwright/test").Page) {
+  await page.waitForSelector("canvas[data-rendered]", { timeout: 20_000 });
+  await page.evaluate(() => new Promise<void>(r => requestAnimationFrame(() => r())));
+}
+
+async function openDialog(page: import("@playwright/test").Page) {
+  await page.keyboard.press("e");
+  await page.waitForSelector("dialog[open]");
+}
+
+test.describe("Export dialog", () => {
+  test("PNG: dialog-driven 1080p export matches golden", async ({ page }) => {
     await page.goto("/");
-    await page.waitForSelector("canvas[data-rendered]", { timeout: 20_000 });
-    await page.evaluate(() => new Promise<void>(r => requestAnimationFrame(() => r())));
+    await waitForRender(page);
+    await openDialog(page);
+
+    // 1080p preset is selected by default — just confirm PNG and export
+    await page.getByRole("radio", { name: "PNG" }).check();
 
     const downloadPromise = page.waitForEvent("download", { timeout: 30_000 });
-    await page.keyboard.press("e");
+    await page.getByRole("button", { name: "Start export" }).click();
     const download = await downloadPromise;
 
     expect(download.suggestedFilename()).toMatch(/\.png$/i);
+    const buf = await readFile((await download.path())!);
+    await expect(buf).toMatchSnapshot("export-mandelbrot-1080p.png");
+  });
 
-    const filePath = await download.path();
-    const buf = await readFile(filePath!);
+  test("JPEG: dialog-driven 1080p export matches golden", async ({ page }) => {
+    await page.goto("/");
+    await waitForRender(page);
+    await openDialog(page);
 
-    // PNG magic bytes: 137 80 78 71 13 10 26 10
-    expect(buf[0]).toBe(137);
-    expect(buf[1]).toBe(80); // 'P'
-    expect(buf[2]).toBe(78); // 'N'
-    expect(buf[3]).toBe(71); // 'G'
+    await page.getByRole("radio", { name: "JPEG" }).check();
+    // Quality slider defaults to 90 — leave it
 
-    // IHDR chunk starts at byte 16: width (u32 BE) then height (u32 BE)
-    const width  = buf.readUInt32BE(16);
-    const height = buf.readUInt32BE(20);
-    expect(width).toBe(1920);
-    expect(height).toBe(1080);
+    const downloadPromise = page.waitForEvent("download", { timeout: 30_000 });
+    await page.getByRole("button", { name: "Start export" }).click();
+    const download = await downloadPromise;
+
+    expect(download.suggestedFilename()).toMatch(/\.jpg$/i);
+    const buf = await readFile((await download.path())!);
+    await expect(buf).toMatchSnapshot("export-mandelbrot-1080p.jpg");
+  });
+
+  test("dialog closes after export and viewport resumes", async ({ page }) => {
+    await page.goto("/");
+    await waitForRender(page);
+    await openDialog(page);
+
+    const downloadPromise = page.waitForEvent("download", { timeout: 30_000 });
+    await page.getByRole("button", { name: "Start export" }).click();
+    await downloadPromise;
+
+    // Dialog should be gone
+    await expect(page.locator("dialog[open]")).toHaveCount(0);
+
+    // Viewport should re-render (generation counter advances)
+    await page.waitForSelector("canvas[data-rendered]", { timeout: 10_000 });
+  });
+
+  test("cancel closes dialog without downloading", async ({ page }) => {
+    await page.goto("/");
+    await waitForRender(page);
+    await openDialog(page);
+
+    await page.getByRole("button", { name: "Cancel export" }).click();
+    await expect(page.locator("dialog[open]")).toHaveCount(0);
   });
 });
