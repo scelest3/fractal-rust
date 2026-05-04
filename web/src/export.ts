@@ -135,9 +135,8 @@ export class ExportSession {
       const tilesY = Math.ceil(actualH / TILE);
 
       gl.clearExportFBO();
-      await this.renderStrip(stripY, tilesX, tilesY, step);
+      await this.renderStrip(stripY, tilesX, tilesY, step, doneTiles, totalTiles);
       doneTiles += tilesX * tilesY;
-      this.onProgress(doneTiles, totalTiles);
 
       if (this.cancelled) return null;
       gl.blitExportStrip();
@@ -160,6 +159,8 @@ export class ExportSession {
     tilesX: number,
     tilesY: number,
     step: number,
+    doneBeforeStrip: number,
+    totalTiles: number,
   ): Promise<void> {
     return new Promise((resolve) => {
       const { params, lease, gl } = this;
@@ -183,7 +184,7 @@ export class ExportSession {
       }
 
       const total = pending.length;
-      let completed = 0;
+      let completedInStrip = 0;
       const busyWorkers = new Set<number>();
 
       const dispatch = () => {
@@ -218,8 +219,9 @@ export class ExportSession {
           if (msg.type !== "tile_ready") return;
           busyWorkers.delete(i);
           gl.uploadExportTile(lease.tileSab, msg.slotIndex, msg.tileX, msg.tileY);
-          completed++;
-          if (completed === total) {
+          completedInStrip++;
+          this.onProgress(doneBeforeStrip + completedInStrip, totalTiles);
+          if (completedInStrip === total) {
             resolve();
           } else {
             dispatch();
