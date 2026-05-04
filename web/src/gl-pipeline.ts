@@ -119,6 +119,15 @@ export class GlPipeline {
   private readonly accumTexture: WebGLTexture;  // canvas-sized RGBA32F
   private readonly accumFBO: WebGLFramebuffer;
 
+  // Export FBOs — allocated lazily on first export
+  private exportAccumTexture:    WebGLTexture | null = null;
+  private exportAccumFBO:        WebGLFramebuffer | null = null;
+  private exportReadbackTexture: WebGLTexture | null = null;
+  private exportReadbackFBO:     WebGLFramebuffer | null = null;
+  private exportPbo:             WebGLBuffer | null = null;
+  private exportWidth  = 0;
+  private exportStripH = 0;
+
   // tile program uniforms
   private readonly uTileTex: WebGLUniformLocation;
   // blit program uniforms
@@ -409,6 +418,149 @@ export class GlPipeline {
     const { gl } = this;
     gl.useProgram(this.blitProgram);
     gl.uniform3f(this.uUnresolvedColor, r, g, b);
+  }
+
+  // ── Export pipeline ───────────────────────────────────────────────────────
+
+  getMaxRenderbufferSize(): number {
+    return this.gl.getParameter(this.gl.MAX_RENDERBUFFER_SIZE) as number;
+  }
+
+  /** Allocate (or resize) the dedicated export accumulation and readback FBOs. */
+  initExportFBOs(width: number, stripHeight: number): void {
+    const { gl } = this;
+    if (this.exportWidth === width && this.exportStripH === stripHeight) return;
+
+    // Clean up old resources
+    if (this.exportAccumFBO)        gl.deleteFramebuffer(this.exportAccumFBO);
+    if (this.exportAccumTexture)    gl.deleteTexture(this.exportAccumTexture);
+    if (this.exportReadbackFBO)     gl.deleteFramebuffer(this.exportReadbackFBO);
+    if (this.exportReadbackTexture) gl.deleteTexture(this.exportReadbackTexture);
+    if (this.exportPbo)             gl.deleteBuffer(this.exportPbo);
+
+    // RGBA32F accumulation texture + FBO
+    this.exportAccumTexture = this.makeTexture(gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, stripHeight, 0, gl.RGBA, gl.FLOAT, null);
+    this.exportAccumFBO = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.exportAccumFBO);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.exportAccumTexture, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    // RGBA8 readback texture + FBO
+    this.exportReadbackTexture = this.makeTexture(gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, stripHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    this.exportReadbackFBO = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.exportReadbackFBO);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.exportReadbackTexture, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    // PIXEL_PACK_BUFFER for async readback
+    this.exportPbo = gl.createBuffer()!;
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.exportPbo);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, width * stripHeight * 4, gl.STREAM_READ);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+
+    this.exportWidth  = width;
+    this.exportStripH = stripHeight;
+  }
+
+  /** Clear the export accumulation FBO (call before rendering each strip). */
+  clearExportFBO(): void {
+    const { gl } = this;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.exportAccumFBO);
+    gl.viewport(0, 0, this.exportWidth, this.exportStripH);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  /**
+   * Upload a 256×256 tile from the SAB into the export accumFBO.
+   * tileY is strip-relative. Does NOT blit to the canvas.
+   */
+  uploadExportTile(
+    tileSab: SharedArrayBuffer,
+    slotIndex: number,
+    tileX: number,
+    tileY: number,
+  ): void {
+    const { gl } = this;
+    const byteOffset = slotIndex * 256 * 256 * 4 * 4;
+    const data = new Float32Array(tileSab, byteOffset, 256 * 256 * 4);
+
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.bindTexture(gl.TEXTURE_2D, this.tileTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 256, 256, 0, gl.RGBA, gl.FLOAT, data);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+
+    const x = tileX * 256;
+    const y = this.exportStripH - (tileY + 1) * 256;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.exportAccumFBO);
+    gl.viewport(x, y, 256, 256);
+    gl.scissor(x, y, 256, 256);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.useProgram(this.tileProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.tileTexture);
+    gl.uniform1i(this.uTileTex, 0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  /** Apply LUT coloring to the export accumFBO and write into the RGBA8 readback FBO. */
+  blitExportStrip(): void {
+    const { gl } = this;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.exportReadbackFBO);
+    gl.viewport(0, 0, this.exportWidth, this.exportStripH);
+    gl.useProgram(this.blitProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.exportAccumTexture);
+    gl.uniform1i(this.uAccum, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
+    gl.uniform1i(this.uLut, 1);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  /**
+   * Async pixel readback from the export readback FBO.
+   * Uses PIXEL_PACK_BUFFER + fenceSync + RAF polling — never blocks the main thread.
+   * Returns RGBA bytes in bottom-up row order (caller must flip for ImageData).
+   */
+  async readbackStrip(): Promise<Uint8Array> {
+    const { gl } = this;
+    const byteLen = this.exportWidth * this.exportStripH * 4;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.exportReadbackFBO);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.exportPbo);
+    gl.readPixels(0, 0, this.exportWidth, this.exportStripH, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    const fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)!;
+    gl.flush();
+
+    await new Promise<void>((resolve) => {
+      (function poll() {
+        const status = gl.clientWaitSync(fence, gl.SYNC_FLUSH_COMMANDS_BIT, 0);
+        if (status === (gl as WebGL2RenderingContext).ALREADY_SIGNALED ||
+            status === (gl as WebGL2RenderingContext).CONDITION_SATISFIED) {
+          resolve();
+        } else {
+          requestAnimationFrame(poll);
+        }
+      })();
+    });
+    gl.deleteSync(fence);
+
+    const pixels = new Uint8Array(byteLen);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.exportPbo);
+    gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, pixels);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    return pixels;
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────

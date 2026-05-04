@@ -23,6 +23,7 @@ import {
   type NewtonParams,
 } from "./newton.ts";
 import { NewtonPanel } from "./newton-panel.ts";
+import { ExportSession, type WorkerLease, type ExportParams } from "./export.ts";
 
 const BASE_ITER = 256;
 
@@ -122,6 +123,7 @@ export class FractalSession {
 
   private readonly busyWorkers = new Set<number>();
   private workerInitCount = 0;
+  private paused = false;
   private orbitWorkerReady = false;
 
   private pendingTiles: TileDesc[] = [];
@@ -217,6 +219,12 @@ export class FractalSession {
     this.hiDpi = (window.devicePixelRatio ?? 1) > 1;
     this.overlay.appendChild(this.buildDprToggle(canvas));
     this.overlay.appendChild(this.paletteEditor.getToggleButton());
+
+    document.addEventListener("keydown", (e: KeyboardEvent) => {
+      if ((e.key === "e" || e.key === "E") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        void this.triggerExport();
+      }
+    });
 
     this.fsm = new ZoomPanFSM(DEFAULT_VIEW, {
       onViewChange: () => {
@@ -519,6 +527,62 @@ export class FractalSession {
     return Math.max(BASE_ITER, Math.round(BASE_ITER + Math.max(0, zoom_exp) * ITER_PER_DECADE));
   }
 
+  /**
+   * Pause viewport tile dispatch and hand the worker pool to the caller.
+   * Call WorkerLease.release() (always in a finally block) to resume.
+   */
+  pause(): WorkerLease {
+    this.pendingTiles = [];
+    this.paused = true;
+    const self = this;
+    return {
+      workers: this.workers,
+      tileSab: this.tileSab,
+      release() {
+        self.workers.forEach((w, i) => {
+          w.onmessage = (e: MessageEvent<WorkerInMsg>) => self.onWorkerMessage(i, e.data);
+        });
+        self.paused = false;
+        self.scheduleDispatch();
+      },
+    };
+  }
+
+  private async triggerExport(): Promise<void> {
+    if (!this.lutReady) return;
+    const view  = this.fsm.getView();
+    const cxRef = parseFloat(view.cx);
+    const cyRef = parseFloat(view.cy);
+    const params: ExportParams = {
+      width:       1920,
+      height:      1080,
+      format:      "png",
+      view,
+      fractalKind: this.fractalKind,
+      maxIter:     this.computeMaxIter(view.zoom_exp),
+      useF64x2:    view.zoom_exp > F64X2_ZOOM_THRESHOLD,
+      cxRef,
+      cyRef,
+      newton: this.fractalKind === "newton" ? {
+        degree:  this.newtonParams.degree,
+        coeffs:  Array.from(this.newtonParams.coeffs),
+        rootsRe: Array.from(this.newtonParams.rootsRe),
+        rootsIm: Array.from(this.newtonParams.rootsIm),
+      } : undefined,
+    };
+    const lease = this.pause();
+    const session = new ExportSession(lease, this.gl, params, () => {});
+    const blob = await session.run();
+    if (blob) {
+      const url = URL.createObjectURL(blob);
+      const a   = document.createElement("a");
+      a.href     = url;
+      a.download = `fractal-${cxRef.toFixed(6)}-zoom${view.zoom_exp.toFixed(2)}.png`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+  }
+
   private dispatchPending(): void {
     for (let i = 0; i < this.workers.length; i++) {
       if (this.pendingTiles.length === 0) break;
@@ -535,6 +599,9 @@ export class FractalSession {
     msg: { slotIndex: number; tileX: number; tileY: number; generation: number },
   ): void {
     this.busyWorkers.delete(workerIndex);
+
+    // Discard viewport tiles silently while export owns the worker pool.
+    if (this.paused) return;
 
     if (msg.generation !== this.generation) {
       this.dispatchPending();
