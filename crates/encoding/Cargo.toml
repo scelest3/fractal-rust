@@ -4,5 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-png      = "0.17"
+png      = "0.18"
 coloring = { path = "../coloring" }

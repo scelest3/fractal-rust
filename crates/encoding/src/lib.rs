@@ -287,7 +287,7 @@ mod tests {
         // Decode with the png crate and inspect pixel values.
         let decoder = png::Decoder::new(std::io::Cursor::new(&out));
         let mut reader = decoder.read_info().unwrap();
-        let mut img = vec![0u8; reader.output_buffer_size()];
+        let mut img = vec![0u8; reader.output_buffer_size().unwrap()];
         reader.next_frame(&mut img).unwrap();
 
         // RGB16: 6 bytes per pixel. Top pixel (PNG row 0) should be white.
