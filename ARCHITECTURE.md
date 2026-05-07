@@ -49,7 +49,7 @@ Browser-based, high-resolution fractal explorer targeting sustained 60 fps inter
 
 - Correct deep-zoom rendering to zoom_exp ≈ 20 via F64x2 double-double arithmetic (v1 cap; see §8)
 - Smooth ≥ 60 fps pan / zoom via progressive tile streaming
-- PNG / JPEG image export at user-defined resolution (up to 16K × 16K); EXR is v2
+- PNG image export at user-defined resolution (up to 16K × 16K), 16-bit RGB, with DPI metadata; EXR is v2
 - Interactive color palette editor (gradient stops, iteration-space mapping, orbit-trap overlay)
 - Julia set live preview linked to Mandelbrot pointer position
 - Newton fractal with configurable polynomial and root coloring
@@ -113,7 +113,8 @@ fractal-workspace/
   crates/
     arith/          # Extended-precision arithmetic (no_std)
     kernel/         # Fractal math: escape time, perturbation, BLA
-    coloring/       # Coloring algorithms, LUT, orbit traps
+    coloring/       # color_pixel — three coloring paths (escaped, interior, Newton)
+    encoding/       # encode_png — RGB16 PNG with pHYs, sRGB, tEXt metadata
     scheduler/      # Tile queue, priority, progressive refinement
     wasm-bridge/    # wasm-bindgen surface — thin API only
   web/
@@ -428,8 +429,7 @@ The `simd` feature activates `wasm-simd128` intrinsics for `F64x2` hot loops (2�
 | `tileTexArray` | RGBA32F (2D Array) | 256-slot texture array; each slot = one tile |
 | `accumFBO` | RGBA32F | Full-resolution accumulation; smooth-color pass composites tiles here |
 | `lut1D` | RGBA32F (1D) | 4 096-element LUT; rebuilt when palette changes |
-| `exportFBO` | RGBA32F | Export accumulation — raw iteration data per strip; mirrors `accumFBO` format; RGBA32F preserves EXR upgrade path |
-| `exportReadbackFBO` | RGBA8 | LUT-colored strip output; source for PBO pixel readback into `OffscreenCanvas` |
+| `exportFBO` | RGBA32F | Export accumulation — raw iteration data per strip; mirrors `accumFBO` format; RGBA32F preserves EXR upgrade path and is read back directly for Rust PNG encoding |
 
 ### 6.2 Render Passes
 
@@ -476,7 +476,7 @@ Second fullscreen pass over `accumFBO`:
 
 **Pass 4 — Export (on demand)**
 
-Re-renders at target resolution into `exportFBO` (RGBA32F, strip-sized), blits through LUT into `exportReadbackFBO` (RGBA8), and reads back via `PIXEL_PACK_BUFFER` + `fenceSync` + RAF polling. Strips are stitched on an `OffscreenCanvas` and encoded to PNG or JPEG. See §12.
+Re-renders at target resolution into `exportFBO` (RGBA32F, strip-sized), reads back raw float pixels via `PIXEL_PACK_BUFFER` + `fenceSync` + RAF polling, and encodes to PNG via the Rust `encoding` crate running in a Tile Worker. See §12.
 
 ### 6.3 Progressive Refinement
 
@@ -504,7 +504,7 @@ The GPU scale step reuses the previous `accumFBO` so the user sees something coh
 | `workers.ts` | `WorkerPool` | Spawns N workers; manages `MessageChannel` ports; collects tile completions |
 | `gl-pipeline.ts` | `GlPipeline` | WebGL2 context; FBO setup; all render passes; reads tile data from shared memory via `MemoryLayout` |
 | `color-editor.ts` | `PaletteEditor` | Gradient stop UI; LUT generation; palette preset management |
-| `export.ts` | `ExportDialog`, `ExportSession`, `WorkerLease` | Resolution picker; format selector; `ExportSession` drives strip render loop via `WorkerLease`; PBO readback; `OffscreenCanvas` stitching |
+| `export.ts` | `ExportDialog`, `ExportSession`, `WorkerLease` | Resolution picker (PNG-only, DPI input, physical size hint); `ExportSession` drives strip render loop via `WorkerLease`; raw RGBA32F PBO readback; dispatches WASM `encode_png` to a Tile Worker |
 | `ui-overlay.ts` | `OverlayController` | Coordinates panel, info bar, keyboard shortcuts, Julia preview |
 
 ### 7.2 Input Handling — ZoomPanFSM
@@ -881,8 +881,7 @@ Adding a new fractal type is: one registry line + trait implementations for the 
 
 | Format | Library | Use case |
 |---|---|---|
-| PNG | `OffscreenCanvas.convertToBlob("image/png")` | Default; lossless |
-| JPEG | `OffscreenCanvas.convertToBlob("image/jpeg", quality)` | Small file; lossy; quality 50–100% |
+| PNG | `crates/encoding` (Rust, `png` 0.17) | Default; lossless; 16-bit RGB; pHYs (DPI→px/m), sRGB, tEXt metadata; encoded in a Tile Worker via WASM |
 | EXR (32-bit float) | v2 — deferred | Full HDR; preserves raw `smooth_t` for compositing. `exportFBO` is RGBA32F so no GL pipeline change is required when added. |
 
 ### 12.2 Coordinate System
@@ -907,37 +906,40 @@ interface WorkerLease {
 
 ### 12.4 Strip Rendering
 
-`exportFBO` and `exportReadbackFBO` are always sized `export_width × strip_height` where `strip_height = Math.min(gl.MAX_RENDERBUFFER_SIZE, export_height)`. All exports — including those that fit in a single strip — use the same strip code path.
+`exportFBO` is sized `export_width × strip_height` where `strip_height = Math.min(gl.MAX_RENDERBUFFER_SIZE, export_height)`. All exports — including those that fit in a single strip — use the same strip code path.
 
 `ExportSession.run()` sequences strips strictly one at a time:
 
-1. `gl.initExportFBOs(export_width, strip_height)` — allocate/resize both FBOs for this strip
+1. `gl.initExportFBOs(export_width, strip_height)` — allocate/resize `exportFBO` (RGBA32F) and PBO
 2. Dispatch all 256×256 tiles covering the strip; route completions to `gl.uploadExportTile`
-3. `gl.blitExportStrip()` — LUT coloring pass: `exportFBO` → `exportReadbackFBO`
-4. `gl.readbackStrip()` — async PBO readback:
+3. `gl.readbackRawStrip()` — async PBO readback of raw RGBA32F pixels directly from `exportFBO`:
    ```js
    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
-   gl.readPixels(0, 0, w, stripH, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+   gl.readPixels(0, 0, w, stripH, gl.RGBA, gl.FLOAT, 0);
    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-   // poll via requestAnimationFrame until getSyncParameter returns SIGNALED
+   // poll via requestAnimationFrame until SIGNALED; return Float32Array
    ```
-5. `ctx.putImageData(new ImageData(pixels, export_width, strip_height), 0, stripY)`
-6. Check `cancelled` flag; if set return `null` immediately
-7. Repeat for next strip
+4. Accumulate strip into `allRaw: Float32Array` (full image, bottom-up row order)
+5. Check `cancelled` flag; if set return `null` immediately
+6. Repeat for next strip; after final strip, transfer `allRaw` to a Tile Worker for encoding
 
 `gl.readPixels` is never called synchronously on the main thread. Progress is reported as `onProgress(tilesComplete, totalTiles)` after each tile, spanning all strips.
 
 ### 12.5 Encoding and Download
 
-After all strips are stitched into the `OffscreenCanvas`, `convertToBlob` encodes to PNG or JPEG. `ExportSession.run()` returns the `Blob`; `ExportDialog` triggers the download:
+After all strips are collected, `ExportSession` posts an `encode_png` message to `lease.workers[0]`, transferring `allRaw` (ownership, zero-copy). The Tile Worker calls `wasm.encode_png(...)` — the wasm-bridge function that constructs `ColorParams` from the flat coloring arguments, calls `encoding::encode_png`, and returns `Uint8Array` PNG bytes. The main thread receives `encode_done`, wraps the bytes in a `Blob`, and triggers the download:
 
 ```ts
 const a = document.createElement('a');
 a.href = URL.createObjectURL(blob);
-a.download = `fractal-${cx}-${zoom_exp}.${ext}`;
+a.download = `fractal-${cx}-zoom${zoom_exp}.png`;
 a.click();
 setTimeout(() => URL.revokeObjectURL(a.href), 0);
 ```
+
+**Row orientation:** GL `readPixels` returns rows bottom-up. `encoding::encode_png` iterates rows in reverse (`for row in (0..height).rev()`) so the PNG output is top-down with no intermediate allocation.
+
+**`ColoringState`:** `FractalSession` accumulates live coloring state (LUT, all shader uniform values, fractal kind) in a `coloringState` field updated on every palette callback. `ExportParams` carries this alongside `dpi`, `view`, and fractal params — the encoding side has everything it needs with no GL state reads at export time.
 
 `gl.MAX_RENDERBUFFER_SIZE` is queried once when the dialog opens; custom resolution inputs are clamped to this value with a visible warning.
 
@@ -989,7 +991,7 @@ This runs before `fetch`, so non-SIMD browsers never request the SIMD bundle. Sh
 | GL pipeline | Screenshot regression | Playwright + pixelmatch | `|Δpixel| < 2 LSB` on 8-bit for canonical zoom coordinates |
 | UI shell | Component + E2E | vitest + Playwright | FSM state transitions |
 | Export math | Unit | vitest | `computeStripHeight`, `computeStripCount`, `computeExportStep` return correct values for known inputs |
-| Export pipeline | E2E golden | Playwright | PNG at 1080p for Mandelbrot default view: `\|Δpixel\| < 2 LSB`; JPEG same coordinate: `\|Δpixel\| < 8 LSB` |
+| Export pipeline | E2E golden | Playwright | PNG at 1080p for Mandelbrot default view: `\|Δpixel\| < 2 LSB`; IHDR asserts bit depth=16, color type=2 (RGB) |
 
 ---
 
@@ -1016,7 +1018,7 @@ This runs before `fetch`, so non-SIMD browsers never request the SIMD bundle. Sh
 | 2b — Deep Zoom (v2) | Perturbation theory; BigFloat<N>; BLA; glitch correction / rebasing | `arith` (BigFloat), `kernel` (perturb, BLA), `scheduler` |
 | 3 — Newton | Newton fractal: `NewtonResult` type, Durand-Kerner root-finding, Newton params shared memory slot, HSL shader branch, preset picker (`z³−1` default) with advanced coefficient overrides, `compute_roots` wasm-bridge entry point | `kernel` (newton), `wasm-bridge` (compute_roots, newton_params_offset), `gl-pipeline.ts` (shader branch), `session.ts` (polynomial change → compute_roots → tile dispatch) |
 | 4 — Color Editor | Full palette editor, orbit trap, LUT, preset library | `coloring`, `color-editor.ts` |
-| 5 — Export | PNG / JPEG export pipeline; `WorkerLease` pause/resume; `ExportSession` strip loop; PBO readback; `OffscreenCanvas` stitching. EXR deferred to v2. | `export.ts`, `gl-pipeline.ts`, `session.ts` |
+| 5 — Export | PNG export pipeline (16-bit RGB, DPI, metadata); `ColoringState` accumulation; `WorkerLease` pause/resume; `ExportSession` strip loop; raw RGBA32F PBO readback; Rust `encode_png` via Tile Worker. EXR deferred to v2. | `crates/coloring`, `crates/encoding`, `wasm-bridge`, `export.ts`, `gl-pipeline.ts`, `session.ts` |
 | 6 — Polish | Playwright golden tests, perf regression CI, URL bookmarks, Julia preview | All |
 
 ---
