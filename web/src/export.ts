@@ -316,9 +316,13 @@ export class ExportDialog {
     });
     this.activeSession = session;
 
-    const blob = await session.run();
-    this.activeSession = null;
-    this.setRendering(false);
+    let blob: Blob | null = null;
+    try {
+      blob = await session.run();
+    } finally {
+      this.activeSession = null;
+      this.setRendering(false);
+    }
 
     if (blob) {
       const cx = parseFloat(params.view.cx).toFixed(6);
