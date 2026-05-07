@@ -3,6 +3,8 @@
 //! Calls into `crates/coloring` to apply LUT coloring to raw RGBA32F tile data,
 //! then encodes the result as a 16-bit RGB PNG with full metadata.
 
+use std::io::Write as _;
+
 use coloring::{color_pixel, ColorParams};
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -92,22 +94,28 @@ pub fn encode_png(
     // ── Pixel data ────────────────────────────────────────────────────────────
     let mut writer = encoder.write_header()?;
 
-    // Flip rows: GL bottom-up → PNG top-down.
+    // Stream one row at a time: GL bottom-up → PNG top-down.
+    // Peak allocation is one row (width × 6 bytes) rather than the full image.
     let row_floats = (width * 4) as usize;
-    let mut image_data = Vec::with_capacity(height as usize * width as usize * 6);
-    for row_idx in (0..height).rev() {
-        let row_start = row_idx as usize * row_floats;
-        for col in 0..width as usize {
-            let pi = row_start + col * 4;
-            let raw = [pixels[pi], pixels[pi + 1], pixels[pi + 2], pixels[pi + 3]];
-            let [r, g, b] = color_pixel(raw, entries, params, fractal_kind);
-            image_data.extend_from_slice(&r.to_be_bytes());
-            image_data.extend_from_slice(&g.to_be_bytes());
-            image_data.extend_from_slice(&b.to_be_bytes());
+    let mut row_buf = vec![0u8; width as usize * 6];
+    {
+        let mut stream = writer.stream_writer()?;
+        for row_idx in (0..height).rev() {
+            let row_start = row_idx as usize * row_floats;
+            for col in 0..width as usize {
+                let pi = row_start + col * 4;
+                let raw = [pixels[pi], pixels[pi + 1], pixels[pi + 2], pixels[pi + 3]];
+                let [r, g, b] = color_pixel(raw, entries, params, fractal_kind);
+                let base = col * 6;
+                row_buf[base..base + 2].copy_from_slice(&r.to_be_bytes());
+                row_buf[base + 2..base + 4].copy_from_slice(&g.to_be_bytes());
+                row_buf[base + 4..base + 6].copy_from_slice(&b.to_be_bytes());
+            }
+            stream.write_all(&row_buf)?;
         }
-    }
-    writer.write_image_data(&image_data)?;
-    drop(writer); // flushes IEND
+        stream.flush()?;
+    } // drops stream, flushing IEND back into writer
+    drop(writer);
     Ok(buf)
 }
 
