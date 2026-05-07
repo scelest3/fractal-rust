@@ -39,6 +39,8 @@ export function computeExportStep(
 export interface WorkerLease {
   workers: Worker[];
   tileSab: SharedArrayBuffer;
+  /** Terminate the worker at `index` and replace it with a freshly initialised one. */
+  replaceWorker(index: number): void;
   release(): void;
 }
 
@@ -516,9 +518,16 @@ export class ExportSession {
       const w = this.lease.workers[0];
       const cs = params.coloringState;
       w.onmessage = (e: MessageEvent) => {
-        if (e.data.type === "encode_done") resolve(e.data.bytes as Uint8Array);
-        else if (e.data.type === "encode_error") reject(new Error(`WASM encode_png failed: ${e.data.error}`));
-        else reject(new Error(`Unexpected worker message during encode: ${e.data.type}`));
+        if (e.data.type === "encode_done") {
+          resolve(e.data.bytes as Uint8Array);
+        } else if (e.data.type === "encode_error") {
+          // WASM heap is corrupted after an OOM trap — terminate and replace this
+          // worker before rejecting so release() never hands it back to the pool.
+          this.lease.replaceWorker(0);
+          reject(new Error(`WASM encode_png failed: ${e.data.error}`));
+        } else {
+          reject(new Error(`Unexpected worker message during encode: ${e.data.type}`));
+        }
       };
       const msg: EncodePngWorkerMsg = {
         type:             "encode_png",

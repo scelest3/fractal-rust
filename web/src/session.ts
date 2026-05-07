@@ -598,6 +598,20 @@ export class FractalSession {
     return {
       workers: this.workers,
       tileSab: this.tileSab,
+      replaceWorker(index: number) {
+        self.workers[index].terminate();
+        const w = new Worker(new URL("./tile-worker.ts", import.meta.url), { type: "module" });
+        w.onerror = (e) => console.error(`[FractalSession] tile worker ${index} error`, e);
+        w.postMessage({
+          type: "init",
+          wasmUrl: wasmBundleUrl(),
+          tileSab: self.tileSab,
+          orbitSab: self.orbitSab,
+          primaryOrbitDataOffset: PRIMARY_ORBIT_DATA_OFFSET,
+          blaTableOffset: blaTableOffset(MAX_ORBIT_ITER),
+        });
+        self.workers[index] = w;
+      },
       release() {
         self.workers.forEach((w, i) => {
           w.onmessage = (e: MessageEvent<WorkerInMsg>) => self.onWorkerMessage(i, e.data);
