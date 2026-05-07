@@ -23,7 +23,7 @@ import {
   type NewtonParams,
 } from "./newton.ts";
 import { NewtonPanel } from "./newton-panel.ts";
-import { ExportDialog, type WorkerLease } from "./export.ts";
+import { ExportDialog, type WorkerLease, type ColoringState } from "./export.ts";
 
 const BASE_ITER = 256;
 
@@ -140,6 +140,25 @@ export class FractalSession {
 
   private readonly exportDialog: ExportDialog;
 
+  private coloringState: ColoringState = {
+    lut:              new Float32Array(4096 * 4),
+    cycleLen:         64,
+    trapRadius:       0.5,
+    trapStrength:     0.0,
+    trapColor:        [1.0, 1.0, 0.0],
+    interiorColor:    [0.0, 0.0, 0.0],
+    shadingColor:     [1.0, 1.0, 1.0],
+    distanceStrength: 0.0,
+    distancePow:      1.0,
+    angleStrength:    0.0,
+    periodStrength:   0.0,
+    periodCycleLen:   8.0,
+    distWeight:       0.0,
+    fractalKind:      0,
+    newtonDegree:     3,
+    unresolvedColor:  [0.05, 0.05, 0.05],
+  };
+
   // Fractal kind + Newton state
   private fractalKind: "mandelbrot" | "newton" = "mandelbrot";
   private newtonParams: NewtonParams = defaultNewtonParams();
@@ -179,12 +198,17 @@ export class FractalSession {
         this.gl.uploadLut(lut);
         this.gl.setCycleLen(cycleLen);
         this.gl.blit();
+        this.coloringState.lut = lut;
+        this.coloringState.cycleLen = cycleLen;
       },
       ([r, g, b], trapRadius, trapStrength) => {
         this.gl.setTrapColor(r, g, b);
         this.gl.setTrapRadius(trapRadius);
         this.gl.setTrapStrength(trapStrength);
         this.gl.blit();
+        this.coloringState.trapColor = [r, g, b];
+        this.coloringState.trapRadius = trapRadius;
+        this.coloringState.trapStrength = trapStrength;
       },
       ([r, g, b], [sr, sg, sb], distanceStrength, distancePow, angleStrength, periodStrength) => {
         this.gl.setInteriorColor(r, g, b);
@@ -194,10 +218,17 @@ export class FractalSession {
         this.gl.setAngleStrength(angleStrength);
         this.gl.setPeriodStrength(periodStrength);
         this.gl.blit();
+        this.coloringState.interiorColor = [r, g, b];
+        this.coloringState.shadingColor = [sr, sg, sb];
+        this.coloringState.distanceStrength = distanceStrength;
+        this.coloringState.distancePow = distancePow;
+        this.coloringState.angleStrength = angleStrength;
+        this.coloringState.periodStrength = periodStrength;
       },
       (weight) => {
         this.gl.setDistWeight(weight);
         this.gl.blit();
+        this.coloringState.distWeight = weight;
       },
     );
     document.body.appendChild(this.paletteEditor.getPanel());
@@ -225,8 +256,11 @@ export class FractalSession {
     this.exportDialog = new ExportDialog(
       this.gl,
       () => this.pause(),
-      (width, height, format, quality) => ({
-        width, height, format, quality,
+      (width, height, dpi) => ({
+        width, height,
+        format: "png",
+        dpi,
+        coloringState: this.coloringState,
         view:        this.fsm.getView(),
         fractalKind: this.fractalKind,
         maxIter:     this.computeMaxIter(this.fsm.getView().zoom_exp),
@@ -256,14 +290,14 @@ export class FractalSession {
       onZoomSettled: () => this.debouncedDispatch(0),
     });
     this.fsm.setCanvasSize(canvas.width, canvas.height);
-    this.fsm.setPixelScale(this.hiDpi ? Math.min(window.devicePixelRatio ?? 1, 2) : 1);
+    this.fsm.setPixelScale(this.hiDpi ? (window.devicePixelRatio || 1) : 1);
     this.fsm.setZoomExpRange(...ZOOM_RANGES[this.fractalKind]);
     this.fsm.attach(canvas);
 
     new BoxZoom(canvas, () => this.fsm.getView(), (view) => {
       this.fsm.setView(view);
       this.scheduleDispatch();
-    }, () => this.hiDpi ? Math.min(window.devicePixelRatio ?? 1, 2) : 1);
+    }, () => this.hiDpi ? (window.devicePixelRatio || 1) : 1);
 
     const wasmUrl = wasmBundleUrl();
 
@@ -303,6 +337,7 @@ export class FractalSession {
   private switchFractalKind(kind: "mandelbrot" | "newton"): void {
     if (kind === this.fractalKind) return;
     this.fractalKind = kind;
+    this.coloringState.fractalKind = kind === "newton" ? 1 : 0;
 
     // Apply the precision-appropriate zoom range and reset zoom to 0.
     this.fsm.setZoomExpRange(...ZOOM_RANGES[kind]);
@@ -337,6 +372,7 @@ export class FractalSession {
       rootsRe: new Float64Array(degree),
       rootsIm: new Float64Array(degree),
     };
+    this.coloringState.newtonDegree = degree;
     // Ask the orbit worker to compute roots (it has WASM; main thread doesn't).
     this.orbitWorker.postMessage({
       type: "compute_roots",
@@ -420,9 +456,11 @@ export class FractalSession {
   }
 
   private buildDprToggle(canvas: HTMLCanvasElement): HTMLButtonElement {
-    const dpr = Math.min(window.devicePixelRatio ?? 1, 2);
     const btn = document.createElement("button");
-    const update = () => { btn.textContent = this.hiDpi ? `HiDPI ${dpr}×` : "HiDPI off"; };
+    const update = () => {
+      const dpr = window.devicePixelRatio || 1;
+      btn.textContent = this.hiDpi ? `HiDPI ${dpr.toFixed(1)}×` : "HiDPI off";
+    };
     update();
     Object.assign(btn.style, {
       display: "block", marginTop: "4px", cursor: "pointer",
@@ -433,7 +471,7 @@ export class FractalSession {
     });
     btn.addEventListener("click", () => {
       this.hiDpi = !this.hiDpi;
-      const scale = this.hiDpi ? dpr : 1;
+      const scale = this.hiDpi ? (window.devicePixelRatio || 1) : 1;
       canvas.width  = Math.round(window.innerWidth  * scale);
       canvas.height = Math.round(window.innerHeight * scale);
       canvas.style.width  = window.innerWidth  + "px";

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { computeStripHeight, computeStripCount, computeExportStep } from "../export.ts";
+import { computeStripHeight, computeStripCount, computeExportStep, type ColoringState } from "../export.ts";
 import { pixelStep } from "../viewport.ts";
 
 // ── computeStripHeight ────────────────────────────────────────────────────────
@@ -80,5 +80,48 @@ describe("computeExportStep", () => {
       const extent = h * computeExportStep(zoomExp, h);
       expect(extent).toBeCloseTo(4 * Math.pow(10, -zoomExp));
     }
+  });
+});
+
+// ── ColoringState defaults ────────────────────────────────────────────────────
+
+describe("ColoringState defaults", () => {
+  it("has correct default values matching GlPipeline constructor", () => {
+    const s: ColoringState = {
+      lut: new Float32Array(4096 * 4),
+      cycleLen: 64,
+      trapRadius: 0.5,
+      trapStrength: 0.0,
+      trapColor: [1, 1, 0],
+      interiorColor: [0, 0, 0],
+      shadingColor: [1, 1, 1],
+      distanceStrength: 0.0,
+      distancePow: 1.0,
+      angleStrength: 0.0,
+      periodStrength: 0.0,
+      periodCycleLen: 8.0,
+      distWeight: 0.0,
+      fractalKind: 0,
+      newtonDegree: 3,
+      unresolvedColor: [0.05, 0.05, 0.05],
+    };
+    expect(s.fractalKind).toBe(0);
+    expect(s.trapColor).toEqual([1, 1, 0]);
+    expect(s.lut.length).toBe(4096 * 4);
+    expect(s.periodCycleLen).toBe(8.0);
+    expect(s.unresolvedColor).toEqual([0.05, 0.05, 0.05]);
+  });
+});
+
+// ── Physical size hint calculation ────────────────────────────────────────────
+
+describe("physical size hint calculation", () => {
+  it.each([
+    { w: 1920, h: 1080, dpi: 300, expectedW: "6.4", expectedH: "3.6" },
+    { w: 3840, h: 2160, dpi: 300, expectedW: "12.8", expectedH: "7.2" },
+    { w: 1920, h: 1080, dpi: 72,  expectedW: "26.7", expectedH: "15.0" },
+  ])("$w×$h at $dpi DPI → $expectedW × $expectedH in", ({ w, h, dpi, expectedW, expectedH }) => {
+    expect((w / dpi).toFixed(1)).toBe(expectedW);
+    expect((h / dpi).toFixed(1)).toBe(expectedH);
   });
 });

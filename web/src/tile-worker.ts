@@ -67,7 +67,37 @@ interface RenderTileMsg {
   newton?: NewtonRenderParams;
 }
 
-type WorkerMsg = InitMsg | OrbitReadyMsg | RenderTileMsg;
+interface EncodePngMsg {
+  type: "encode_png";
+  pixels: Float32Array;
+  width: number;
+  height: number;
+  lut: Float32Array;
+  cycleLen: number;
+  trapRadius: number;
+  trapStrength: number;
+  trapColor: [number, number, number];
+  interiorColor: [number, number, number];
+  shadingColor: [number, number, number];
+  distanceStrength: number;
+  distancePow: number;
+  angleStrength: number;
+  periodStrength: number;
+  periodCycleLen: number;
+  distWeight: number;
+  fractalKind: number;
+  newtonDegree: number;
+  unresolvedColor: [number, number, number];
+  dpi: number;
+  cx: string;
+  cy: string;
+  zoomExp: number;
+  maxIter: number;
+  newtonDegreeMeta: number;
+  creationTime: string;
+}
+
+type WorkerMsg = InitMsg | OrbitReadyMsg | RenderTileMsg | EncodePngMsg;
 
 interface WasmExports {
   memory: WebAssembly.Memory;
@@ -114,6 +144,36 @@ interface WasmGlue {
     maxIter: number,
     ptr: number,
   ) => void;
+  encode_png: (
+    pixels: Float32Array,
+    width: number,
+    height: number,
+    stripYOffset: number,
+    stripHeight: number,
+    lut: Float32Array,
+    cycleLen: number,
+    trapRadius: number,
+    trapStrength: number,
+    trapColorR: number, trapColorG: number, trapColorB: number,
+    interiorColorR: number, interiorColorG: number, interiorColorB: number,
+    shadingColorR: number, shadingColorG: number, shadingColorB: number,
+    distanceStrength: number,
+    distancePow: number,
+    angleStrength: number,
+    periodStrength: number,
+    periodCycleLen: number,
+    distWeight: number,
+    fractalKind: number,
+    newtonDegree: number,
+    unresolvedColorR: number, unresolvedColorG: number, unresolvedColorB: number,
+    dpi: number,
+    cx: string,
+    cy: string,
+    zoomExp: number,
+    maxIter: number,
+    newtonDegreeMeta: number,
+    creationTime: string,
+  ) => Uint8Array;
 }
 
 let wasm: WasmExports | null = null;
@@ -133,6 +193,8 @@ self.onmessage = async (event: MessageEvent<WorkerMsg>) => {
     handleOrbitReady(msg);
   } else if (msg.type === "render_tile") {
     handleRenderTile(msg);
+  } else if (msg.type === "encode_png") {
+    handleEncodePng(msg);
   }
 };
 
@@ -218,4 +280,44 @@ function handleRenderTile(msg: RenderTileMsg): void {
     tileY,
     generation,
   });
+}
+
+function handleEncodePng(msg: EncodePngMsg): void {
+  if (!glueModule) {
+    (self as unknown as Worker).postMessage({ type: "encode_error", error: "encode_png called before init" });
+    return;
+  }
+  try {
+    const [tr, tg, tb] = msg.trapColor;
+    const [ir, ig, ib] = msg.interiorColor;
+    const [sr, sg, sb] = msg.shadingColor;
+    const [ur, ug, ub] = msg.unresolvedColor;
+
+    const bytes = glueModule.encode_png(
+      msg.pixels, msg.width, msg.height,
+      0, msg.height,
+      msg.lut,
+      msg.cycleLen,
+      msg.trapRadius, msg.trapStrength,
+      tr, tg, tb,
+      ir, ig, ib,
+      sr, sg, sb,
+      msg.distanceStrength, msg.distancePow,
+      msg.angleStrength,
+      msg.periodStrength, msg.periodCycleLen,
+      msg.distWeight,
+      msg.fractalKind,
+      msg.newtonDegree,
+      ur, ug, ub,
+      msg.dpi,
+      msg.cx, msg.cy, msg.zoomExp,
+      msg.maxIter,
+      msg.newtonDegreeMeta,
+      msg.creationTime,
+    );
+    (self as unknown as Worker).postMessage({ type: "encode_done", bytes }, [bytes.buffer]);
+  } catch (e) {
+    console.error("[TileWorker] encode_png failed:", e);
+    (self as unknown as Worker).postMessage({ type: "encode_error", error: String(e) });
+  }
 }

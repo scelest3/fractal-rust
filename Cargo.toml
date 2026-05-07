@@ -4,6 +4,7 @@ members = [
     "crates/arith",
     "crates/kernel",
     "crates/coloring",
+    "crates/encoding",
     "crates/scheduler",
     "crates/wasm-bridge",
 ]

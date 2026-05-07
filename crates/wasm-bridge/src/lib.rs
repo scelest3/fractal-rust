@@ -4,6 +4,8 @@
 //! lives in the inner crates. Full implementation across Phases 0–5.
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
+use coloring::ColorParams;
+use encoding::PngMetadata;
 
 // ── Memory layout constants ────────────────────────────────────────────────
 
@@ -795,4 +797,69 @@ mod tests {
         let (_, _, degree) = compute_roots_inner(&coeffs);
         assert_eq!(degree, 10);
     }
+}
+
+// ── PNG export ────────────────────────────────────────────────────────────────
+
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_png(
+    pixels: &[f32],
+    width: u32,
+    height: u32,
+    strip_y_offset: u32,
+    strip_height: u32,
+    lut: &[f32],
+    cycle_len: f32,
+    trap_radius: f32,
+    trap_strength: f32,
+    trap_color_r: f32, trap_color_g: f32, trap_color_b: f32,
+    interior_color_r: f32, interior_color_g: f32, interior_color_b: f32,
+    shading_color_r: f32, shading_color_g: f32, shading_color_b: f32,
+    distance_strength: f32,
+    distance_pow: f32,
+    angle_strength: f32,
+    period_strength: f32,
+    period_cycle_len: f32,
+    dist_weight: f32,
+    fractal_kind: u32,
+    newton_degree: u32,
+    unresolved_color_r: f32, unresolved_color_g: f32, unresolved_color_b: f32,
+    dpi: u32,
+    cx: &str,
+    cy: &str,
+    zoom_exp: f64,
+    max_iter: u32,
+    newton_degree_meta: i32,
+    creation_time: &str,
+) -> Result<Vec<u8>, JsValue> {
+    let _ = (strip_y_offset, strip_height); // reserved for future stateful API
+    let params = ColorParams {
+        cycle_len,
+        trap_radius,
+        trap_strength,
+        trap_color:       [trap_color_r,       trap_color_g,       trap_color_b],
+        interior_color:   [interior_color_r,   interior_color_g,   interior_color_b],
+        shading_color:    [shading_color_r,    shading_color_g,    shading_color_b],
+        distance_strength,
+        distance_pow,
+        angle_strength,
+        period_strength,
+        period_cycle_len,
+        dist_weight,
+        newton_degree,
+        unresolved_color: [unresolved_color_r, unresolved_color_g, unresolved_color_b],
+    };
+    let meta = PngMetadata {
+        dpi,
+        cx,
+        cy,
+        zoom_exp,
+        fractal_kind: if fractal_kind == 1 { "newton" } else { "mandelbrot" },
+        max_iter,
+        newton_degree: if newton_degree_meta >= 0 { Some(newton_degree_meta as u32) } else { None },
+        creation_time: if creation_time.is_empty() { None } else { Some(creation_time) },
+    };
+    encoding::encode_png(pixels, width, height, lut, &params, fractal_kind, &meta)
+        .map_err(|e| JsValue::from_str(&format!("{e:?}")))
 }

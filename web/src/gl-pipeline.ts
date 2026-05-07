@@ -122,8 +122,6 @@ export class GlPipeline {
   // Export FBOs — allocated lazily on first export
   private exportAccumTexture:    WebGLTexture | null = null;
   private exportAccumFBO:        WebGLFramebuffer | null = null;
-  private exportReadbackTexture: WebGLTexture | null = null;
-  private exportReadbackFBO:     WebGLFramebuffer | null = null;
   private exportPbo:             WebGLBuffer | null = null;
   private exportWidth  = 0;
   private exportStripH = 0;
@@ -432,11 +430,9 @@ export class GlPipeline {
     if (this.exportWidth === width && this.exportStripH === stripHeight) return;
 
     // Clean up old resources
-    if (this.exportAccumFBO)        gl.deleteFramebuffer(this.exportAccumFBO);
-    if (this.exportAccumTexture)    gl.deleteTexture(this.exportAccumTexture);
-    if (this.exportReadbackFBO)     gl.deleteFramebuffer(this.exportReadbackFBO);
-    if (this.exportReadbackTexture) gl.deleteTexture(this.exportReadbackTexture);
-    if (this.exportPbo)             gl.deleteBuffer(this.exportPbo);
+    if (this.exportAccumFBO)     gl.deleteFramebuffer(this.exportAccumFBO);
+    if (this.exportAccumTexture) gl.deleteTexture(this.exportAccumTexture);
+    if (this.exportPbo)          gl.deleteBuffer(this.exportPbo);
 
     // RGBA32F accumulation texture + FBO
     this.exportAccumTexture = this.makeTexture(gl.NEAREST);
@@ -446,18 +442,10 @@ export class GlPipeline {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.exportAccumTexture, 0);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-    // RGBA8 readback texture + FBO
-    this.exportReadbackTexture = this.makeTexture(gl.NEAREST);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, stripHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    this.exportReadbackFBO = gl.createFramebuffer()!;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.exportReadbackFBO);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.exportReadbackTexture, 0);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-    // PIXEL_PACK_BUFFER for async readback
+    // PIXEL_PACK_BUFFER for async RGBA32F readback (4 floats × 4 bytes per pixel)
     this.exportPbo = gl.createBuffer()!;
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.exportPbo);
-    gl.bufferData(gl.PIXEL_PACK_BUFFER, width * stripHeight * 4, gl.STREAM_READ);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, width * stripHeight * 4 * 4, gl.STREAM_READ);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
 
     this.exportWidth  = width;
@@ -509,34 +497,18 @@ export class GlPipeline {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
-  /** Apply LUT coloring to the export accumFBO and write into the RGBA8 readback FBO. */
-  blitExportStrip(): void {
-    const { gl } = this;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.exportReadbackFBO);
-    gl.viewport(0, 0, this.exportWidth, this.exportStripH);
-    gl.useProgram(this.blitProgram);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.exportAccumTexture);
-    gl.uniform1i(this.uAccum, 0);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
-    gl.uniform1i(this.uLut, 1);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  }
-
   /**
-   * Async pixel readback from the export readback FBO.
+   * Async raw RGBA32F pixel readback directly from the export accumFBO.
    * Uses PIXEL_PACK_BUFFER + fenceSync + RAF polling — never blocks the main thread.
-   * Returns RGBA bytes in bottom-up row order (caller must flip for ImageData).
+   * Returns float pixels in bottom-up row order (GL native).
    */
-  async readbackStrip(): Promise<Uint8Array> {
+  async readbackRawStrip(): Promise<Float32Array> {
     const { gl } = this;
-    const byteLen = this.exportWidth * this.exportStripH * 4;
+    const floatLen = this.exportWidth * this.exportStripH * 4;
 
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.exportReadbackFBO);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.exportAccumFBO);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.exportPbo);
-    gl.readPixels(0, 0, this.exportWidth, this.exportStripH, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+    gl.readPixels(0, 0, this.exportWidth, this.exportStripH, gl.RGBA, gl.FLOAT, 0);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
@@ -556,7 +528,7 @@ export class GlPipeline {
     });
     gl.deleteSync(fence);
 
-    const pixels = new Uint8Array(byteLen);
+    const pixels = new Float32Array(floatLen);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.exportPbo);
     gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, pixels);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);

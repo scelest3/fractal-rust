@@ -2,7 +2,7 @@ import { FractalSession } from "./session.ts";
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
 // Start at HiDPI if the display supports it; the session toggle can drop to 1×.
-const dpr = Math.min(window.devicePixelRatio ?? 1, 2);
+const dpr = window.devicePixelRatio || 1;
 canvas.width  = Math.round(window.innerWidth  * dpr);
 canvas.height = Math.round(window.innerHeight * dpr);
 if (dpr !== 1) {

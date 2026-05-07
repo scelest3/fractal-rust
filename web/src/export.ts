@@ -42,12 +42,31 @@ export interface WorkerLease {
   release(): void;
 }
 
+export interface ColoringState {
+  lut: Float32Array;
+  cycleLen: number;
+  trapRadius: number;
+  trapStrength: number;
+  trapColor: [number, number, number];
+  interiorColor: [number, number, number];
+  shadingColor: [number, number, number];
+  distanceStrength: number;
+  distancePow: number;
+  angleStrength: number;
+  periodStrength: number;
+  periodCycleLen: number;
+  distWeight: number;
+  fractalKind: 0 | 1;
+  newtonDegree: number;
+  unresolvedColor: [number, number, number];
+}
+
 export interface ExportParams {
   width: number;
   height: number;
-  format: "png" | "jpeg";
-  /** JPEG quality 50–100 (ignored for PNG). */
-  quality: number;
+  format: "png";
+  dpi: number;
+  coloringState: ColoringState;
   view: { cx: string; cy: string; zoom_exp: number };
   fractalKind: "mandelbrot" | "newton";
   maxIter: number;
@@ -69,8 +88,7 @@ const PRESETS = [
 type BuildParams = (
   width: number,
   height: number,
-  format: "png" | "jpeg",
-  quality: number,
+  dpi: number,
 ) => ExportParams;
 
 /**
@@ -81,9 +99,7 @@ export class ExportDialog {
   private readonly dialog: HTMLDialogElement;
   private readonly widthInput: HTMLInputElement;
   private readonly heightInput: HTMLInputElement;
-  private readonly qualitySlider: HTMLInputElement;
-  private readonly qualityLabel: HTMLSpanElement;
-  private readonly qualityRow: HTMLDivElement;
+  private readonly dpiInput: HTMLInputElement;
   private readonly sizeHint: HTMLSpanElement;
   private readonly progressBar: HTMLProgressElement;
   private readonly progressRow: HTMLDivElement;
@@ -91,7 +107,6 @@ export class ExportDialog {
   private readonly cancelBtn: HTMLButtonElement;
   private readonly warningEl: HTMLSpanElement;
 
-  private formatRadios: HTMLInputElement[] = [];
   private presetRadios: HTMLInputElement[] = [];
   private activeSession: ExportSession | null = null;
   private maxRbs = 16384;
@@ -174,57 +189,21 @@ export class ExportDialog {
       });
     }
 
-    // ── Format ────────────────────────────────────────────────────────────────
-    const fmtLabel = document.createElement("div");
-    fmtLabel.textContent = "Format";
-    fmtLabel.style.cssText = "margin:10px 0 6px;color:#aaa;";
-    this.dialog.appendChild(fmtLabel);
+    // ── DPI ───────────────────────────────────────────────────────────────────
+    const dpiLabel = document.createElement("div");
+    dpiLabel.textContent = "DPI";
+    dpiLabel.style.cssText = "margin:10px 0 6px;color:#aaa;";
+    this.dialog.appendChild(dpiLabel);
 
-    const fmtRow = document.createElement("div");
-    fmtRow.style.cssText = "display:flex;gap:12px;margin-bottom:8px;";
-
-    this.formatRadios = [];
-    for (const fmt of ["PNG", "JPEG"] as const) {
-      const { radio, wrapper } = this.makeRadioWidget("format", fmt, fmt.toLowerCase());
-      this.formatRadios.push(radio);
-      radio.addEventListener("change", () => {
-        this.qualityRow.style.display = radio.value === "jpeg" && radio.checked ? "flex" : "none";
-        if (radio.value === "png" && radio.checked) this.qualityRow.style.display = "none";
-        this.updateSizeHint();
-      });
-      fmtRow.appendChild(wrapper);
-    }
-    this.formatRadios[0].checked = true; // PNG default
-    this.dialog.appendChild(fmtRow);
-
-    // ── JPEG quality ──────────────────────────────────────────────────────────
-    this.qualityRow = document.createElement("div");
-    this.qualityRow.style.cssText = "display:none;align-items:center;gap:8px;margin-bottom:8px;";
-
-    const qLabel = document.createElement("label");
-    qLabel.textContent = "Quality";
-    qLabel.style.color = "#aaa";
-
-    this.qualitySlider = document.createElement("input");
-    this.qualitySlider.type = "range";
-    this.qualitySlider.min = "50";
-    this.qualitySlider.max = "100";
-    this.qualitySlider.value = "90";
-    this.qualitySlider.setAttribute("aria-label", "JPEG quality");
-    this.qualitySlider.style.flex = "1";
-    this.qualitySlider.addEventListener("input", () => {
-      this.qualityLabel.textContent = `${this.qualitySlider.value}%`;
-      this.updateSizeHint();
-    });
-
-    this.qualityLabel = document.createElement("span");
-    this.qualityLabel.textContent = "90%";
-    this.qualityLabel.style.cssText = "width:36px;text-align:right;";
-
-    this.qualityRow.appendChild(qLabel);
-    this.qualityRow.appendChild(this.qualitySlider);
-    this.qualityRow.appendChild(this.qualityLabel);
-    this.dialog.appendChild(this.qualityRow);
+    this.dpiInput = document.createElement("input");
+    this.dpiInput.type = "number";
+    this.dpiInput.min = "72";
+    this.dpiInput.max = "1200";
+    this.dpiInput.value = "300";
+    this.dpiInput.style.cssText = "width:80px;background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:4px;padding:4px 6px;font-family:monospace;font-size:13px;";
+    this.dpiInput.setAttribute("aria-label", "DPI");
+    this.dpiInput.addEventListener("input", () => this.updateSizeHint());
+    this.dialog.appendChild(this.dpiInput);
 
     // ── Size hint ─────────────────────────────────────────────────────────────
     this.sizeHint = document.createElement("span");
@@ -316,27 +295,22 @@ export class ExportDialog {
   private updateSizeHint(): void {
     const w = parseInt(this.widthInput.value, 10) || 0;
     const h = parseInt(this.heightInput.value, 10) || 0;
-    const fmt = this.selectedFormat();
-    const bytes = fmt === "jpeg" ? w * h * 3 : w * h * 4;
-    const mb = (bytes / 1024 / 1024).toFixed(1);
-    this.sizeHint.textContent = `Estimated size: ~${mb} MB`;
-  }
-
-  private selectedFormat(): "png" | "jpeg" {
-    return (this.formatRadios.find(r => r.checked)?.value ?? "png") as "png" | "jpeg";
+    const dpi = parseInt(this.dpiInput.value, 10) || 300;
+    const inW = (w / dpi).toFixed(1);
+    const inH = (h / dpi).toFixed(1);
+    this.sizeHint.textContent = `→ ${inW} × ${inH} in at ${dpi} DPI`;
   }
 
   private async handleExport(): Promise<void> {
     const w = Math.max(1, Math.min(this.maxRbs, parseInt(this.widthInput.value, 10) || 1920));
     const h = Math.max(1, Math.min(this.maxRbs, parseInt(this.heightInput.value, 10) || 1080));
-    const format = this.selectedFormat();
-    const quality = parseInt(this.qualitySlider.value, 10);
+    const dpi = Math.max(72, Math.min(1200, parseInt(this.dpiInput.value, 10) || 300));
 
     this.setRendering(true);
     this.progressBar.value = 0;
 
     const lease = this.acquireLease();
-    const params = this.buildParams(w, h, format, quality);
+    const params = this.buildParams(w, h, dpi);
     const session = new ExportSession(lease, this.gl, params, (done, total) => {
       this.progressBar.value = Math.round((done / total) * 100);
     });
@@ -347,13 +321,12 @@ export class ExportDialog {
     this.setRendering(false);
 
     if (blob) {
-      const ext = format === "jpeg" ? "jpg" : "png";
       const cx = parseFloat(params.view.cx).toFixed(6);
       const zoom = params.view.zoom_exp.toFixed(2);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `fractal-${cx}-zoom${zoom}.${ext}`;
+      a.download = `fractal-${cx}-zoom${zoom}.png`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 0);
       this.dialog.close();
@@ -420,21 +393,38 @@ export class ExportDialog {
 // ── ExportSession ─────────────────────────────────────────────────────────────
 
 const TILE = 256;
-const TILE_SLOT_BYTES = TILE * TILE * 4 * 4; // 1 MiB per slot
-
-function flipRows(pixels: Uint8Array, width: number, height: number): Uint8ClampedArray {
-  const rowBytes = width * 4;
-  const out = new Uint8ClampedArray(pixels.length);
-  for (let y = 0; y < height; y++) {
-    out.set(
-      pixels.subarray((height - 1 - y) * rowBytes, (height - y) * rowBytes),
-      y * rowBytes,
-    );
-  }
-  return out;
-}
 
 type TileReadyMsg = { type: "tile_ready"; slotIndex: number; tileX: number; tileY: number; generation: number };
+
+interface EncodePngWorkerMsg {
+  type: "encode_png";
+  pixels: Float32Array;
+  width: number;
+  height: number;
+  lut: Float32Array;
+  cycleLen: number;
+  trapRadius: number;
+  trapStrength: number;
+  trapColor: [number, number, number];
+  interiorColor: [number, number, number];
+  shadingColor: [number, number, number];
+  distanceStrength: number;
+  distancePow: number;
+  angleStrength: number;
+  periodStrength: number;
+  periodCycleLen: number;
+  distWeight: number;
+  fractalKind: number;
+  newtonDegree: number;
+  unresolvedColor: [number, number, number];
+  dpi: number;
+  cx: string;
+  cy: string;
+  zoomExp: number;
+  maxIter: number;
+  newtonDegreeMeta: number;
+  creationTime: string;
+}
 
 /**
  * Renders an export image using the leased worker pool and GL pipeline.
@@ -468,11 +458,8 @@ export class ExportSession {
 
     const maxRbs = gl.getMaxRenderbufferSize();
     const stripHeight = computeStripHeight(height, maxRbs);
-    const stripCount = computeStripCount(height, stripHeight);
-    const step = computeExportStep(params.view.zoom_exp, height);
-
-    const offscreen = new OffscreenCanvas(width, height);
-    const ctx = offscreen.getContext("2d")!;
+    const stripCount  = computeStripCount(height, stripHeight);
+    const step        = computeExportStep(params.view.zoom_exp, height);
 
     gl.initExportFBOs(width, stripHeight);
     gl.setFractalKind(params.fractalKind === "newton" ? 1 : 0);
@@ -483,39 +470,85 @@ export class ExportSession {
     const tilesX = Math.ceil(width / TILE);
     let totalTiles = 0;
     for (let s = 0; s < stripCount; s++) {
-      const stripY = s * stripHeight;
-      const actualH = Math.min(stripHeight, height - stripY);
+      const actualH = Math.min(stripHeight, height - s * stripHeight);
       totalTiles += tilesX * Math.ceil(actualH / TILE);
     }
     let doneTiles = 0;
 
+    // Collect all strips into one bottom-up RGBA32F buffer (GL native row order).
+    const allRaw = new Float32Array(width * height * 4);
+
     for (let s = 0; s < stripCount; s++) {
       if (this.cancelled) return null;
 
-      const stripY = s * stripHeight;
+      const stripY  = s * stripHeight;
       const actualH = Math.min(stripHeight, height - stripY);
-      const tilesY = Math.ceil(actualH / TILE);
+      const tilesY  = Math.ceil(actualH / TILE);
 
       gl.clearExportFBO();
       await this.renderStrip(stripY, tilesX, tilesY, step, doneTiles, totalTiles);
       doneTiles += tilesX * tilesY;
 
       if (this.cancelled) return null;
-      gl.blitExportStrip();
+      const raw = await gl.readbackRawStrip();
 
       if (this.cancelled) return null;
-      const pixels = await gl.readbackStrip();
-
-      if (this.cancelled) return null;
-      const flipped = flipRows(pixels, width, actualH);
-      ctx.putImageData(new ImageData(flipped, width, actualH), 0, stripY);
+      allRaw.set(raw, stripY * width * 4);
     }
 
-    return offscreen.convertToBlob(
-      params.format === "jpeg"
-        ? { type: "image/jpeg", quality: params.quality / 100 }
-        : { type: "image/png" },
-    );
+    if (this.cancelled) return null;
+
+    const pngBytes = await this.encodePng(allRaw, width, height, params);
+    return new Blob([pngBytes.buffer as ArrayBuffer], { type: "image/png" });
+  }
+
+  private encodePng(
+    raw: Float32Array,
+    width: number,
+    height: number,
+    params: ExportParams,
+  ): Promise<Uint8Array> {
+    return new Promise((resolve, reject) => {
+      const w = this.lease.workers[0];
+      const cs = params.coloringState;
+      w.onmessage = (e: MessageEvent) => {
+        if (e.data.type === "encode_done") resolve(e.data.bytes as Uint8Array);
+        else if (e.data.type === "encode_error") reject(new Error(`WASM encode_png failed: ${e.data.error}`));
+        else reject(new Error(`Unexpected worker message during encode: ${e.data.type}`));
+      };
+      const msg: EncodePngWorkerMsg = {
+        type:             "encode_png",
+        pixels:           raw,
+        width,
+        height,
+        lut:              cs.lut,
+        cycleLen:         cs.cycleLen,
+        trapRadius:       cs.trapRadius,
+        trapStrength:     cs.trapStrength,
+        trapColor:        cs.trapColor,
+        interiorColor:    cs.interiorColor,
+        shadingColor:     cs.shadingColor,
+        distanceStrength: cs.distanceStrength,
+        distancePow:      cs.distancePow,
+        angleStrength:    cs.angleStrength,
+        periodStrength:   cs.periodStrength,
+        periodCycleLen:   cs.periodCycleLen,
+        distWeight:       cs.distWeight,
+        fractalKind:      cs.fractalKind,
+        newtonDegree:     cs.newtonDegree,
+        unresolvedColor:  cs.unresolvedColor,
+        dpi:              params.dpi,
+        cx:               params.view.cx,
+        cy:               params.view.cy,
+        zoomExp:          params.view.zoom_exp,
+        maxIter:          params.maxIter,
+        newtonDegreeMeta: params.fractalKind === "newton" && params.newton
+                          ? params.newton.degree : -1,
+        creationTime:     new Date().toISOString(),
+      };
+      // Transfer pixel buffer — avoids copying the full RGBA32F frame across the boundary.
+      w.postMessage(msg, [raw.buffer]);
+    });
   }
 
   private renderStrip(

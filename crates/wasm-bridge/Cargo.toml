@@ -10,6 +10,8 @@ crate-type = ["cdylib", "rlib"]
 wasm-bindgen = "0.2"
 arith        = { path = "../arith" }
 kernel       = { path = "../kernel" }
+coloring     = { path = "../coloring" }
+encoding     = { path = "../encoding" }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
