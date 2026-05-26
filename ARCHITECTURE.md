@@ -51,7 +51,7 @@ Browser-based, high-resolution fractal explorer targeting sustained 60 fps inter
 - Smooth ≥ 60 fps pan / zoom via progressive tile streaming
 - PNG image export at user-defined resolution (up to 16K × 16K), 16-bit RGB, with DPI metadata; EXR is v2
 - Interactive color palette editor (gradient stops, iteration-space mapping, orbit-trap overlay)
-- Julia set live preview linked to Mandelbrot pointer position
+- Julia set as a new fractal type with configurable parameter `c`; Mandelbrot hover preview (pointer position drives Julia `c`) follows as a second step
 - Newton fractal with configurable polynomial and root coloring
 - Web Worker offload — main thread never blocked
 
@@ -792,6 +792,7 @@ The `RefOrbitEntry` associated type on `PerturbationSupport` determines the stri
 | Fractal | Perturbation? | Notes |
 |---|---|---|
 | Mandelbrot z²+c | Yes | Reference implementation |
+| Julia z²+c | No (v1) | Fixed `c` parameter; pixel coord is `z₀`. Same escape-time math as Mandelbrot; perturbation not needed for the live-preview use case (f64 sufficient). Phase 7. |
 | Multibrot zⁿ+c | Yes | Same perturbation eq; different exponent |
 | Burning Ship | Yes (modified) | Abs-value folds change the perturbation equation; `RefState` must expose sign bits |
 | Tricorn / Mandelbar | Partial | Conjugate complicates BLA |
@@ -1006,6 +1007,8 @@ This runs before `fetch`, so non-SIMD browsers never request the SIMD bundle. Sh
 | Reference orbit (10 000 iter, BigFloat<4>) | < 500 ms | cargo-criterion |
 | 4K PNG export (3840 × 2160) | < 10 s | export.ts timing |
 
+> **Note:** `cargo-criterion` CI regression gating (blocking builds on > 10% perf regression) is deferred to v2. Benchmarks remain runnable locally; they do not gate CI in v1.
+
 ---
 
 ## 16. Phased Roadmap
@@ -1019,7 +1022,8 @@ This runs before `fetch`, so non-SIMD browsers never request the SIMD bundle. Sh
 | 3 — Newton | Newton fractal: `NewtonResult` type, Durand-Kerner root-finding, Newton params shared memory slot, HSL shader branch, preset picker (`z³−1` default) with advanced coefficient overrides, `compute_roots` wasm-bridge entry point | `kernel` (newton), `wasm-bridge` (compute_roots, newton_params_offset), `gl-pipeline.ts` (shader branch), `session.ts` (polynomial change → compute_roots → tile dispatch) |
 | 4 — Color Editor | Full palette editor, orbit trap, LUT, preset library | `coloring`, `color-editor.ts` |
 | 5 — Export | PNG export pipeline (16-bit RGB, DPI, metadata); `ColoringState` accumulation; `WorkerLease` pause/resume; `ExportSession` strip loop; raw RGBA32F PBO readback; Rust `encode_png` via Tile Worker. EXR deferred to v2. | `crates/coloring`, `crates/encoding`, `wasm-bridge`, `export.ts`, `gl-pipeline.ts`, `session.ts` |
-| 6 — Polish | Playwright golden tests, perf regression CI, URL bookmarks, Julia preview | All |
+| 6 — Polish | UI polish pass (layout, spacing, accessibility, keyboard shortcut discoverability); URL bookmark support for Mandelbrot view state (Newton already done — tracked as GitHub issue); Playwright golden tests at specific Mandelbrot coordinates with known escape counts | `web/src/`, `web/e2e/` |
+| 7 — Julia | Julia set as a new fractal type: `IterationMap` impl, parameter `c` picker in UI, `FractalKind::Julia` registration. Second step: Mandelbrot hover preview — pointer position over the Mandelbrot canvas drives the Julia `c` parameter in real time | `kernel` (julia map), `coloring`, `wasm-bridge`, `web/src/ui-overlay.ts`, `web/src/session.ts` |
 
 ---
 

@@ -20,6 +20,9 @@ pub struct ColorParams {
     pub dist_weight: f32,
     pub newton_degree: u32,
     pub unresolved_color: [f32; 3],
+    pub newton_color_mode: u32,  // 0=basin+convergence, 1=convergence only, 2=basin only
+    pub newton_phase: f32,       // 0..1
+    pub newton_smooth: bool,
 }
 
 /// Color one raw pixel, returning RGB16 (no alpha).
@@ -44,8 +47,22 @@ fn shade(raw: [f32; 4], lut: &[[f32; 4]], p: &ColorParams, fractal_kind: u32) ->
         if raw[3] < 0.5 {
             return p.unresolved_color;
         }
-        let hue = (raw[2] / p.newton_degree as f32) * 360.0;
-        return hsl_to_rgb(hue, 0.85, 0.55);
+        let iter = raw[0];
+        let smooth_iter = if p.newton_smooth {
+            // raw[1] = ln|p(z_N)|; ln(CONVERGENCE_EPS=1e-6) ≈ -13.8155
+            // Newton has quadratic convergence → log2 correction term
+            iter + 1.0 - (raw[1] / -13.8155_f32).log2()
+        } else {
+            iter
+        };
+        let speed_t = glsl_fract(smooth_iter / p.cycle_len);
+        let basin_t = raw[2] / p.newton_degree as f32;
+        let t = match p.newton_color_mode {
+            0 => glsl_fract(p.newton_phase + basin_t + speed_t),
+            1 => glsl_fract(p.newton_phase + speed_t),
+            _ => glsl_fract(p.newton_phase + basin_t),
+        };
+        return sample_lut(lut, t);
     }
 
     // Path 2 — Interior Mandelbrot
@@ -81,20 +98,6 @@ fn sample_lut(lut: &[[f32; 4]], t: f32) -> [f32; 3] {
     ]
 }
 
-/// HSL → RGB matching the GLSL implementation in gl-pipeline.ts:57–68.
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let x = c * (1.0 - (glsl_mod(h / 60.0, 2.0) - 1.0).abs());
-    let m = l - c * 0.5;
-    let (r, g, b) = if      h < 60.0  { (c, x, 0.0) }
-                    else if h < 120.0 { (x, c, 0.0) }
-                    else if h < 180.0 { (0.0, c, x) }
-                    else if h < 240.0 { (0.0, x, c) }
-                    else if h < 300.0 { (x, 0.0, c) }
-                    else              { (c, 0.0, x) };
-    [r + m, g + m, b + m]
-}
-
 fn to_u16(f: f32) -> u16 {
     (clamp(f, 0.0, 1.0) * 65535.0).round() as u16
 }
@@ -102,11 +105,6 @@ fn to_u16(f: f32) -> u16 {
 /// GLSL fract: always returns value in [0, 1) regardless of sign.
 fn glsl_fract(x: f32) -> f32 {
     x - x.floor()
-}
-
-/// GLSL mod: always same sign as y (matches GLSL, differs from Rust's % operator).
-fn glsl_mod(x: f32, y: f32) -> f32 {
-    x - y * (x / y).floor()
 }
 
 fn clamp(x: f32, lo: f32, hi: f32) -> f32 {
@@ -151,6 +149,9 @@ mod tests {
             dist_weight: 0.0,
             newton_degree: 3,
             unresolved_color: [0.05, 0.05, 0.05],
+            newton_color_mode: 0,
+            newton_phase: 0.0,
+            newton_smooth: false,
         }
     }
 
@@ -217,38 +218,60 @@ mod tests {
     }
 
     #[test]
-    fn newton_converged_root_zero() {
-        let lut = flat_lut(0.0, 0.0, 0.0);
-        let raw = [3.0, 0.0, 0.0, 1.0]; // root_index=0, newton_degree=3 → hue=0°
-        let [r, g, b] = color_pixel(raw, &lut, &default_params(), 1);
-        // hsl_to_rgb(0°, 0.85, 0.55): h=0 → sextant 0 → (c, x, 0)+m
-        // c = (1-|2*0.55-1|)*0.85 = (1-0.1)*0.85 = 0.765
-        // x = 0.765*(1-|mod(0/60,2)-1|) = 0.765*(1-1) = 0.0
-        // m = 0.55 - 0.765/2 = 0.55 - 0.3825 = 0.1675
-        // rgb = [0.765+0.1675, 0.0+0.1675, 0.0+0.1675] = [0.9325, 0.1675, 0.1675]
-        assert_eq!(r, to_u16(0.9325));
-        assert_eq!(g, to_u16(0.1675));
-        assert_eq!(b, to_u16(0.1675));
-    }
-
-    // ── hsl_to_rgb ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn hsl_to_rgb_green_sextant() {
-        // hue=120° → pure green sextant (x, c, 0) + m
-        let [r, g, b] = hsl_to_rgb(120.0, 1.0, 0.5);
-        assert!((r - 0.0).abs() < 1e-5, "r={r}");
-        assert!((g - 1.0).abs() < 1e-5, "g={g}");
-        assert!((b - 0.0).abs() < 1e-5, "b={b}");
+    fn newton_basin_only_root_zero_samples_lut_start() {
+        let lut = flat_lut(1.0, 0.0, 0.0); // solid red
+        let params = ColorParams { newton_color_mode: 2, ..default_params() };
+        // root_index=0, degree=3 → basin_t=0 → t=0 → LUT start → red
+        let raw = [3.0, -14.0, 0.0, 1.0];
+        let [r, g, b] = color_pixel(raw, &lut, &params, 1);
+        assert_eq!(r, 65535);
+        assert_eq!(g, 0);
+        assert_eq!(b, 0);
     }
 
     #[test]
-    fn hsl_to_rgb_blue_sextant() {
-        // hue=240° → pure blue
-        let [r, g, b] = hsl_to_rgb(240.0, 1.0, 0.5);
-        assert!((r - 0.0).abs() < 1e-5, "r={r}");
-        assert!((g - 0.0).abs() < 1e-5, "g={g}");
-        assert!((b - 1.0).abs() < 1e-5, "b={b}");
+    fn newton_basin_only_distinct_roots() {
+        // A solid-green LUT still produces green for root 1 (any basin_t → same color)
+        let lut = flat_lut(0.0, 1.0, 0.0);
+        let params = ColorParams { newton_color_mode: 2, ..default_params() };
+        let raw = [0.0, -14.0, 1.0, 1.0]; // root_index=1
+        let [r, g, b] = color_pixel(raw, &lut, &params, 1);
+        assert_eq!(g, 65535);
+        assert_eq!(r, 0);
+        assert_eq!(b, 0);
+    }
+
+    #[test]
+    fn newton_convergence_only_uses_speed() {
+        // A solid-blue LUT: convergence-only mode still samples blue regardless of root
+        let lut = flat_lut(0.0, 0.0, 1.0);
+        let params = ColorParams { newton_color_mode: 1, ..default_params() };
+        let raw = [0.0, -14.0, 2.0, 1.0]; // root_index=2, iter=0 → speed_t=0
+        let [r, g, b] = color_pixel(raw, &lut, &params, 1);
+        assert_eq!(b, 65535);
+        assert_eq!(r, 0);
+        assert_eq!(g, 0);
+    }
+
+    #[test]
+    fn newton_phase_shifts_lut_position() {
+        // Phase=0.75, basin-only, root_index=0 → t=fract(0.75+0)=0.75 → well into second half.
+        // Two-tone LUT: first 3/4 red, last 1/4 blue.
+        let mut lut = [[0.0f32; 4]; 4096];
+        for i in 0..3072 { lut[i] = [1.0, 0.0, 0.0, 1.0]; }
+        for i in 3072..4096 { lut[i] = [0.0, 0.0, 1.0, 1.0]; }
+        let params = ColorParams {
+            newton_color_mode: 2,
+            newton_phase: 0.75,
+            ..default_params()
+        };
+        // t = fract(0.75 + 0) = 0.75 → pos ≈ 3071.25 → straddles boundary, interpolates
+        // Use phase=0.8 to land clearly in the blue zone (pos ≈ 3276)
+        let params2 = ColorParams { newton_phase: 0.8, ..params };
+        let raw = [0.0, -14.0, 0.0, 1.0];
+        let [r, _g, b] = color_pixel(raw, &lut, &params2, 1);
+        assert_eq!(b, 65535);
+        assert_eq!(r, 0);
     }
 
     // ── to_u16 edge cases ─────────────────────────────────────────────────────

@@ -11,7 +11,7 @@
  *
  * No WASM runs on the main thread. All computation is in Web Workers.
  */
-import { ZoomPanFSM, DEFAULT_VIEW, pixelToFractal, pixelStep } from "./viewport.ts";
+import { ZoomPanFSM, DEFAULT_VIEW, pixelToFractal, pixelStep, serializeViewState, deserializeViewState } from "./viewport.ts";
 import { BoxZoom } from "./box-zoom.ts";
 import { GlPipeline } from "./gl-pipeline.ts";
 import { wasmBundleUrl } from "./detect-simd.ts";
@@ -22,8 +22,9 @@ import {
   serializeNewtonState, deserializeNewtonState,
   type NewtonParams,
 } from "./newton.ts";
-import { NewtonPanel } from "./newton-panel.ts";
+import { FractalParamsPanel } from "./fractal-params-panel.ts";
 import { ExportDialog, type WorkerLease, type ColoringState } from "./export.ts";
+import { PANEL_GAP, SELECT_CSS } from "./ui-constants.ts";
 
 const BASE_ITER = 256;
 
@@ -102,7 +103,7 @@ function makeOverlay(): HTMLElement {
     position: "fixed", top: "8px", left: "8px",
     color: "white", fontFamily: "monospace", fontSize: "12px",
     background: "rgba(0,0,0,0.55)", padding: "6px 10px",
-    borderRadius: "4px", pointerEvents: "none", zIndex: "999",
+    borderRadius: "4px", zIndex: "999",
     lineHeight: "1.6",
   });
   document.body.appendChild(el);
@@ -132,6 +133,7 @@ export class FractalSession {
   private tilesThisGen = 0;
   private tilesDrawnThisGen = 0;
   private dispatchDebounceId: ReturnType<typeof setTimeout> | null = null;
+  private urlDebounceId: ReturnType<typeof setTimeout> | null = null;
 
   // Orbit state
   private currentOrbitId = 0;
@@ -157,12 +159,15 @@ export class FractalSession {
     fractalKind:      0,
     newtonDegree:     3,
     unresolvedColor:  [0.05, 0.05, 0.05],
+    newtonColorMode:  0,
+    newtonPhase:      0.0,
+    newtonSmooth:     true,
   };
 
   // Fractal kind + Newton state
   private fractalKind: "mandelbrot" | "newton" = "mandelbrot";
   private newtonParams: NewtonParams = defaultNewtonParams();
-  private readonly newtonPanel: NewtonPanel;
+  private readonly fractalParamsPanel: FractalParamsPanel;
   private modeSelectEl!: HTMLSelectElement;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -170,9 +175,9 @@ export class FractalSession {
 
     // Fractal mode selector — sits above the stats readout.
     const modeRow = document.createElement("div");
-    modeRow.style.cssText = "pointer-events:auto;margin-bottom:4px;";
+    modeRow.style.cssText = "margin-bottom:4px;";
     const modeSelect = document.createElement("select");
-    modeSelect.style.cssText = "background:#222;color:#eee;border:1px solid #555;border-radius:3px;padding:2px 6px;font-family:monospace;font-size:12px;cursor:pointer;";
+    modeSelect.style.cssText = SELECT_CSS;
     (["mandelbrot", "newton"] as const).forEach(kind => {
       const opt = document.createElement("option");
       opt.value = kind;
@@ -230,24 +235,71 @@ export class FractalSession {
         this.gl.blit();
         this.coloringState.distWeight = weight;
       },
+      (colorMode, phase, smooth, [r, g, b]) => {
+        this.gl.setNewtonColorMode(colorMode);
+        this.gl.setNewtonPhase(phase);
+        this.gl.setNewtonSmooth(smooth);
+        this.gl.setUnresolvedColor(r, g, b);
+        this.gl.blit();
+        this.coloringState.newtonColorMode = colorMode;
+        this.coloringState.newtonPhase = phase;
+        this.coloringState.newtonSmooth = smooth;
+        this.coloringState.unresolvedColor = [r, g, b];
+      },
     );
-    document.body.appendChild(this.paletteEditor.getPanel());
+    const palettePanel = this.paletteEditor.getPanel();
+    document.body.appendChild(palettePanel);
 
-    // Newton panel — preset picker + advanced coefficient inputs.
-    this.newtonPanel = new NewtonPanel((coeffs, degree) => {
+    // Keep palette panel anchored just below the stats overlay.
+    const ro = new ResizeObserver(() => {
+      const r = this.overlay.getBoundingClientRect();
+      palettePanel.style.top = `${r.bottom + PANEL_GAP}px`;
+    });
+    ro.observe(this.overlay);
+    // Set initial position immediately (before first resize event).
+    palettePanel.style.top = `${this.overlay.getBoundingClientRect().bottom + PANEL_GAP}px`;
+
+    // Fractal params panel — preset picker + advanced coefficient inputs.
+    this.fractalParamsPanel = new FractalParamsPanel((coeffs, degree) => {
       this.onPolynomialCommit(coeffs, degree);
     });
-    document.body.appendChild(this.newtonPanel.getElement());
+    document.body.appendChild(this.fractalParamsPanel.getElement());
 
-    // Restore fractal kind + Newton state from URL hash if present.
-    const hashParams = deserializeNewtonState(window.location.hash.slice(1));
-    if (hashParams) {
-      this.fractalKind = "newton";
-      this.newtonParams = hashParams;
-      this.modeSelectEl.value = "newton";
+    // Restore fractal kind + Newton params from URL hash if present.
+    // View state (cx/cy/zoom_exp) is stored in restoredView and passed to the
+    // ZoomPanFSM constructor below so it takes effect before the first render.
+    const hashFragment = window.location.hash.slice(1);
+    const savedState = hashFragment ? deserializeViewState(hashFragment) : null;
+    let restoredView = DEFAULT_VIEW;
+    if (savedState) {
+      restoredView = savedState.view;
+      if (savedState.fractalKind === "newton") {
+        const hashParams = deserializeNewtonState(savedState.extraParams);
+        if (hashParams) {
+          this.fractalKind = "newton";
+          this.newtonParams = hashParams;
+          this.modeSelectEl.value = "newton";
+        }
+      } else {
+        this.fractalKind = "mandelbrot";
+        this.modeSelectEl.value = "mandelbrot";
+      }
+    } else if (hashFragment) {
+      // Legacy Newton-only hash (no cx/cy/z) — try old format for backwards compat.
+      const hashParams = deserializeNewtonState(hashFragment);
+      if (hashParams) {
+        this.fractalKind = "newton";
+        this.newtonParams = hashParams;
+        this.modeSelectEl.value = "newton";
+      }
     }
-    this.newtonPanel.setParams(this.newtonParams);
-    this.newtonPanel.setVisible(this.fractalKind === "newton");
+    this.fractalParamsPanel.setParams(this.newtonParams);
+    this.fractalParamsPanel.setTitle("Newton");
+    this.fractalParamsPanel.setVisible(this.fractalKind === "newton");
+    this.paletteEditor.setFractalKind(this.fractalKind);
+    if (this.fractalKind === "newton") {
+      this.paletteEditor.setNewtonDegree(this.newtonParams.degree);
+    }
 
     this.hiDpi = (window.devicePixelRatio ?? 1) > 1;
     this.overlay.appendChild(this.buildDprToggle(canvas));
@@ -282,9 +334,10 @@ export class FractalSession {
       }
     });
 
-    this.fsm = new ZoomPanFSM(DEFAULT_VIEW, {
+    this.fsm = new ZoomPanFSM(restoredView, {
       onViewChange: () => {
         this.updateOverlay();
+        this.debouncedWriteUrl(500);
         if (this.fsm.getState() === "PANNING") this.debouncedDispatch(150);
       },
       onZoomSettled: () => this.debouncedDispatch(0),
@@ -344,7 +397,12 @@ export class FractalSession {
     const view = this.fsm.getView();
     this.fsm.setView({ ...view, zoom_exp: 0 });
 
-    this.newtonPanel.setVisible(kind === "newton");
+    this.fractalParamsPanel.setTitle(kind === "newton" ? "Newton" : kind);
+    this.fractalParamsPanel.setVisible(kind === "newton");
+    this.paletteEditor.setFractalKind(kind);
+    if (kind === "newton") {
+      this.paletteEditor.setNewtonDegree(this.newtonParams.degree);
+    }
     this.modeSelectEl.value = kind;
 
     if (kind === "newton") {
@@ -355,10 +413,8 @@ export class FractalSession {
           coeffs: Array.from(this.newtonParams.coeffs.subarray(0, this.newtonParams.degree + 1)),
         });
       }
-      this.writeUrlHash();
-    } else {
-      window.history.replaceState(null, "", window.location.pathname);
     }
+    this.writeUrlHash();
 
     this.scheduleDispatch();
   }
@@ -373,6 +429,9 @@ export class FractalSession {
       rootsIm: new Float64Array(degree),
     };
     this.coloringState.newtonDegree = degree;
+    if (this.fractalKind === "newton") {
+      this.paletteEditor.setNewtonDegree(degree);
+    }
     // Ask the orbit worker to compute roots (it has WASM; main thread doesn't).
     this.orbitWorker.postMessage({
       type: "compute_roots",
@@ -388,7 +447,7 @@ export class FractalSession {
         rootsRe: new Float64Array(msg.rootsRe),
         rootsIm: new Float64Array(msg.rootsIm),
       };
-      this.newtonPanel.setParams(this.newtonParams);
+      this.fractalParamsPanel.setParams(this.newtonParams);
       this.writeUrlHash();
       this.scheduleDispatch();
       return;
@@ -437,9 +496,22 @@ export class FractalSession {
     this.scheduleDispatch();
   }
 
-  /** Write Newton state to window.location.hash without triggering a navigation. */
+  private debouncedWriteUrl(delayMs: number): void {
+    if (this.urlDebounceId !== null) clearTimeout(this.urlDebounceId);
+    this.urlDebounceId = setTimeout(() => {
+      this.urlDebounceId = null;
+      this.writeUrlHash();
+    }, delayMs);
+  }
+
+  /** Write full view state (including fractal kind and Newton params) to the URL hash. */
   private writeUrlHash(): void {
-    const fragment = serializeNewtonState(this.newtonParams);
+    const view = this.fsm.getView();
+    let extra: string | undefined;
+    if (this.fractalKind === "newton") {
+      extra = serializeNewtonState(this.newtonParams);
+    }
+    const fragment = serializeViewState(view, this.fractalKind, extra);
     window.history.replaceState(null, "", `#${fragment}`);
   }
 
@@ -467,7 +539,7 @@ export class FractalSession {
       background: "rgba(255,255,255,0.15)", color: "white",
       border: "1px solid rgba(255,255,255,0.3)", borderRadius: "3px",
       fontFamily: "monospace", fontSize: "12px", padding: "2px 6px",
-      width: "100%", boxSizing: "border-box", pointerEvents: "auto",
+      width: "100%", boxSizing: "border-box",
     });
     btn.addEventListener("click", () => {
       this.hiDpi = !this.hiDpi;

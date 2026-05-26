@@ -11,7 +11,8 @@
  *   document.body.appendChild(editor.getPanel());
  */
 
-import { buildLut, ALL_PRESETS, type ColorStop, type Palette } from "./palette.ts";
+import { buildLut, makeNewtonPalette, ALL_PRESETS, type ColorStop, type Palette } from "./palette.ts";
+import { PANEL_STYLE, SECTION_HEADER_CSS, SELECT_CSS } from "./ui-constants.ts";
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -71,6 +72,12 @@ export class PaletteEditor {
     periodStrength: number,
   ) => void;
   private readonly onDistWeightChange?: (weight: number) => void;
+  private readonly onNewtonChange?: (
+    colorMode: 0 | 1 | 2,
+    phase: number,
+    smooth: boolean,
+    unresolvedColor: [number, number, number],
+  ) => void;
 
   private readonly panel: HTMLElement;
   private readonly toggleBtn: HTMLButtonElement;
@@ -79,8 +86,13 @@ export class PaletteEditor {
   private readonly barCanvas: HTMLCanvasElement;
   private readonly handleRow: HTMLElement;
   private readonly stopListEl: HTMLElement;
-  private readonly cycleLenLabel: HTMLSpanElement;
-  private readonly cycleLenSlider: HTMLInputElement;
+
+  // Section visibility groups for setFractalKind()
+  private mandelbrotSections: HTMLElement[] = [];
+  private newtonSections: HTMLElement[] = [];
+  private currentNewtonDegree = 3;
+  // Preset strip ref for Rainbow swatch update
+  private presetRow!: HTMLElement;
 
   constructor(
     initial: Palette,
@@ -95,20 +107,25 @@ export class PaletteEditor {
       periodStrength: number,
     ) => void,
     onDistWeightChange?: (weight: number) => void,
+    onNewtonChange?: (
+      colorMode: 0 | 1 | 2,
+      phase: number,
+      smooth: boolean,
+      unresolvedColor: [number, number, number],
+    ) => void,
   ) {
     this.palette = deepCopyPalette(initial);
     this.onChange = onChange;
     this.onTrapChange = onTrapChange;
     this.onInteriorChange = onInteriorChange;
     this.onDistWeightChange = onDistWeightChange;
+    this.onNewtonChange = onNewtonChange;
 
     const refs = this.buildPanel();
-    this.panel       = refs.panel;
-    this.barCanvas   = refs.barCanvas;
-    this.handleRow   = refs.handleRow;
-    this.stopListEl  = refs.stopListEl;
-    this.cycleLenLabel  = refs.cycleLenLabel;
-    this.cycleLenSlider = refs.cycleLenSlider;
+    this.panel      = refs.panel;
+    this.barCanvas  = refs.barCanvas;
+    this.handleRow  = refs.handleRow;
+    this.stopListEl = refs.stopListEl;
 
     this.toggleBtn = this.buildToggleBtn();
     this.notifyChange(); // upload initial LUT
@@ -142,7 +159,6 @@ export class PaletteEditor {
       border: "1px solid rgba(255,255,255,0.3)", borderRadius: "3px",
       fontFamily: "monospace", fontSize: "12px", padding: "2px 6px",
       width: "100%", boxSizing: "border-box",
-      pointerEvents: "auto", // override overlay's pointer-events:none
     });
     btn.addEventListener("click", () => {
       const hidden = this.panel.style.display === "none";
@@ -154,14 +170,16 @@ export class PaletteEditor {
 
   private buildPanel() {
     const panel = document.createElement("div");
-    Object.assign(panel.style, {
-      position: "fixed", left: "8px", top: "130px",
-      background: "rgba(0,0,0,0.75)", color: "white",
-      fontFamily: "monospace", fontSize: "12px",
-      padding: "8px", borderRadius: "4px",
-      width: "316px", zIndex: "998", display: "none",
-      lineHeight: "1.5",
+    Object.assign(panel.style, PANEL_STYLE, {
+      position: "fixed", left: "8px", top: "200px", // overridden by ResizeObserver in session.ts
+      width: "316px", display: "none",
     });
+
+    // ── Title ─────────────────────────────────────────────────────────────────
+    const titleEl = document.createElement("div");
+    titleEl.textContent = "Palette";
+    Object.assign(titleEl.style, { fontWeight: "bold", marginBottom: "6px" });
+    panel.appendChild(titleEl);
 
     // ── Gradient bar ──────────────────────────────────────────────────────────
     const barCanvas = document.createElement("canvas");
@@ -198,13 +216,14 @@ export class PaletteEditor {
     // ── Preset strip ──────────────────────────────────────────────────────────
     const presetRow = document.createElement("div");
     presetRow.style.cssText = "margin-top:8px; display:flex; gap:4px; flex-wrap:wrap;";
-
-    for (const { name, palette } of ALL_PRESETS) {
+    for (const { name, palette, isNewton } of ALL_PRESETS) {
       const sw = document.createElement("canvas");
       sw.width = 44; sw.height = 20; sw.title = name;
       sw.style.cssText = "cursor:pointer; border-radius:2px; border:2px solid rgba(255,255,255,0.3);";
       sw.addEventListener("click", () => {
-        this.palette = deepCopyPalette(palette);
+        // Rainbow preset generates stops matched to current Newton degree
+        const applied = isNewton ? makeNewtonPalette(this.currentNewtonDegree) : palette;
+        this.palette = deepCopyPalette(applied);
         cycleLenSlider.value = String(cycleLenToSlider(this.palette.cycleLen));
         cycleLenLabel.textContent = String(this.palette.cycleLen);
         this.selectedStop = 0;
@@ -214,15 +233,23 @@ export class PaletteEditor {
       drawLutToCanvas(sw, buildLut(palette));
       presetRow.appendChild(sw);
     }
+    this.presetRow = presetRow;
 
     // ── Orbit Trap ────────────────────────────────────────────────────────────
     const trapSection = document.createElement("div");
     trapSection.style.cssText = "margin-top:8px; border-top:1px solid rgba(255,255,255,0.2); padding-top:6px;";
 
     const trapHeader = document.createElement("div");
-    trapHeader.textContent = "Orbit Trap";
-    trapHeader.style.cssText = "font-weight:bold; margin-bottom:4px; font-size:11px; opacity:0.7;";
+    trapHeader.style.cssText = SECTION_HEADER_CSS;
+    const trapHeaderLabel = document.createElement("span");
+    trapHeaderLabel.textContent = "Orbit Trap";
+    const trapChevron = document.createElement("span");
+    trapChevron.textContent = "▾";
+    trapHeader.append(trapHeaderLabel, trapChevron);
     trapSection.appendChild(trapHeader);
+
+    const trapBody = document.createElement("div");
+    trapSection.appendChild(trapBody);
 
     const trapColorInput = document.createElement("input");
     trapColorInput.type = "color"; trapColorInput.value = "#ffff00";
@@ -269,16 +296,28 @@ export class PaletteEditor {
     trapStrengthRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
     trapStrengthRow.append("Strength: ", trapStrengthSlider, trapStrengthLabel);
 
-    trapSection.append(trapColorRow, trapRadiusRow, trapStrengthRow);
+    trapBody.append(trapColorRow, trapRadiusRow, trapStrengthRow);
+    trapHeader.addEventListener("click", () => {
+      const open = trapBody.style.display !== "none";
+      trapBody.style.display = open ? "none" : "";
+      trapChevron.textContent = open ? "▾" : "▴";
+    });
 
     // ── Interior ──────────────────────────────────────────────────────────────
     const interiorSection = document.createElement("div");
     interiorSection.style.cssText = "margin-top:8px; border-top:1px solid rgba(255,255,255,0.2); padding-top:6px;";
 
     const interiorHeader = document.createElement("div");
-    interiorHeader.textContent = "Interior";
-    interiorHeader.style.cssText = "font-weight:bold; margin-bottom:4px; font-size:11px; opacity:0.7;";
+    interiorHeader.style.cssText = SECTION_HEADER_CSS;
+    const interiorHeaderLabel = document.createElement("span");
+    interiorHeaderLabel.textContent = "Interior";
+    const interiorChevron = document.createElement("span");
+    interiorChevron.textContent = "▾";
+    interiorHeader.append(interiorHeaderLabel, interiorChevron);
     interiorSection.appendChild(interiorHeader);
+
+    const interiorBody = document.createElement("div");
+    interiorSection.appendChild(interiorBody);
 
     // Base color
     const interiorColorInput = document.createElement("input");
@@ -407,16 +446,28 @@ export class PaletteEditor {
     periodRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
     periodRow.append("Period: ", periodToggle, periodStrengthSlider, periodStrengthLabel);
 
-    interiorSection.append(interiorColorRow, distanceRow, curveRow, angleRow, periodRow);
+    interiorBody.append(interiorColorRow, distanceRow, curveRow, angleRow, periodRow);
+    interiorHeader.addEventListener("click", () => {
+      const open = interiorBody.style.display !== "none";
+      interiorBody.style.display = open ? "none" : "";
+      interiorChevron.textContent = open ? "▾" : "▴";
+    });
 
     // ── Exterior coloring ─────────────────────────────────────────────────────
     const exteriorSection = document.createElement("div");
     exteriorSection.style.cssText = "margin-top:8px; border-top:1px solid rgba(255,255,255,0.2); padding-top:6px;";
 
     const extHeader = document.createElement("div");
-    extHeader.textContent = "Exterior";
-    extHeader.style.cssText = "font-weight:bold; margin-bottom:4px; font-size:11px; opacity:0.7;";
+    extHeader.style.cssText = SECTION_HEADER_CSS;
+    const extHeaderLabel = document.createElement("span");
+    extHeaderLabel.textContent = "Exterior";
+    const extChevron = document.createElement("span");
+    extChevron.textContent = "▾";
+    extHeader.append(extHeaderLabel, extChevron);
     exteriorSection.appendChild(extHeader);
+
+    const exteriorBody = document.createElement("div");
+    exteriorSection.appendChild(exteriorBody);
 
     const distWeightSlider = document.createElement("input");
     distWeightSlider.type = "range"; distWeightSlider.min = "-2"; distWeightSlider.max = "2"; distWeightSlider.step = "0.05";
@@ -434,11 +485,147 @@ export class PaletteEditor {
     const distWeightRow = document.createElement("div");
     distWeightRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
     distWeightRow.append("Dist: ", distWeightSlider, distWeightLabel);
-    exteriorSection.appendChild(distWeightRow);
+    exteriorBody.appendChild(distWeightRow);
+    extHeader.addEventListener("click", () => {
+      const open = exteriorBody.style.display !== "none";
+      exteriorBody.style.display = open ? "none" : "";
+      extChevron.textContent = open ? "▾" : "▴";
+    });
 
-    panel.append(barCanvas, handleRow, stopListEl, cycleLenRow, presetRow, exteriorSection, trapSection, interiorSection);
+    // ── Newton: Basins ────────────────────────────────────────────────────────
+    const basinsSection = document.createElement("div");
+    basinsSection.style.cssText = "margin-top:8px; border-top:1px solid rgba(255,255,255,0.2); padding-top:6px; display:none;";
 
-    return { panel, barCanvas, handleRow, stopListEl, cycleLenLabel, cycleLenSlider };
+    const basinsHeader = document.createElement("div");
+    basinsHeader.style.cssText = SECTION_HEADER_CSS;
+    const basinsChevron = document.createElement("span");
+    basinsChevron.textContent = "▾";
+    basinsHeader.append(Object.assign(document.createElement("span"), { textContent: "Basins" }), basinsChevron);
+
+    const basinsBody = document.createElement("div");
+    basinsHeader.addEventListener("click", () => {
+      const open = basinsBody.style.display !== "none";
+      basinsBody.style.display = open ? "none" : "";
+      basinsChevron.textContent = open ? "▾" : "▴";
+    });
+
+    const modeSelect = document.createElement("select");
+    modeSelect.style.cssText = SELECT_CSS;
+    ([ ["Basin + convergence", "0"], ["Convergence only", "1"], ["Basin only", "2"] ] as const)
+      .forEach(([label, value]) => {
+        const opt = document.createElement("option");
+        opt.value = value; opt.textContent = label;
+        modeSelect.appendChild(opt);
+      });
+
+    const phaseSlider = document.createElement("input");
+    phaseSlider.type = "range"; phaseSlider.min = "0"; phaseSlider.max = "1"; phaseSlider.step = "0.01";
+    phaseSlider.value = "0";
+    phaseSlider.style.cssText = "width:130px; vertical-align:middle;";
+    const phaseLabel = document.createElement("span");
+    phaseLabel.textContent = "0.00";
+
+    const modeRow = document.createElement("div");
+    modeRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    modeRow.append("Mode: ", modeSelect);
+    const phaseRow = document.createElement("div");
+    phaseRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    phaseRow.append("Phase: ", phaseSlider, phaseLabel);
+    basinsBody.append(modeRow, phaseRow);
+    basinsSection.append(basinsHeader, basinsBody);
+
+    // ── Newton: Convergence ───────────────────────────────────────────────────
+    const convSection = document.createElement("div");
+    convSection.style.cssText = "margin-top:8px; border-top:1px solid rgba(255,255,255,0.2); padding-top:6px; display:none;";
+
+    const convHeader = document.createElement("div");
+    convHeader.style.cssText = SECTION_HEADER_CSS;
+    const convChevron = document.createElement("span");
+    convChevron.textContent = "▾";
+    convHeader.append(Object.assign(document.createElement("span"), { textContent: "Convergence" }), convChevron);
+
+    const convBody = document.createElement("div");
+    convHeader.addEventListener("click", () => {
+      const open = convBody.style.display !== "none";
+      convBody.style.display = open ? "none" : "";
+      convChevron.textContent = open ? "▾" : "▴";
+    });
+
+    const smoothToggle = document.createElement("input");
+    smoothToggle.type = "checkbox";
+    smoothToggle.checked = true;
+    smoothToggle.style.cssText = "cursor:pointer; vertical-align:middle;";
+    const smoothRow = document.createElement("div");
+    smoothRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    smoothRow.append("Smooth: ", smoothToggle);
+    convBody.append(smoothRow);
+    convSection.append(convHeader, convBody);
+
+    // ── Newton: Unresolved ────────────────────────────────────────────────────
+    const unresolvedSection = document.createElement("div");
+    unresolvedSection.style.cssText = "margin-top:8px; border-top:1px solid rgba(255,255,255,0.2); padding-top:6px; display:none;";
+
+    const unresolvedHeader = document.createElement("div");
+    unresolvedHeader.style.cssText = SECTION_HEADER_CSS;
+    const unresolvedChevron = document.createElement("span");
+    unresolvedChevron.textContent = "▾";
+    unresolvedHeader.append(Object.assign(document.createElement("span"), { textContent: "Unresolved" }), unresolvedChevron);
+
+    const unresolvedBody = document.createElement("div");
+    unresolvedHeader.addEventListener("click", () => {
+      const open = unresolvedBody.style.display !== "none";
+      unresolvedBody.style.display = open ? "none" : "";
+      unresolvedChevron.textContent = open ? "▾" : "▴";
+    });
+
+    const unresolvedColorInput = document.createElement("input");
+    unresolvedColorInput.type = "color";
+    unresolvedColorInput.value = "#0d0d0d"; // matches default [0.05, 0.05, 0.05]
+    unresolvedColorInput.style.cssText = "width:28px; height:22px; padding:1px; cursor:pointer; border:1px solid #555; border-radius:2px; background:none;";
+    const unresolvedRow = document.createElement("div");
+    unresolvedRow.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+    unresolvedRow.append("Color: ", unresolvedColorInput);
+    unresolvedBody.append(unresolvedRow);
+    unresolvedSection.append(unresolvedHeader, unresolvedBody);
+
+    // ── Newton: shared fireNewton callback ────────────────────────────────────
+    const fireNewton = () => {
+      const mode = parseInt(modeSelect.value) as 0 | 1 | 2;
+      const phase = parseFloat(phaseSlider.value);
+      const smooth = smoothToggle.checked;
+      const [r, g, b] = hexToRgb(unresolvedColorInput.value);
+      this.onNewtonChange?.(mode, phase, smooth, [r, g, b]);
+    };
+    modeSelect.addEventListener("change", fireNewton);
+    phaseSlider.addEventListener("input", () => {
+      phaseLabel.textContent = parseFloat(phaseSlider.value).toFixed(2);
+      fireNewton();
+    });
+    smoothToggle.addEventListener("change", fireNewton);
+    unresolvedColorInput.addEventListener("input", fireNewton);
+
+    this.mandelbrotSections = [exteriorSection, trapSection, interiorSection];
+    this.newtonSections = [basinsSection, convSection, unresolvedSection];
+
+    panel.append(barCanvas, handleRow, stopListEl, cycleLenRow, presetRow,
+      exteriorSection, trapSection, interiorSection,
+      basinsSection, convSection, unresolvedSection);
+
+    return { panel, barCanvas, handleRow, stopListEl };
+  }
+
+  setFractalKind(kind: "mandelbrot" | "newton"): void {
+    const isMandelbrot = kind === "mandelbrot";
+    for (const s of this.mandelbrotSections) s.style.display = isMandelbrot ? "" : "none";
+    for (const s of this.newtonSections)     s.style.display = isMandelbrot ? "none" : "";
+  }
+
+  setNewtonDegree(degree: number): void {
+    this.currentNewtonDegree = degree;
+    this.palette = deepCopyPalette(makeNewtonPalette(degree));
+    this.selectedStop = 0;
+    this.notifyChange();
+    this.render();
   }
 
   // ── Render methods ──────────────────────────────────────────────────────────

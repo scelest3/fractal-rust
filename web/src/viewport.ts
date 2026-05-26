@@ -83,6 +83,59 @@ export function fractalToPixel(
   };
 }
 
+// ── URL serialization ─────────────────────────────────────────────────────────
+
+/**
+ * Serialize view state to a URL fragment key=value string (no leading `#`).
+ *
+ * Format: `cx=…&cy=…&z=…&f=…[&<fractal-specific params>]`
+ *
+ * zoom_exp is emitted as a decimal string (not a float) so that precision is
+ * preserved through the v1 zoom range. Extra params (e.g. Newton preset) are
+ * appended verbatim after `&f=…`.
+ */
+export function serializeViewState(
+  view: ViewState,
+  fractalKind: string,
+  extraParams?: string,
+): string {
+  const parts = [
+    `cx=${view.cx}`,
+    `cy=${view.cy}`,
+    `z=${view.zoom_exp}`,
+    `f=${fractalKind}`,
+  ];
+  if (extraParams) parts.push(extraParams);
+  return parts.join("&");
+}
+
+/**
+ * Parse a URL fragment string (no leading `#`) for shared view state.
+ *
+ * Returns null if required fields (cx, cy, z, f) are absent or malformed.
+ * The `extraParams` string (everything after `f=…`) is returned raw for
+ * fractal-specific deserialization.
+ */
+export function deserializeViewState(fragment: string): {
+  view: ViewState;
+  fractalKind: string;
+  extraParams: string;
+} | null {
+  const params = new URLSearchParams(fragment);
+  const cx = params.get("cx");
+  const cy = params.get("cy");
+  const zStr = params.get("z");
+  const f = params.get("f");
+  if (!cx || !cy || zStr === null || !f) return null;
+  const zoom_exp = parseFloat(zStr);
+  if (isNaN(zoom_exp)) return null;
+  return {
+    view: { cx, cy, zoom_exp },
+    fractalKind: f,
+    extraParams: fragment,
+  };
+}
+
 // ── ZoomPanFSM ────────────────────────────────────────────────────────────────
 
 export type FsmState = "IDLE" | "PANNING" | "ZOOMING";

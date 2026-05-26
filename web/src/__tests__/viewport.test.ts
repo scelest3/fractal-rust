@@ -7,6 +7,8 @@ import {
   pixelToFractal,
   fractalToPixel,
   ZoomPanFSM,
+  serializeViewState,
+  deserializeViewState,
 } from "../viewport.ts";
 
 // ── fractalHeight ─────────────────────────────────────────────────────────────
@@ -113,6 +115,100 @@ describe("coordinate round-trips", () => {
     const { fx, fy } = pixelToFractal(px, py, view, W, H);
     expect(fx).toBeCloseTo(fx0, 10);
     expect(fy).toBeCloseTo(fy0, 10);
+  });
+});
+
+// ── serializeViewState / deserializeViewState ─────────────────────────────────
+
+describe("serializeViewState", () => {
+  it("emits cx, cy, z, f keys", () => {
+    const view: ViewState = { cx: "-0.743643887", cy: "0.131825905", zoom_exp: 12.5 };
+    const s = serializeViewState(view, "mandelbrot");
+    expect(s).toContain("cx=-0.743643887");
+    expect(s).toContain("cy=0.131825905");
+    expect(s).toContain("z=12.5");
+    expect(s).toContain("f=mandelbrot");
+  });
+
+  it("appends extraParams after f=", () => {
+    const view: ViewState = { cx: "0.0", cy: "0.0", zoom_exp: 0 };
+    const s = serializeViewState(view, "newton", "preset=z3-1");
+    expect(s).toContain("f=newton");
+    expect(s).toContain("preset=z3-1");
+  });
+
+  it("omits extra when not provided", () => {
+    const s = serializeViewState(DEFAULT_VIEW, "mandelbrot");
+    expect(s).not.toContain("preset=");
+    expect(s).not.toContain("coeffs=");
+  });
+
+  it("preserves cx/cy string precision exactly", () => {
+    const cx = "-0.7436438870371587302";
+    const view: ViewState = { cx, cy: "0.0", zoom_exp: 0 };
+    const s = serializeViewState(view, "mandelbrot");
+    expect(s).toContain(`cx=${cx}`);
+  });
+});
+
+describe("deserializeViewState", () => {
+  it("returns null for empty fragment", () => {
+    expect(deserializeViewState("")).toBeNull();
+  });
+
+  it("returns null when required fields are missing", () => {
+    expect(deserializeViewState("cx=0&cy=0")).toBeNull();
+    expect(deserializeViewState("cx=0&cy=0&z=1")).toBeNull();
+    expect(deserializeViewState("z=1&f=mandelbrot")).toBeNull();
+  });
+
+  it("returns null for non-numeric z", () => {
+    expect(deserializeViewState("cx=0&cy=0&z=bad&f=mandelbrot")).toBeNull();
+  });
+
+  it("parses mandelbrot fragment correctly", () => {
+    const result = deserializeViewState("cx=-0.5&cy=0.0&z=3&f=mandelbrot");
+    expect(result).not.toBeNull();
+    expect(result!.view.cx).toBe("-0.5");
+    expect(result!.view.cy).toBe("0.0");
+    expect(result!.view.zoom_exp).toBe(3);
+    expect(result!.fractalKind).toBe("mandelbrot");
+  });
+
+  it("returns extraParams for fractal-specific deserialization", () => {
+    const result = deserializeViewState("cx=0&cy=0&z=0&f=newton&preset=z3-1");
+    expect(result!.extraParams).toContain("preset=z3-1");
+  });
+});
+
+describe("serializeViewState / deserializeViewState round-trips", () => {
+  it("round-trips mandelbrot view", () => {
+    const view: ViewState = { cx: "-0.743643887", cy: "0.131825905", zoom_exp: 12.5 };
+    const fragment = serializeViewState(view, "mandelbrot");
+    const result = deserializeViewState(fragment)!;
+    expect(result.view.cx).toBe(view.cx);
+    expect(result.view.cy).toBe(view.cy);
+    expect(result.view.zoom_exp).toBe(view.zoom_exp);
+    expect(result.fractalKind).toBe("mandelbrot");
+  });
+
+  it("round-trips newton view with preset extra params", () => {
+    const view: ViewState = { cx: "0.0", cy: "0.0", zoom_exp: 2 };
+    const fragment = serializeViewState(view, "newton", "preset=z4-1");
+    const result = deserializeViewState(fragment)!;
+    expect(result.view.zoom_exp).toBe(2);
+    expect(result.fractalKind).toBe("newton");
+    expect(result.extraParams).toContain("preset=z4-1");
+  });
+
+  it("preserves high-precision cx/cy strings through round-trip", () => {
+    const cx = "-1.9999999999999980";
+    const cy = "0.000000000000001337";
+    const view: ViewState = { cx, cy, zoom_exp: 0 };
+    const fragment = serializeViewState(view, "mandelbrot");
+    const result = deserializeViewState(fragment)!;
+    expect(result.view.cx).toBe(cx);
+    expect(result.view.cy).toBe(cy);
   });
 });
 

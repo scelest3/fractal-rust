@@ -104,6 +104,9 @@ describe("ColoringState defaults", () => {
       fractalKind: 0,
       newtonDegree: 3,
       unresolvedColor: [0.05, 0.05, 0.05],
+      newtonColorMode: 0,
+      newtonPhase: 0.0,
+      newtonSmooth: false,
     };
     expect(s.fractalKind).toBe(0);
     expect(s.trapColor).toEqual([1, 1, 0]);

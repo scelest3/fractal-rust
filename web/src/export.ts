@@ -61,6 +61,9 @@ export interface ColoringState {
   fractalKind: 0 | 1;
   newtonDegree: number;
   unresolvedColor: [number, number, number];
+  newtonColorMode: 0 | 1 | 2;
+  newtonPhase: number;
+  newtonSmooth: boolean;
 }
 
 export interface ExportParams {
@@ -472,6 +475,9 @@ export class ExportSession {
     if (params.fractalKind === "newton" && params.newton) {
       gl.setNewtonDegree(params.newton.degree);
     }
+    gl.setNewtonColorMode(params.coloringState.newtonColorMode);
+    gl.setNewtonPhase(params.coloringState.newtonPhase);
+    gl.setNewtonSmooth(params.coloringState.newtonSmooth);
 
     const tilesX = Math.ceil(width / TILE);
     let totalTiles = 0;

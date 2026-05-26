@@ -38,7 +38,7 @@ function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
 }
 
 /** HSL (h ∈ [0,360), s ∈ [0,1], l ∈ [0,1]) → RGB [0,1]. */
-function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+export function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   const c = (1 - Math.abs(2 * l - 1)) * s;
   const x = c * (1 - Math.abs((h / 60) % 2 - 1));
   const m = l - c / 2;
@@ -160,11 +160,30 @@ export const SHANNON: Palette = {
   cycleLen: 64,
 };
 
-export const ALL_PRESETS: { name: string; palette: Palette }[] = [
+// ── Newton palette generator ──────────────────────────────────────────────────
+
+/**
+ * Generate a palette with `degree` equidistant hue stops, one per Newton root.
+ * Each stop sits at t = i/degree so that basin_t = root_index/degree maps each
+ * root cleanly to a distinct pure hue.
+ */
+export function makeNewtonPalette(degree: number): Palette {
+  const stops: ColorStop[] = [];
+  for (let i = 0; i < degree; i++) {
+    const t = i / degree;
+    const hue = (i / degree) * 360;
+    const [r, g, b] = hslToRgb(hue, 1.0, 0.5);
+    stops.push({ t, r, g, b, hueDir: "short" });
+  }
+  return { stops, cycleLen: 32 };
+}
+
+export const ALL_PRESETS: { name: string; palette: Palette; isNewton?: boolean }[] = [
   { name: "Classic",   palette: CLASSIC },
   { name: "Fire",      palette: FIRE },
   { name: "Ice",       palette: ICE },
   { name: "Electric",  palette: ELECTRIC },
   { name: "Grayscale", palette: GRAYSCALE },
   { name: "Shannon",   palette: SHANNON },
+  { name: "Rainbow",   palette: makeNewtonPalette(6), isNewton: true },
 ];

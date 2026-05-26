@@ -49,24 +49,13 @@ uniform float uPeriodStrength;
 uniform float uPeriodCycleLen;
 uniform float uDistWeight;
 // Newton uniforms
-uniform int   uFractalKind;   // 0 = Mandelbrot, 1 = Newton
+uniform int   uFractalKind;      // 0 = Mandelbrot, 1 = Newton
 uniform int   uNewtonDegree;
 uniform vec3  uUnresolvedColor;
+uniform int   uNewtonColorMode;  // 0=basin+convergence, 1=convergence only, 2=basin only
+uniform float uNewtonPhase;      // 0..1 — shifts all basins around the LUT cycle
+uniform int   uNewtonSmooth;     // 0=integer iter, 1=sub-iter smooth via log_p_norm
 out vec4 fragColor;
-
-vec3 hsl_to_rgb(float h, float s, float l) {
-    float c = (1.0 - abs(2.0 * l - 1.0)) * s;
-    float x = c * (1.0 - abs(mod(h / 60.0, 2.0) - 1.0));
-    float m = l - c * 0.5;
-    vec3 rgb;
-    if      (h < 60.0)  rgb = vec3(c, x, 0.0);
-    else if (h < 120.0) rgb = vec3(x, c, 0.0);
-    else if (h < 180.0) rgb = vec3(0.0, c, x);
-    else if (h < 240.0) rgb = vec3(0.0, x, c);
-    else if (h < 300.0) rgb = vec3(x, 0.0, c);
-    else                rgb = vec3(c, 0.0, x);
-    return rgb + m;
-}
 
 void main() {
     vec4 data = texture(uAccum, vUv);
@@ -77,8 +66,23 @@ void main() {
             fragColor = vec4(uUnresolvedColor, 1.0);
             return;
         }
-        float hue = (data.b / float(uNewtonDegree)) * 360.0;
-        fragColor = vec4(hsl_to_rgb(hue, 0.85, 0.55), 1.0);
+        float iter = data.r;
+        if (uNewtonSmooth == 1) {
+            // data.g = ln|p(z_N)|; ln(CONVERGENCE_EPS=1e-6) ≈ -13.8155
+            // Newton has quadratic convergence → log2 correction term
+            iter += 1.0 - log2(data.g / -13.8155);
+        }
+        float speed_t = fract(iter / uCycleLen);
+        float basin_t = data.b / float(uNewtonDegree);
+        float t;
+        if (uNewtonColorMode == 0) {
+            t = fract(uNewtonPhase + basin_t + speed_t);
+        } else if (uNewtonColorMode == 1) {
+            t = fract(uNewtonPhase + speed_t);
+        } else {
+            t = fract(uNewtonPhase + basin_t);
+        }
+        fragColor = vec4(texture(uLut, vec2(t, 0.5)).rgb, 1.0);
         return;
     }
 
@@ -147,6 +151,9 @@ export class GlPipeline {
   private readonly uFractalKind:      WebGLUniformLocation;
   private readonly uNewtonDegree:     WebGLUniformLocation;
   private readonly uUnresolvedColor:  WebGLUniformLocation;
+  private readonly uNewtonColorMode:  WebGLUniformLocation;
+  private readonly uNewtonPhase:      WebGLUniformLocation;
+  private readonly uNewtonSmooth:     WebGLUniformLocation;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -222,6 +229,12 @@ export class GlPipeline {
     gl.uniform1i(this.uFractalKind,     0);
     gl.uniform1i(this.uNewtonDegree,    3);
     gl.uniform3f(this.uUnresolvedColor, 0.05, 0.05, 0.05); // near-black
+    this.uNewtonColorMode = gl.getUniformLocation(this.blitProgram, "uNewtonColorMode")!;
+    this.uNewtonPhase     = gl.getUniformLocation(this.blitProgram, "uNewtonPhase")!;
+    this.uNewtonSmooth    = gl.getUniformLocation(this.blitProgram, "uNewtonSmooth")!;
+    gl.uniform1i(this.uNewtonColorMode, 0);
+    gl.uniform1f(this.uNewtonPhase,     0.0);
+    gl.uniform1i(this.uNewtonSmooth,    1);
 
     // ── Tile program uniform ──────────────────────────────────────────────────
     gl.useProgram(this.tileProgram);
@@ -416,6 +429,24 @@ export class GlPipeline {
     const { gl } = this;
     gl.useProgram(this.blitProgram);
     gl.uniform3f(this.uUnresolvedColor, r, g, b);
+  }
+
+  setNewtonColorMode(mode: 0 | 1 | 2): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1i(this.uNewtonColorMode, mode);
+  }
+
+  setNewtonPhase(phase: number): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1f(this.uNewtonPhase, phase);
+  }
+
+  setNewtonSmooth(smooth: boolean): void {
+    const { gl } = this;
+    gl.useProgram(this.blitProgram);
+    gl.uniform1i(this.uNewtonSmooth, smooth ? 1 : 0);
   }
 
   // ── Export pipeline ───────────────────────────────────────────────────────
