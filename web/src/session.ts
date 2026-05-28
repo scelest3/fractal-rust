@@ -15,7 +15,7 @@ import { ZoomPanFSM, DEFAULT_VIEW, pixelToFractal, pixelStep, serializeViewState
 import { BoxZoom } from "./box-zoom.ts";
 import { GlPipeline } from "./gl-pipeline.ts";
 import { wasmBundleUrl } from "./detect-simd.ts";
-import { CLASSIC } from "./palette.ts";
+import { CLASSIC, palettesEqual } from "./palette.ts";
 import { PaletteEditor } from "./palette-editor.ts";
 import {
   newtonParamsZ3, defaultNewtonParams, newtonParamsFromPreset,
@@ -301,6 +301,21 @@ export class FractalSession {
       this.paletteEditor.setNewtonDegree(this.newtonParams.degree);
     }
 
+    // Restore palette from `p=` URL param if present.
+    if (savedState?.extraParams) {
+      const pMatch = savedState.extraParams.match(/(?:^|&)p=([^&]+)/);
+      if (pMatch) {
+        try {
+          const palette = JSON.parse(decodeURIComponent(pMatch[1]));
+          if (palette && Array.isArray(palette.stops) && typeof palette.cycleLen === "number") {
+            this.paletteEditor.loadPalette(palette);
+          }
+        } catch {
+          // malformed p= param — ignore and keep default
+        }
+      }
+    }
+
     this.hiDpi = (window.devicePixelRatio ?? 1) > 1;
     this.overlay.appendChild(this.buildDprToggle(canvas));
     this.overlay.appendChild(this.paletteEditor.getToggleButton());
@@ -510,6 +525,11 @@ export class FractalSession {
     let extra: string | undefined;
     if (this.fractalKind === "newton") {
       extra = serializeNewtonState(this.newtonParams);
+    }
+    const palette = this.paletteEditor.getPalette();
+    if (!palettesEqual(palette, CLASSIC)) {
+      const pParam = `p=${encodeURIComponent(JSON.stringify(palette))}`;
+      extra = extra ? `${extra}&${pParam}` : pParam;
     }
     const fragment = serializeViewState(view, this.fractalKind, extra);
     window.history.replaceState(null, "", `#${fragment}`);

@@ -86,6 +86,8 @@ export class PaletteEditor {
   private readonly barCanvas: HTMLCanvasElement;
   private readonly handleRow: HTMLElement;
   private readonly stopListEl: HTMLElement;
+  private cycleLenSlider!: HTMLInputElement;
+  private cycleLenLabel!: HTMLSpanElement;
 
   // Section visibility groups for setFractalKind()
   private mandelbrotSections: HTMLElement[] = [];
@@ -201,9 +203,11 @@ export class PaletteEditor {
     cycleLenSlider.type = "range"; cycleLenSlider.min = "0"; cycleLenSlider.max = "100";
     cycleLenSlider.value = String(cycleLenToSlider(this.palette.cycleLen));
     cycleLenSlider.style.cssText = "width:140px; vertical-align:middle;";
+    this.cycleLenSlider = cycleLenSlider;
 
     const cycleLenLabel = document.createElement("span");
     cycleLenLabel.textContent = String(this.palette.cycleLen);
+    this.cycleLenLabel = cycleLenLabel;
 
     cycleLenSlider.addEventListener("input", () => {
       this.palette.cycleLen = sliderToCycleLen(Number(cycleLenSlider.value));
@@ -623,6 +627,19 @@ export class PaletteEditor {
   setNewtonDegree(degree: number): void {
     this.currentNewtonDegree = degree;
     this.palette = deepCopyPalette(makeNewtonPalette(degree));
+    this.selectedStop = 0;
+    this.notifyChange();
+    this.render();
+  }
+
+  getPalette(): Palette {
+    return deepCopyPalette(this.palette);
+  }
+
+  loadPalette(p: Palette): void {
+    this.palette = deepCopyPalette(p);
+    this.cycleLenSlider.value = String(cycleLenToSlider(this.palette.cycleLen));
+    this.cycleLenLabel.textContent = String(this.palette.cycleLen);
     this.selectedStop = 0;
     this.notifyChange();
     this.render();

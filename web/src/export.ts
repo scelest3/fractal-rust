@@ -405,9 +405,8 @@ const TILE = 256;
 
 type TileReadyMsg = { type: "tile_ready"; slotIndex: number; tileX: number; tileY: number; generation: number };
 
-interface EncodePngWorkerMsg {
-  type: "encode_png";
-  pixels: Float32Array;
+interface BeginEncodeWorkerMsg {
+  type: "begin_png_encode";
   width: number;
   height: number;
   lut: Float32Array;
@@ -487,11 +486,11 @@ export class ExportSession {
     }
     let doneTiles = 0;
 
-    // Collect all strips into one bottom-up RGBA32F buffer (GL native row order).
-    const allRaw = new Float32Array(width * height * 4);
+    // Begin the streaming PNG session in the encoding worker.
+    await this.beginEncode(width, height, params);
 
     for (let s = 0; s < stripCount; s++) {
-      if (this.cancelled) return null;
+      if (this.cancelled) { await this.abortEncode(); return null; }
 
       const stripY  = s * stripHeight;
       const actualH = Math.min(stripHeight, height - stripY);
@@ -501,73 +500,105 @@ export class ExportSession {
       await this.renderStrip(stripY, tilesX, tilesY, step, doneTiles, totalTiles);
       doneTiles += tilesX * tilesY;
 
-      if (this.cancelled) return null;
+      if (this.cancelled) { await this.abortEncode(); return null; }
       const raw = await gl.readbackRawStrip();
 
-      if (this.cancelled) return null;
-      allRaw.set(raw, stripY * width * 4);
+      if (this.cancelled) { await this.abortEncode(); return null; }
+
+      // Encode this strip immediately — no allRaw accumulation.
+      await this.appendStrip(raw, actualH);
     }
 
-    if (this.cancelled) return null;
+    if (this.cancelled) { await this.abortEncode(); return null; }
 
-    const pngBytes = await this.encodePng(allRaw, width, height, params);
+    const pngBytes = await this.finishEncode();
     return new Blob([pngBytes.buffer as ArrayBuffer], { type: "image/png" });
   }
 
-  private encodePng(
-    raw: Float32Array,
-    width: number,
-    height: number,
-    params: ExportParams,
-  ): Promise<Uint8Array> {
+  private sendEncodeMsg(msg: object, transfer?: Transferable[]): Promise<void> {
     return new Promise((resolve, reject) => {
       const w = this.lease.workers[0];
-      const cs = params.coloringState;
+      w.onmessage = (e: MessageEvent) => {
+        if (e.data.type === "begin_encode_done" || e.data.type === "append_strip_done") {
+          resolve();
+        } else if (e.data.type === "encode_error") {
+          this.lease.replaceWorker(0);
+          reject(new Error(`PNG encode failed: ${e.data.error}`));
+        } else {
+          reject(new Error(`Unexpected worker message: ${e.data.type}`));
+        }
+      };
+      if (transfer) {
+        this.lease.workers[0].postMessage(msg, transfer);
+      } else {
+        this.lease.workers[0].postMessage(msg);
+      }
+    });
+  }
+
+  private beginEncode(width: number, height: number, params: ExportParams): Promise<void> {
+    const cs = params.coloringState;
+    const msg: BeginEncodeWorkerMsg = {
+      type:             "begin_png_encode",
+      width,
+      height,
+      lut:              cs.lut,
+      cycleLen:         cs.cycleLen,
+      trapRadius:       cs.trapRadius,
+      trapStrength:     cs.trapStrength,
+      trapColor:        cs.trapColor,
+      interiorColor:    cs.interiorColor,
+      shadingColor:     cs.shadingColor,
+      distanceStrength: cs.distanceStrength,
+      distancePow:      cs.distancePow,
+      angleStrength:    cs.angleStrength,
+      periodStrength:   cs.periodStrength,
+      periodCycleLen:   cs.periodCycleLen,
+      distWeight:       cs.distWeight,
+      fractalKind:      cs.fractalKind,
+      newtonDegree:     cs.newtonDegree,
+      unresolvedColor:  cs.unresolvedColor,
+      dpi:              params.dpi,
+      cx:               params.view.cx,
+      cy:               params.view.cy,
+      zoomExp:          params.view.zoom_exp,
+      maxIter:          params.maxIter,
+      newtonDegreeMeta: params.fractalKind === "newton" && params.newton
+                        ? params.newton.degree : -1,
+      creationTime:     new Date().toISOString(),
+    };
+    return this.sendEncodeMsg(msg);
+  }
+
+  private appendStrip(raw: Float32Array, stripHeight: number): Promise<void> {
+    return this.sendEncodeMsg(
+      { type: "append_png_strip", pixels: raw, stripHeight },
+      [raw.buffer],
+    );
+  }
+
+  private finishEncode(): Promise<Uint8Array> {
+    return new Promise((resolve, reject) => {
+      const w = this.lease.workers[0];
       w.onmessage = (e: MessageEvent) => {
         if (e.data.type === "encode_done") {
           resolve(e.data.bytes as Uint8Array);
         } else if (e.data.type === "encode_error") {
-          // WASM heap is corrupted after an OOM trap — terminate and replace this
-          // worker before rejecting so release() never hands it back to the pool.
           this.lease.replaceWorker(0);
-          reject(new Error(`WASM encode_png failed: ${e.data.error}`));
+          reject(new Error(`PNG finish failed: ${e.data.error}`));
         } else {
-          reject(new Error(`Unexpected worker message during encode: ${e.data.type}`));
+          reject(new Error(`Unexpected worker message: ${e.data.type}`));
         }
       };
-      const msg: EncodePngWorkerMsg = {
-        type:             "encode_png",
-        pixels:           raw,
-        width,
-        height,
-        lut:              cs.lut,
-        cycleLen:         cs.cycleLen,
-        trapRadius:       cs.trapRadius,
-        trapStrength:     cs.trapStrength,
-        trapColor:        cs.trapColor,
-        interiorColor:    cs.interiorColor,
-        shadingColor:     cs.shadingColor,
-        distanceStrength: cs.distanceStrength,
-        distancePow:      cs.distancePow,
-        angleStrength:    cs.angleStrength,
-        periodStrength:   cs.periodStrength,
-        periodCycleLen:   cs.periodCycleLen,
-        distWeight:       cs.distWeight,
-        fractalKind:      cs.fractalKind,
-        newtonDegree:     cs.newtonDegree,
-        unresolvedColor:  cs.unresolvedColor,
-        dpi:              params.dpi,
-        cx:               params.view.cx,
-        cy:               params.view.cy,
-        zoomExp:          params.view.zoom_exp,
-        maxIter:          params.maxIter,
-        newtonDegreeMeta: params.fractalKind === "newton" && params.newton
-                          ? params.newton.degree : -1,
-        creationTime:     new Date().toISOString(),
-      };
-      // Transfer pixel buffer — avoids copying the full RGBA32F frame across the boundary.
-      w.postMessage(msg, [raw.buffer]);
+      w.postMessage({ type: "finish_png_encode" });
     });
+  }
+
+  private abortEncode(): Promise<void> {
+    // Fire-and-forget: tell the worker to discard any in-progress encoder state.
+    // We don't wait for a response since we're already cleaning up.
+    this.lease.workers[0].postMessage({ type: "finish_png_encode" });
+    return Promise.resolve();
   }
 
   private renderStrip(

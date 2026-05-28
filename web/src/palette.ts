@@ -178,6 +178,14 @@ export function makeNewtonPalette(degree: number): Palette {
   return { stops, cycleLen: 32 };
 }
 
+export function palettesEqual(a: Palette, b: Palette): boolean {
+  if (a.cycleLen !== b.cycleLen || a.stops.length !== b.stops.length) return false;
+  return a.stops.every((s, i) => {
+    const t = b.stops[i];
+    return s.t === t.t && s.r === t.r && s.g === t.g && s.b === t.b && s.hueDir === t.hueDir;
+  });
+}
+
 export const ALL_PRESETS: { name: string; palette: Palette; isNewton?: boolean }[] = [
   { name: "Classic",   palette: CLASSIC },
   { name: "Fire",      palette: FIRE },

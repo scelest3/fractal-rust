@@ -119,6 +119,153 @@ pub fn encode_png(
     Ok(buf)
 }
 
+// ── StreamingPngEncoder ───────────────────────────────────────────────────────
+
+/// `Write` adaptor over a raw pointer to a `Vec<u8>`.
+///
+/// Used by `StreamingPngEncoder` to let `png::Writer` (and its owned
+/// `StreamWriter`) write compressed PNG bytes into the encoder's output buffer
+/// without requiring a borrow that would outlive the encoder.
+///
+/// # Safety
+/// The caller must ensure the pointed-to `Vec<u8>` remains valid and exclusively
+/// accessible for the lifetime of any live `VecPtrWriter`. This is upheld by
+/// `StreamingPngEncoder`'s field layout and single-threaded WASM usage.
+struct VecPtrWriter(*mut Vec<u8>);
+
+impl std::io::Write for VecPtrWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        unsafe { (*self.0).write(buf) }
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+/// Stateful PNG encoder for strip-by-strip export.
+///
+/// Typical usage:
+/// ```ignore
+/// let mut enc = StreamingPngEncoder::new(width, height, lut, params, kind, &meta)?;
+/// for each strip (top-to-bottom order):
+///     enc.append_strip(&strip_pixels, strip_height)?;
+/// let bytes = enc.finish()?;
+/// ```
+///
+/// `pixels` passed to `append_strip` must be in GL readback order (bottom row
+/// first within the strip). Strips must be supplied in top-to-bottom image
+/// order so that PNG rows are written sequentially.
+///
+/// # Design note
+///
+/// `stream` is a `png::StreamWriter<'static, VecPtrWriter>` produced by
+/// `Writer::into_stream_writer()`. This consumes the `Writer` so the stream
+/// owns the compressor and the `VecPtrWriter`; no borrow lifetime is involved.
+/// `output` is a `Box<Vec<u8>>` (stable heap address). `VecPtrWriter` holds a
+/// raw pointer to that Vec. Moving `StreamingPngEncoder` moves the `Box`
+/// pointer but not the pointed-to Vec, so the raw pointer remains valid.
+/// `stream` is declared before `output` to ensure stream drops first (flushing
+/// IEND through `VecPtrWriter`), then `output` is freed.
+pub struct StreamingPngEncoder {
+    // Drop order: stream drops first (writes IEND to *output), then output is freed.
+    stream: png::StreamWriter<'static, VecPtrWriter>,
+    output: Box<Vec<u8>>,
+    row_buf: Vec<u8>,
+    row_floats: usize,
+    lut: Vec<[f32; 4]>,
+    params: ColorParams,
+    fractal_kind: u32,
+    width: u32,
+}
+
+impl StreamingPngEncoder {
+    /// Begin a new streaming encode session and write the PNG header.
+    pub fn new(
+        width: u32,
+        height: u32,
+        lut: &[f32],
+        params: ColorParams,
+        fractal_kind: u32,
+        metadata: &PngMetadata,
+    ) -> Result<Self, EncodingError> {
+        let lut_vec = lut_entries(lut).to_vec();
+        let mut output = Box::new(Vec::<u8>::new());
+        // SAFETY: `output` is heap-allocated (Box), so the Vec's address on the
+        // heap is stable even when StreamingPngEncoder is moved. `VecPtrWriter`
+        // holds a raw pointer to that allocation, not to the Box itself.
+        let raw: *mut Vec<u8> = output.as_mut();
+
+        let mut encoder = png::Encoder::new(VecPtrWriter(raw), width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Sixteen);
+        let ppm = (metadata.dpi as f64 / 0.0254).round() as u32;
+        encoder.set_pixel_dims(Some(png::PixelDimensions {
+            xppu: ppm,
+            yppu: ppm,
+            unit: png::Unit::Meter,
+        }));
+        encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+        encoder.add_text_chunk("Software".into(), "fractal-rust".into())?;
+        if let Some(t) = metadata.creation_time {
+            encoder.add_text_chunk("Creation Time".into(), t.into())?;
+        }
+        encoder.add_text_chunk("fractal:cx".into(), metadata.cx.into())?;
+        encoder.add_text_chunk("fractal:cy".into(), metadata.cy.into())?;
+        encoder.add_text_chunk("fractal:zoom_exp".into(), format!("{}", metadata.zoom_exp))?;
+        encoder.add_text_chunk("fractal:kind".into(), metadata.fractal_kind.into())?;
+        encoder.add_text_chunk("fractal:max_iter".into(), format!("{}", metadata.max_iter))?;
+        if let Some(deg) = metadata.newton_degree {
+            encoder.add_text_chunk("fractal:newton_degree".into(), format!("{deg}"))?;
+        }
+
+        // into_stream_writer consumes the Writer and returns StreamWriter<'static, W>,
+        // so no borrow lifetime escapes — stream can be stored alongside output.
+        let stream = encoder.write_header()?.into_stream_writer()?;
+        Ok(StreamingPngEncoder {
+            stream,
+            output,
+            row_buf: vec![0u8; width as usize * 6],
+            row_floats: (width * 4) as usize,
+            lut: lut_vec,
+            params,
+            fractal_kind,
+            width,
+        })
+    }
+
+    /// Encode one rendered strip.
+    ///
+    /// `pixels` is `width × strip_height × 4` RGBA f32 in GL bottom-up order
+    /// (row 0 = bottom of strip in image space). Strips must be supplied in
+    /// top-to-bottom image order.
+    pub fn append_strip(&mut self, pixels: &[f32], strip_height: u32) -> Result<(), EncodingError> {
+        for row_idx in (0..strip_height as usize).rev() {
+            let row_start = row_idx * self.row_floats;
+            for col in 0..self.width as usize {
+                let pi = row_start + col * 4;
+                let raw = [pixels[pi], pixels[pi + 1], pixels[pi + 2], pixels[pi + 3]];
+                let [r, g, b] = color_pixel(raw, &self.lut, &self.params, self.fractal_kind);
+                let base = col * 6;
+                self.row_buf[base..base + 2].copy_from_slice(&r.to_be_bytes());
+                self.row_buf[base + 2..base + 4].copy_from_slice(&g.to_be_bytes());
+                self.row_buf[base + 4..base + 6].copy_from_slice(&b.to_be_bytes());
+            }
+            self.stream.write_all(&self.row_buf)?;
+        }
+        Ok(())
+    }
+
+    /// Finalize the PNG (flush and write IEND) and return the encoded bytes.
+    ///
+    /// Returns `Err` if not all rows were written (`height` rows total expected).
+    pub fn finish(self) -> Result<Vec<u8>, EncodingError> {
+        let StreamingPngEncoder { stream, output, .. } = self;
+        // finish() flushes the deflate compressor and writes IEND via VecPtrWriter.
+        // output is still live at this point (destructor order is field declaration order,
+        // but since we destructure, we control the drop order explicitly here).
+        stream.finish()?;
+        Ok(*output)
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Reinterpret a flat `&[f32]` LUT as `&[[f32; 4]]` entries without copying.
@@ -155,6 +302,9 @@ mod tests {
             dist_weight: 0.0,
             newton_degree: 3,
             unresolved_color: [0.05, 0.05, 0.05],
+            newton_color_mode: 0,
+            newton_phase: 0.0,
+            newton_smooth: false,
         }
     }
 
@@ -267,6 +417,61 @@ mod tests {
         assert_eq!(u32::from_be_bytes(out[20..24].try_into().unwrap()), 2, "height");
         assert_eq!(out[24], 16, "bit depth");
         assert_eq!(out[25], 2, "color type (RGB)");
+    }
+
+    // ── StreamingPngEncoder ───────────────────────────────────────────────────
+
+    #[test]
+    fn streaming_single_strip_matches_encode_png() {
+        // A 4×2 all-escaped image encoded as one strip should match encode_png.
+        let pixels: Vec<f32> = (0..4 * 2 * 4).map(|i| if i % 4 == 3 { 1.0 } else { 0.0 }).collect();
+        let lut = white_lut();
+        let params = default_params();
+        let m = meta(300);
+
+        let expected = encode_png(&pixels, 4, 2, &lut, &params, 0, &m).unwrap();
+
+        let mut enc = StreamingPngEncoder::new(4, 2, &lut, default_params(), 0, &m).unwrap();
+        enc.append_strip(&pixels, 2).unwrap();
+        let got = enc.finish().unwrap();
+
+        // Decode both and compare pixel data (not raw bytes — multi-IDAT is valid but differs).
+        let decode = |bytes: &[u8]| {
+            let dec = png::Decoder::new(std::io::Cursor::new(bytes));
+            let mut reader = dec.read_info().unwrap();
+            let mut img = vec![0u8; reader.output_buffer_size().unwrap()];
+            reader.next_frame(&mut img).unwrap();
+            img
+        };
+        assert_eq!(decode(&expected), decode(&got), "pixel data mismatch");
+    }
+
+    #[test]
+    fn streaming_two_strips_round_trip() {
+        // 2×4 image split into two 2×2 strips, all escaped pixels.
+        // Strip 0 = top 2 rows (image rows 0-1), strip 1 = bottom 2 rows (image rows 2-3).
+        // Each strip's pixels are in GL bottom-up order.
+        let all_pixels: Vec<f32> = (0..2 * 4 * 4).map(|i| if i % 4 == 3 { 1.0 } else { 0.0 }).collect();
+        let lut = white_lut();
+        let m = meta(300);
+
+        let expected = encode_png(&all_pixels, 2, 4, &lut, &default_params(), 0, &m).unwrap();
+
+        let mut enc = StreamingPngEncoder::new(2, 4, &lut, default_params(), 0, &m).unwrap();
+        // strip 0: image rows 0-1 → GL pixels [rows 1,0 of image top half]
+        enc.append_strip(&all_pixels[..2 * 2 * 4], 2).unwrap();
+        // strip 1: image rows 2-3 → GL pixels [rows 3,2 of image bottom half]
+        enc.append_strip(&all_pixels[2 * 2 * 4..], 2).unwrap();
+        let got = enc.finish().unwrap();
+
+        let decode = |bytes: &[u8]| {
+            let dec = png::Decoder::new(std::io::Cursor::new(bytes));
+            let mut reader = dec.read_info().unwrap();
+            let mut img = vec![0u8; reader.output_buffer_size().unwrap()];
+            reader.next_frame(&mut img).unwrap();
+            img
+        };
+        assert_eq!(decode(&expected), decode(&got), "two-strip pixel data mismatch");
     }
 
     // ── Row orientation ───────────────────────────────────────────────────────

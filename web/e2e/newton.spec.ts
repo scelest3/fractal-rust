@@ -34,4 +34,22 @@ test.describe("Newton fractals", () => {
       clip: { x: 750, y: 280, width: 120, height: 120 },
     });
   });
+
+  test("z³−1 with custom LUT palette from URL", async ({ page }) => {
+    // A grayscale palette applied to Newton coloring — exercises the Newton LUT path.
+    const GRAY_PALETTE = {
+      stops: [
+        { t: 0, r: 0.1, g: 0.1, b: 0.1, hueDir: "short" },
+        { t: 0.5, r: 0.9, g: 0.9, b: 0.9, hueDir: "short" },
+      ],
+      cycleLen: 32,
+    };
+    const url = `/#f=newton&preset=z3-1&p=${encodeURIComponent(JSON.stringify(GRAY_PALETTE))}`;
+    await page.goto(url);
+    await waitForRender(page);
+    await expect(page.locator("#canvas")).toHaveScreenshot(
+      "newton-z3-1-gray-palette.png",
+      { mask: MASK(page) },
+    );
+  });
 });

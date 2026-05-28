@@ -439,33 +439,30 @@ When the Scheduler forwards a `READY` tile, the main thread calls `gl.texSubImag
 
 **Pass 2 — Smooth-Color Accumulation**
 
-Fullscreen quad reads from `tileTexArray` and `lut1D`. Branches on `u_fractal_kind`:
+Fullscreen quad reads from `uAccum` and `uLut`. Branches on `uFractalKind`:
 
 ```glsl
-if (u_fractal_kind == FRACTAL_NEWTON) {
+if (uFractalKind == 1) {  // Newton
     // a channel: 1.0 = Converged, 0.0 = Unresolved
-    if (tile.a < 0.5) {
-        fragColor = u_unresolved_color;
-    } else {
-        uint root_idx = uint(tile.b + 0.5);
-        float hue = float(root_idx) / float(u_newton_degree) * 360.0;
-        float lightness = mix(0.2, 0.8, tile.r);  // r = convergence_t
-        fragColor = hsl_to_rgb(hue, 0.8, lightness);
-    }
-} else {
-    // Mandelbrot / escape-time path
-    float t = mod(tile.r * palette_speed + palette_offset, 1.0);
-    vec4 color = texture(u_lut, t);
-
-    // orbit trap blend
-    float trap = 1.0 - smoothstep(0.0, trap_radius, tile.g);
-    color = mix(color, trap_color, trap_strength * trap);
-
-    fragColor = color;
+    if (data.a < 0.5) { fragColor = vec4(uUnresolvedColor, 1.0); return; }
+    float iter = data.r;  // convergence iteration count
+    // optional sub-iteration smoothing via log of final |p(z)|
+    if (uNewtonSmooth == 1) iter += 1.0 - log2(data.g / -13.8155);
+    float speed_t = fract(iter / uCycleLen);
+    float basin_t = data.b / float(uNewtonDegree);  // b = root_index
+    float t;
+    if (uNewtonColorMode == 0)      t = fract(uNewtonPhase + basin_t + speed_t);
+    else if (uNewtonColorMode == 1) t = fract(uNewtonPhase + speed_t);
+    else                            t = fract(uNewtonPhase + basin_t);
+    fragColor = vec4(texture(uLut, vec2(t, 0.5)).rgb, 1.0);
+    return;
 }
+// Mandelbrot / escape-time path
+// Interior: distance shading, angle coloring, period coloring
+// Escaped:  smooth_t → LUT lookup, orbit-trap blend
 ```
 
-Newton coloring uses auto-assigned evenly-spaced hues (`hue = root_index / degree * 360°`) with convergence speed encoded as lightness. No LUT is sampled for Newton pixels. Per-root hue overrides are a v2 addition to the palette editor.
+Newton coloring maps basin index and convergence speed into the shared LUT via `uNewtonColorMode` (basin+speed / speed only / basin only) and `uNewtonPhase` offset. This means custom palettes apply to Newton renders. Per-root hue overrides (bypassing the LUT) are a v2 addition to the palette editor.
 
 **Pass 3 — Post-Process & Tonemap**
 
@@ -503,8 +500,8 @@ The GPU scale step reuses the previous `accumFBO` so the user sees something coh
 | `viewport.ts` | `ViewState`, `ZoomPanFSM` | Coordinate transforms; FSM for pointer / wheel input |
 | `workers.ts` | `WorkerPool` | Spawns N workers; manages `MessageChannel` ports; collects tile completions |
 | `gl-pipeline.ts` | `GlPipeline` | WebGL2 context; FBO setup; all render passes; reads tile data from shared memory via `MemoryLayout` |
-| `color-editor.ts` | `PaletteEditor` | Gradient stop UI; LUT generation; palette preset management |
-| `export.ts` | `ExportDialog`, `ExportSession`, `WorkerLease` | Resolution picker (PNG-only, DPI input, physical size hint); `ExportSession` drives strip render loop via `WorkerLease`; raw RGBA32F PBO readback; dispatches WASM `encode_png` to a Tile Worker |
+| `palette-editor.ts` | `PaletteEditor` | Gradient stop UI; LUT generation; palette preset management |
+| `export.ts` | `ExportDialog`, `ExportSession`, `WorkerLease` | Resolution picker (PNG-only, DPI input, physical size hint); `ExportSession` drives strip render loop via `WorkerLease`; raw RGBA32F PBO readback; streaming PNG encode via `begin_png_encode`/`append_png_strip`/`finish_png_encode` in a Tile Worker |
 | `ui-overlay.ts` | `OverlayController` | Coordinates panel, info bar, keyboard shortcuts, Julia preview |
 
 ### 7.2 Input Handling — ZoomPanFSM
@@ -836,12 +833,12 @@ pub enum NewtonResult {
 
 | Channel | Value |
 |---|---|
-| `r` | `convergence_iter as f32 / max_iter as f32` (convergence_t) |
-| `g` | `0.0` (unused) |
+| `r` | `convergence_iter as f32` (raw iteration count; shader divides by `uCycleLen`) |
+| `g` | `ln\|p(z_N)\|` at the final iterate (used for smooth sub-iteration when `uNewtonSmooth=1`) |
 | `b` | `root_index as f32` |
 | `a` | `1.0` if `Converged`, `0.0` if `Unresolved` |
 
-The GPU shader reads these channels and computes HSL color directly (see §6.2). No LUT is sampled for Newton pixels. The `u_unresolved_color` uniform (dark, near-black by default) handles `Unresolved` pixels; a single uniform covers both divergent and max-iter-exceeded cases.
+The GPU shader maps `(root_index, convergence_iter)` into a LUT coordinate via `uNewtonColorMode` and `uNewtonPhase`, then samples `uLut` — the same LUT used by Mandelbrot coloring (see §6.2). Custom palettes therefore apply to Newton renders. The `uUnresolvedColor` uniform (dark near-black by default) handles `Unresolved` pixels; a single uniform covers both divergent and max-iter-exceeded cases.
 
 ### 10.5 Registration
 
@@ -882,7 +879,7 @@ Adding a new fractal type is: one registry line + trait implementations for the 
 
 | Format | Library | Use case |
 |---|---|---|
-| PNG | `crates/encoding` (Rust, `png` 0.17) | Default; lossless; 16-bit RGB; pHYs (DPI→px/m), sRGB, tEXt metadata; encoded in a Tile Worker via WASM |
+| PNG | `crates/encoding` (Rust, `png` 0.18) | Default; lossless; 16-bit RGB; pHYs (DPI→px/m), sRGB, tEXt metadata; encoded in a Tile Worker via WASM |
 | EXR (32-bit float) | v2 — deferred | Full HDR; preserves raw `smooth_t` for compositing. `exportFBO` is RGBA32F so no GL pipeline change is required when added. |
 
 ### 12.2 Coordinate System
@@ -899,6 +896,8 @@ Export does not use a mode flag on `FractalSession`. Instead, `session.pause()` 
 interface WorkerLease {
   workers: Worker[];
   tileSab: SharedArrayBuffer;
+  /** Terminate worker at index and spawn a fresh initialised replacement (used after OOM / WASM trap). */
+  replaceWorker(index: number): void;
   release(): void;   // restores default tile handler, calls scheduleDispatch()
 }
 ```
@@ -909,26 +908,34 @@ interface WorkerLease {
 
 `exportFBO` is sized `export_width × strip_height` where `strip_height = Math.min(gl.MAX_RENDERBUFFER_SIZE, export_height)`. All exports — including those that fit in a single strip — use the same strip code path.
 
-`ExportSession.run()` sequences strips strictly one at a time:
+`ExportSession.run()` sequences strips strictly one at a time with streaming PNG encoding — peak JS heap is bounded to one strip's pixel data regardless of export resolution:
 
-1. `gl.initExportFBOs(export_width, strip_height)` — allocate/resize `exportFBO` (RGBA32F) and PBO
-2. Dispatch all 256×256 tiles covering the strip; route completions to `gl.uploadExportTile`
-3. `gl.readbackRawStrip()` — async PBO readback of raw RGBA32F pixels directly from `exportFBO`:
+1. `begin_png_encode` — post to `lease.workers[0]`; worker calls `wasm.begin_png_encode(width, height, coloring_params...)` which opens a `StreamingPngEncoder` on its WASM thread-local; wait for `begin_encode_done`
+2. `gl.initExportFBOs(export_width, strip_height)` — allocate/resize `exportFBO` (RGBA32F) and PBO
+3. Dispatch all 256×256 tiles covering the strip; route completions to `gl.uploadExportTile`
+4. `gl.readbackRawStrip()` — async PBO readback of raw RGBA32F pixels directly from `exportFBO`:
    ```js
    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
    gl.readPixels(0, 0, w, stripH, gl.RGBA, gl.FLOAT, 0);
    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
    // poll via requestAnimationFrame until SIGNALED; return Float32Array
    ```
-4. Accumulate strip into `allRaw: Float32Array` (full image, bottom-up row order)
-5. Check `cancelled` flag; if set return `null` immediately
-6. Repeat for next strip; after final strip, transfer `allRaw` to a Tile Worker for encoding
+5. Transfer `raw` buffer to `lease.workers[0]` via `append_png_strip` (zero-copy transfer); worker calls `wasm.append_png_strip` which encodes the strip rows into the open deflate stream; wait for `append_strip_done`
+6. Check `cancelled` flag; if set post `finish_png_encode` to clean up encoder state and return `null`
+7. Repeat steps 3–6 for each remaining strip
+8. `finish_png_encode` — worker calls `wasm.finish_png_encode()` which finalises the deflate stream and writes the IEND chunk; responds with `encode_done` carrying the complete PNG `Uint8Array` (transferred, zero-copy)
 
 `gl.readPixels` is never called synchronously on the main thread. Progress is reported as `onProgress(tilesComplete, totalTiles)` after each tile, spanning all strips.
 
 ### 12.5 Encoding and Download
 
-After all strips are collected, `ExportSession` posts an `encode_png` message to `lease.workers[0]`, transferring `allRaw` (ownership, zero-copy). The Tile Worker calls `wasm.encode_png(...)` — the wasm-bridge function that constructs `ColorParams` from the flat coloring arguments, calls `encoding::encode_png`, and returns `Uint8Array` PNG bytes. The main thread receives `encode_done`, wraps the bytes in a `Blob`, and triggers the download:
+The streaming PNG encoder (`StreamingPngEncoder` in `crates/encoding`) lives in a thread-local on the Tile Worker's WASM instance. Three wasm-bridge entry points drive it:
+
+- `begin_png_encode(width, height, coloring_params...)` — writes the PNG header and opens a deflate stream via `png::Writer::into_stream_writer()` (a single continuous deflate context across all strip appends)
+- `append_png_strip(pixels: &[f32], strip_height: u32)` — converts f32 RGBA → 16-bit RGB rows and writes them into the deflate stream; rows are reversed from bottom-up GL order to top-down PNG order inside this call
+- `finish_png_encode() → Vec<u8>` — finalises the deflate stream, writes the IEND chunk, returns the complete PNG bytes
+
+The main thread receives `encode_done`, wraps the returned `Uint8Array` in a `Blob`, and triggers the download:
 
 ```ts
 const a = document.createElement('a');
@@ -937,8 +944,6 @@ a.download = `fractal-${cx}-zoom${zoom_exp}.png`;
 a.click();
 setTimeout(() => URL.revokeObjectURL(a.href), 0);
 ```
-
-**Row orientation:** GL `readPixels` returns rows bottom-up. `encoding::encode_png` iterates rows in reverse (`for row in (0..height).rev()`) so the PNG output is top-down with no intermediate allocation.
 
 **`ColoringState`:** `FractalSession` accumulates live coloring state (LUT, all shader uniform values, fractal kind) in a `coloringState` field updated on every palette callback. `ExportParams` carries this alongside `dpi`, `view`, and fractal params — the encoding side has everything it needs with no GL state reads at export time.
 
@@ -1021,8 +1026,8 @@ This runs before `fetch`, so non-SIMD browsers never request the SIMD bundle. Sh
 | 2b — Deep Zoom (v2) | Perturbation theory; BigFloat<N>; BLA; glitch correction / rebasing | `arith` (BigFloat), `kernel` (perturb, BLA), `scheduler` |
 | 3 — Newton | Newton fractal: `NewtonResult` type, Durand-Kerner root-finding, Newton params shared memory slot, HSL shader branch, preset picker (`z³−1` default) with advanced coefficient overrides, `compute_roots` wasm-bridge entry point | `kernel` (newton), `wasm-bridge` (compute_roots, newton_params_offset), `gl-pipeline.ts` (shader branch), `session.ts` (polynomial change → compute_roots → tile dispatch) |
 | 4 — Color Editor | Full palette editor, orbit trap, LUT, preset library | `coloring`, `color-editor.ts` |
-| 5 — Export | PNG export pipeline (16-bit RGB, DPI, metadata); `ColoringState` accumulation; `WorkerLease` pause/resume; `ExportSession` strip loop; raw RGBA32F PBO readback; Rust `encode_png` via Tile Worker. EXR deferred to v2. | `crates/coloring`, `crates/encoding`, `wasm-bridge`, `export.ts`, `gl-pipeline.ts`, `session.ts` |
-| 6 — Polish | UI polish pass (layout, spacing, accessibility, keyboard shortcut discoverability); URL bookmark support for Mandelbrot view state (Newton already done — tracked as GitHub issue); Playwright golden tests at specific Mandelbrot coordinates with known escape counts | `web/src/`, `web/e2e/` |
+| 5 — Export | PNG export pipeline (16-bit RGB, DPI, metadata); `ColoringState` accumulation; `WorkerLease` pause/resume; `ExportSession` strip loop; raw RGBA32F PBO readback; streaming `begin_png_encode`/`append_png_strip`/`finish_png_encode` via Tile Worker (peak JS heap = one strip). EXR deferred to v2. | `crates/coloring`, `crates/encoding`, `wasm-bridge`, `export.ts`, `gl-pipeline.ts`, `session.ts` |
+| 6 — Polish | ✅ UI polish pass (layout, spacing, keyboard shortcut discoverability); URL bookmark support for full view state including palette (`p=<json>` param); Newton LUT coloring (palette applies to Newton renders via `uNewtonColorMode`/`uNewtonPhase`); Playwright golden tests — Mandelbrot default, deep-zoom (zoom_exp=17 elephant valley), palette URL round-trip, Newton + custom palette | `web/src/`, `web/e2e/` |
 | 7 — Julia | Julia set as a new fractal type: `IterationMap` impl, parameter `c` picker in UI, `FractalKind::Julia` registration. Second step: Mandelbrot hover preview — pointer position over the Mandelbrot canvas drives the Julia `c` parameter in real time | `kernel` (julia map), `coloring`, `wasm-bridge`, `web/src/ui-overlay.ts`, `web/src/session.ts` |
 
 ---

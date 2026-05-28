@@ -220,7 +220,7 @@ don't mock — use `proptest` properties and golden-coordinate comparisons inste
 
 The LUT is always 4 096 entries × RGBA f32. It is uploaded to a WebGL `lut1D` texture
 and sampled by the fragment shader. Rebuild the LUT whenever palette parameters change;
-avoid rebuilding on every frame. The `PaletteEditor` in `color-editor.ts` owns the
+avoid rebuilding on every frame. The `PaletteEditor` in `palette-editor.ts` owns the
 rebuild lifecycle.
 
 Orbit trap parameters (`trap_radius`, `trap_strength`, `trap_color`) are passed as

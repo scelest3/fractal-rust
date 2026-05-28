@@ -97,7 +97,47 @@ interface EncodePngMsg {
   creationTime: string;
 }
 
-type WorkerMsg = InitMsg | OrbitReadyMsg | RenderTileMsg | EncodePngMsg;
+interface BeginPngEncodeMsg {
+  type: "begin_png_encode";
+  width: number;
+  height: number;
+  lut: Float32Array;
+  cycleLen: number;
+  trapRadius: number;
+  trapStrength: number;
+  trapColor: [number, number, number];
+  interiorColor: [number, number, number];
+  shadingColor: [number, number, number];
+  distanceStrength: number;
+  distancePow: number;
+  angleStrength: number;
+  periodStrength: number;
+  periodCycleLen: number;
+  distWeight: number;
+  fractalKind: number;
+  newtonDegree: number;
+  unresolvedColor: [number, number, number];
+  dpi: number;
+  cx: string;
+  cy: string;
+  zoomExp: number;
+  maxIter: number;
+  newtonDegreeMeta: number;
+  creationTime: string;
+}
+
+interface AppendPngStripMsg {
+  type: "append_png_strip";
+  pixels: Float32Array;
+  stripHeight: number;
+}
+
+interface FinishPngEncodeMsg {
+  type: "finish_png_encode";
+}
+
+type WorkerMsg = InitMsg | OrbitReadyMsg | RenderTileMsg | EncodePngMsg
+  | BeginPngEncodeMsg | AppendPngStripMsg | FinishPngEncodeMsg;
 
 interface WasmExports {
   memory: WebAssembly.Memory;
@@ -174,6 +214,26 @@ interface WasmGlue {
     newtonDegreeMeta: number,
     creationTime: string,
   ) => Uint8Array;
+  begin_png_encode: (
+    width: number, height: number,
+    lut: Float32Array,
+    cycleLen: number,
+    trapRadius: number, trapStrength: number,
+    trapColorR: number, trapColorG: number, trapColorB: number,
+    interiorColorR: number, interiorColorG: number, interiorColorB: number,
+    shadingColorR: number, shadingColorG: number, shadingColorB: number,
+    distanceStrength: number, distancePow: number,
+    angleStrength: number,
+    periodStrength: number, periodCycleLen: number,
+    distWeight: number,
+    fractalKind: number, newtonDegree: number,
+    unresolvedColorR: number, unresolvedColorG: number, unresolvedColorB: number,
+    dpi: number,
+    cx: string, cy: string, zoomExp: number,
+    maxIter: number, newtonDegreeMeta: number, creationTime: string,
+  ) => void;
+  append_png_strip: (pixels: Float32Array, stripHeight: number) => void;
+  finish_png_encode: () => Uint8Array;
 }
 
 let wasm: WasmExports | null = null;
@@ -195,6 +255,12 @@ self.onmessage = async (event: MessageEvent<WorkerMsg>) => {
     handleRenderTile(msg);
   } else if (msg.type === "encode_png") {
     handleEncodePng(msg);
+  } else if (msg.type === "begin_png_encode") {
+    handleBeginPngEncode(msg);
+  } else if (msg.type === "append_png_strip") {
+    handleAppendPngStrip(msg);
+  } else if (msg.type === "finish_png_encode") {
+    handleFinishPngEncode();
   }
 };
 
@@ -280,6 +346,70 @@ function handleRenderTile(msg: RenderTileMsg): void {
     tileY,
     generation,
   });
+}
+
+function handleBeginPngEncode(msg: BeginPngEncodeMsg): void {
+  if (!glueModule) {
+    (self as unknown as Worker).postMessage({ type: "encode_error", error: "begin_png_encode called before init" });
+    return;
+  }
+  try {
+    const [tr, tg, tb] = msg.trapColor;
+    const [ir, ig, ib] = msg.interiorColor;
+    const [sr, sg, sb] = msg.shadingColor;
+    const [ur, ug, ub] = msg.unresolvedColor;
+    glueModule.begin_png_encode(
+      msg.width, msg.height,
+      msg.lut,
+      msg.cycleLen,
+      msg.trapRadius, msg.trapStrength,
+      tr, tg, tb,
+      ir, ig, ib,
+      sr, sg, sb,
+      msg.distanceStrength, msg.distancePow,
+      msg.angleStrength,
+      msg.periodStrength, msg.periodCycleLen,
+      msg.distWeight,
+      msg.fractalKind, msg.newtonDegree,
+      ur, ug, ub,
+      msg.dpi,
+      msg.cx, msg.cy, msg.zoomExp,
+      msg.maxIter, msg.newtonDegreeMeta, msg.creationTime,
+    );
+    (self as unknown as Worker).postMessage({ type: "begin_encode_done" });
+  } catch (e) {
+    console.error("[TileWorker] begin_png_encode failed:", e);
+    (self as unknown as Worker).postMessage({ type: "encode_error", error: String(e) });
+  }
+}
+
+function handleAppendPngStrip(msg: AppendPngStripMsg): void {
+  if (!glueModule) {
+    (self as unknown as Worker).postMessage({ type: "encode_error", error: "append_png_strip called before init" });
+    return;
+  }
+  try {
+    glueModule.append_png_strip(msg.pixels, msg.stripHeight);
+    (self as unknown as Worker).postMessage({ type: "append_strip_done" });
+  } catch (e) {
+    console.error("[TileWorker] append_png_strip failed:", e);
+    (self as unknown as Worker).postMessage({ type: "encode_error", error: String(e) });
+  }
+}
+
+function handleFinishPngEncode(): void {
+  if (!glueModule) {
+    (self as unknown as Worker).postMessage({ type: "encode_error", error: "finish_png_encode called before init" });
+    return;
+  }
+  try {
+    const bytes = glueModule.finish_png_encode();
+    (self as unknown as Worker).postMessage({ type: "encode_done", bytes }, [bytes.buffer]);
+  } catch (e) {
+    console.error("[TileWorker] finish_png_encode failed:", e);
+    glueModule = null; // heap may be corrupted after a WASM trap
+    (self as unknown as Worker).postMessage({ type: "encode_error", error: String(e) });
+  }
 }
 
 function handleEncodePng(msg: EncodePngMsg): void {
