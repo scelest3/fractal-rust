@@ -1,15 +1,22 @@
 import { pixelStep } from "./viewport.ts";
 import type { GlPipeline } from "./gl-pipeline.ts";
 
+// 256 MB of f32 pixels (4 bytes each) per strip — keeps the Float32Array that
+// wasm-bindgen copies into WASM linear memory well within the 4 GB address space.
+const MAX_STRIP_FLOATS = 64 * 1024 * 1024; // 64 M floats = 256 MB
+
 /**
  * Height of each render strip in pixels.
- * Capped by the GPU's maximum renderbuffer size.
+ * Capped by the GPU's maximum renderbuffer size and a WASM memory budget so
+ * that the Float32Array transferred to append_png_strip never causes a WASM OOM.
  */
 export function computeStripHeight(
   exportHeight: number,
   maxRenderbufferSize: number,
+  exportWidth: number,
 ): number {
-  return Math.min(maxRenderbufferSize, exportHeight);
+  const maxByMemBudget = Math.max(1, Math.floor(MAX_STRIP_FLOATS / (exportWidth * 4)));
+  return Math.min(maxRenderbufferSize, exportHeight, maxByMemBudget);
 }
 
 /**
@@ -465,7 +472,7 @@ export class ExportSession {
     const { width, height } = params;
 
     const maxRbs = gl.getMaxRenderbufferSize();
-    const stripHeight = computeStripHeight(height, maxRbs);
+    const stripHeight = computeStripHeight(height, maxRbs, width);
     const stripCount  = computeStripCount(height, stripHeight);
     const step        = computeExportStep(params.view.zoom_exp, height);
 
