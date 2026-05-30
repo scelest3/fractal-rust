@@ -122,4 +122,14 @@ mod tests {
         assert!((result.re - expected.re).abs() < 1e-14);
         assert!((result.im - expected.im).abs() < 1e-14);
     }
+
+    #[test]
+    fn log_exponent_returns_ln_2() {
+        assert_eq!(MAP.log_exponent(), core::f64::consts::LN_2);
+    }
+
+    #[test]
+    fn supports_distance_estimate_returns_true() {
+        assert!(MAP.supports_distance_estimate());
+    }
 }

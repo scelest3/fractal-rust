@@ -112,6 +112,17 @@ pub trait IterationMap {
     fn converged(&self, _z: Complex<f64>, _z_prev: Complex<f64>) -> Option<u32> {
         None
     }
+
+    /// Natural log of the map's iteration exponent, used in the smooth-t colouring formula.
+    /// Default is `ln(2)`, correct for `z²`. Override for `zⁿ`.
+    fn log_exponent(&self) -> f64 {
+        core::f64::consts::LN_2
+    }
+
+    /// Whether this map supports distance-estimate colouring.
+    fn supports_distance_estimate(&self) -> bool {
+        true
+    }
 }
 
 // ── PerturbationSupport trait ─────────────────────────────────────────────────
@@ -495,7 +506,7 @@ pub fn escape_time<M: IterationMap>(map: &M, c: Complex<f64>, max_iter: u32) -> 
 
         if step.escaped {
             let norm     = z.norm_sqr().sqrt();
-            let smooth_t = (iter as f64 + 1.0) - (norm.ln().ln() / core::f64::consts::LN_2);
+            let smooth_t = (iter as f64 + 1.0) - (norm.ln().ln() / map.log_exponent());
             let dz_norm  = dz.norm_sqr().sqrt().max(1e-300);
             let log_dist = (dz_norm / (2.0 * norm * norm.ln().max(1e-300))).ln();
             return EscapeResult::Escaped { iter, smooth_t, orbit_min_r, orbit_min_z,
