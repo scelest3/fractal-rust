@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   type ViewState,
+  type FractalParams,
   DEFAULT_VIEW,
   fractalHeight,
   pixelStep,
@@ -209,6 +210,69 @@ describe("serializeViewState / deserializeViewState round-trips", () => {
     const result = deserializeViewState(fragment)!;
     expect(result.view.cx).toBe(cx);
     expect(result.view.cy).toBe(cy);
+  });
+});
+
+// ── multibrot / julia param serialization ─────────────────────────────────────
+
+describe("serializeViewState / deserializeViewState — multibrot and julia params", () => {
+  const view: ViewState = { cx: "0.0", cy: "0.0", zoom_exp: 0 };
+
+  it("serializes multibrot exponent", () => {
+    const s = serializeViewState(view, "multibrot", undefined, { exponent: 3.5 });
+    expect(s).toContain("f=multibrot");
+    expect(s).toContain("exp=3.5");
+  });
+
+  it("serializes julia exponent and fixed-c", () => {
+    const s = serializeViewState(view, "julia", undefined, { exponent: 2.0, jre: -0.7, jim: 0.27 });
+    expect(s).toContain("f=julia");
+    expect(s).toContain("exp=2");
+    expect(s).toContain("jre=-0.7");
+    expect(s).toContain("jim=0.27");
+  });
+
+  it("does not emit exp for mandelbrot even if fractalParams provided", () => {
+    const s = serializeViewState(view, "mandelbrot", undefined, { exponent: 2.0 } as FractalParams);
+    expect(s).not.toContain("exp=");
+  });
+
+  it("round-trips multibrot exponent", () => {
+    const s = serializeViewState(view, "multibrot", undefined, { exponent: 3.5 });
+    const result = deserializeViewState(s)!;
+    expect(result.fractalKind).toBe("multibrot");
+    expect(result.exponent).toBe(3.5);
+    expect(result.juliaC).toBeUndefined();
+  });
+
+  it("round-trips julia with jre and jim", () => {
+    const s = serializeViewState(view, "julia", undefined, { exponent: 2.0, jre: -0.4, jim: 0.6 });
+    const result = deserializeViewState(s)!;
+    expect(result.fractalKind).toBe("julia");
+    expect(result.juliaC).toEqual({ re: -0.4, im: 0.6 });
+  });
+
+  it("defaults multibrot exponent to 3.0 when exp is absent", () => {
+    const result = deserializeViewState("cx=0&cy=0&z=0&f=multibrot")!;
+    expect(result.exponent).toBe(3.0);
+  });
+
+  it("defaults julia exponent to 2.0 and juliaC to { re: -0.7, im: 0.27 } when absent", () => {
+    const result = deserializeViewState("cx=0&cy=0&z=0&f=julia")!;
+    expect(result.exponent).toBe(2.0);
+    expect(result.juliaC).toEqual({ re: -0.7, im: 0.27 });
+  });
+
+  it("mandelbrot deserialization has no exponent or juliaC", () => {
+    const result = deserializeViewState("cx=0&cy=0&z=0&f=mandelbrot")!;
+    expect(result.exponent).toBeUndefined();
+    expect(result.juliaC).toBeUndefined();
+  });
+
+  it("newton deserialization has no exponent or juliaC", () => {
+    const result = deserializeViewState("cx=0&cy=0&z=0&f=newton&preset=z3-1")!;
+    expect(result.exponent).toBeUndefined();
+    expect(result.juliaC).toBeUndefined();
   });
 });
 

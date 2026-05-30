@@ -22,6 +22,16 @@ export interface ViewState {
   zoom_exp: number;
 }
 
+/** Fractal-kind-specific parameters for URL serialization. */
+export interface FractalParams {
+  /** Non-integer exponent for multibrot (default 3.0) and julia (default 2.0). */
+  exponent?: number;
+  /** Julia fixed-c real part (default -0.7). */
+  jre?: number;
+  /** Julia fixed-c imaginary part (default 0.27). */
+  jim?: number;
+}
+
 /** The default view showing the full Mandelbrot set. */
 export const DEFAULT_VIEW: ViewState = {
   cx: "-0.5",
@@ -98,6 +108,7 @@ export function serializeViewState(
   view: ViewState,
   fractalKind: string,
   extraParams?: string,
+  fractalParams?: FractalParams,
 ): string {
   const parts = [
     `cx=${view.cx}`,
@@ -105,6 +116,14 @@ export function serializeViewState(
     `z=${view.zoom_exp}`,
     `f=${fractalKind}`,
   ];
+  if (fractalKind === "multibrot" && fractalParams?.exponent !== undefined) {
+    parts.push(`exp=${fractalParams.exponent}`);
+  }
+  if (fractalKind === "julia") {
+    if (fractalParams?.exponent !== undefined) parts.push(`exp=${fractalParams.exponent}`);
+    if (fractalParams?.jre !== undefined) parts.push(`jre=${fractalParams.jre}`);
+    if (fractalParams?.jim !== undefined) parts.push(`jim=${fractalParams.jim}`);
+  }
   if (extraParams) parts.push(extraParams);
   return parts.join("&");
 }
@@ -120,6 +139,8 @@ export function deserializeViewState(fragment: string): {
   view: ViewState;
   fractalKind: string;
   extraParams: string;
+  exponent?: number;
+  juliaC?: { re: number; im: number };
 } | null {
   const params = new URLSearchParams(fragment);
   const cx = params.get("cx");
@@ -129,11 +150,31 @@ export function deserializeViewState(fragment: string): {
   if (!cx || !cy || zStr === null || !f) return null;
   const zoom_exp = parseFloat(zStr);
   if (isNaN(zoom_exp)) return null;
-  return {
+
+  const result: NonNullable<ReturnType<typeof deserializeViewState>> = {
     view: { cx, cy, zoom_exp },
     fractalKind: f,
     extraParams: fragment,
   };
+
+  if (f === "multibrot") {
+    const expStr = params.get("exp");
+    result.exponent =
+      expStr !== null && !isNaN(parseFloat(expStr)) ? parseFloat(expStr) : 3.0;
+  }
+  if (f === "julia") {
+    const expStr = params.get("exp");
+    const jreStr = params.get("jre");
+    const jimStr = params.get("jim");
+    result.exponent =
+      expStr !== null && !isNaN(parseFloat(expStr)) ? parseFloat(expStr) : 2.0;
+    result.juliaC = {
+      re: jreStr !== null && !isNaN(parseFloat(jreStr)) ? parseFloat(jreStr) : -0.7,
+      im: jimStr !== null && !isNaN(parseFloat(jimStr)) ? parseFloat(jimStr) : 0.27,
+    };
+  }
+
+  return result;
 }
 
 // ── ZoomPanFSM ────────────────────────────────────────────────────────────────
