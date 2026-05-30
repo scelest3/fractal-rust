@@ -169,9 +169,12 @@ export class FractalSession {
     newtonSmooth:     true,
   };
 
-  // Fractal kind + Newton state
+  // Fractal kind + per-kind state
   private fractalKind: "mandelbrot" | "newton" | "multibrot" | "julia" = "mandelbrot";
   private newtonParams: NewtonParams = defaultNewtonParams();
+  private multibrotExponent: number = 3.0;
+  private juliaExponent: number = 2.0;
+  private juliaC: { re: number; im: number } = { re: -0.7, im: 0.27 };
   private readonly fractalParamsPanel: FractalParamsPanel;
   private modeSelectEl!: HTMLSelectElement;
 
@@ -183,15 +186,18 @@ export class FractalSession {
     modeRow.style.cssText = "margin-bottom:4px;";
     const modeSelect = document.createElement("select");
     modeSelect.style.cssText = SELECT_CSS;
-    (["mandelbrot", "newton"] as const).forEach(kind => {
+    const KIND_LABELS: Record<string, string> = {
+      mandelbrot: "Mandelbrot", newton: "Newton", multibrot: "Multibrot", julia: "Julia",
+    };
+    (["mandelbrot", "newton", "multibrot", "julia"] as const).forEach(kind => {
       const opt = document.createElement("option");
       opt.value = kind;
-      opt.textContent = kind === "mandelbrot" ? "Mandelbrot" : "Newton";
+      opt.textContent = KIND_LABELS[kind];
       modeSelect.appendChild(opt);
     });
     modeSelect.value = this.fractalKind;
     modeSelect.addEventListener("change", () =>
-      this.switchFractalKind(modeSelect.value as "mandelbrot" | "newton"),
+      this.switchFractalKind(modeSelect.value as "mandelbrot" | "newton" | "multibrot" | "julia"),
     );
     modeRow.appendChild(modeSelect);
     this.overlay.appendChild(modeRow);
@@ -265,9 +271,20 @@ export class FractalSession {
     palettePanel.style.top = `${this.overlay.getBoundingClientRect().bottom + PANEL_GAP}px`;
 
     // Fractal params panel — preset picker + advanced coefficient inputs.
-    this.fractalParamsPanel = new FractalParamsPanel((coeffs, degree) => {
-      this.onPolynomialCommit(coeffs, degree);
-    });
+    this.fractalParamsPanel = new FractalParamsPanel(
+      (coeffs, degree) => this.onPolynomialCommit(coeffs, degree),
+      (exponent) => {
+        if (this.fractalKind === "multibrot") this.multibrotExponent = exponent;
+        else if (this.fractalKind === "julia") this.juliaExponent = exponent;
+        this.writeUrlHash();
+        this.scheduleDispatch();
+      },
+      (re, im) => {
+        this.juliaC = { re, im };
+        this.writeUrlHash();
+        this.scheduleDispatch();
+      },
+    );
     document.body.appendChild(this.fractalParamsPanel.getElement());
 
     // Restore fractal kind + Newton params from URL hash if present.
@@ -285,6 +302,15 @@ export class FractalSession {
           this.newtonParams = hashParams;
           this.modeSelectEl.value = "newton";
         }
+      } else if (savedState.fractalKind === "multibrot") {
+        this.fractalKind = "multibrot";
+        this.multibrotExponent = savedState.exponent ?? 3.0;
+        this.modeSelectEl.value = "multibrot";
+      } else if (savedState.fractalKind === "julia") {
+        this.fractalKind = "julia";
+        this.juliaExponent = savedState.exponent ?? 2.0;
+        this.juliaC = savedState.juliaC ?? { re: -0.7, im: 0.27 };
+        this.modeSelectEl.value = "julia";
       } else {
         this.fractalKind = "mandelbrot";
         this.modeSelectEl.value = "mandelbrot";
@@ -299,9 +325,15 @@ export class FractalSession {
       }
     }
     this.fractalParamsPanel.setParams(this.newtonParams);
-    this.fractalParamsPanel.setTitle("Newton");
-    this.fractalParamsPanel.setVisible(this.fractalKind === "newton");
+    this.fractalParamsPanel.setExponent(
+      this.fractalKind === "julia" ? this.juliaExponent : this.multibrotExponent,
+    );
+    this.fractalParamsPanel.setJuliaC(this.juliaC.re, this.juliaC.im);
+    this.fractalParamsPanel.setKind(this.fractalKind);
     this.paletteEditor.setFractalKind(this.fractalKind);
+    this.paletteEditor.setDistanceEnabled(
+      this.fractalKind !== "julia" && this.fractalKind !== "multibrot",
+    );
     if (this.fractalKind === "newton") {
       this.paletteEditor.setNewtonDegree(this.newtonParams.degree);
     }
@@ -323,6 +355,7 @@ export class FractalSession {
 
     this.hiDpi = (window.devicePixelRatio ?? 1) > 1;
     this.overlay.appendChild(this.buildDprToggle(canvas));
+    this.overlay.appendChild(this.buildResetZoomButton());
     this.overlay.appendChild(this.paletteEditor.getToggleButton());
 
     this.exportDialog = new ExportDialog(
@@ -345,6 +378,12 @@ export class FractalSession {
           rootsRe: Array.from(this.newtonParams.rootsRe),
           rootsIm: Array.from(this.newtonParams.rootsIm),
         } : undefined,
+        exponent:
+          this.fractalKind === "multibrot" ? this.multibrotExponent :
+          this.fractalKind === "julia"     ? this.juliaExponent :
+          undefined,
+        juliaCRe: this.fractalKind === "julia" ? this.juliaC.re : undefined,
+        juliaCIm: this.fractalKind === "julia" ? this.juliaC.im : undefined,
       }),
     );
 
@@ -407,7 +446,7 @@ export class FractalSession {
     });
   }
 
-  private switchFractalKind(kind: "mandelbrot" | "newton"): void {
+  private switchFractalKind(kind: "mandelbrot" | "newton" | "multibrot" | "julia"): void {
     if (kind === this.fractalKind) return;
     this.fractalKind = kind;
     this.coloringState.fractalKind = kind === "newton" ? 1 : 0;
@@ -417,9 +456,13 @@ export class FractalSession {
     const view = this.fsm.getView();
     this.fsm.setView({ ...view, zoom_exp: 0 });
 
-    this.fractalParamsPanel.setTitle(kind === "newton" ? "Newton" : kind);
-    this.fractalParamsPanel.setVisible(kind === "newton");
+    this.fractalParamsPanel.setKind(kind);
+    this.fractalParamsPanel.setExponent(
+      kind === "julia" ? this.juliaExponent : this.multibrotExponent,
+    );
+    this.fractalParamsPanel.setJuliaC(this.juliaC.re, this.juliaC.im);
     this.paletteEditor.setFractalKind(kind);
+    this.paletteEditor.setDistanceEnabled(kind !== "julia" && kind !== "multibrot");
     if (kind === "newton") {
       this.paletteEditor.setNewtonDegree(this.newtonParams.degree);
     }
@@ -524,7 +567,7 @@ export class FractalSession {
     }, delayMs);
   }
 
-  /** Write full view state (including fractal kind and Newton params) to the URL hash. */
+  /** Write full view state (including fractal kind and per-kind params) to the URL hash. */
   private writeUrlHash(): void {
     const view = this.fsm.getView();
     let extra: string | undefined;
@@ -536,7 +579,11 @@ export class FractalSession {
       const pParam = `p=${encodeURIComponent(JSON.stringify(palette))}`;
       extra = extra ? `${extra}&${pParam}` : pParam;
     }
-    const fragment = serializeViewState(view, this.fractalKind, extra);
+    const fractalParams =
+      this.fractalKind === "multibrot" ? { exponent: this.multibrotExponent } :
+      this.fractalKind === "julia"     ? { exponent: this.juliaExponent, jre: this.juliaC.re, jim: this.juliaC.im } :
+      undefined;
+    const fragment = serializeViewState(view, this.fractalKind, extra, fractalParams);
     window.history.replaceState(null, "", `#${fragment}`);
   }
 
@@ -550,6 +597,23 @@ export class FractalSession {
     } else if (msg.type === "tile_ready") {
       this.onTileReady(workerIndex, msg);
     }
+  }
+
+  private buildResetZoomButton(): HTMLButtonElement {
+    const btn = document.createElement("button");
+    btn.textContent = "Reset zoom";
+    Object.assign(btn.style, {
+      display: "block", marginTop: "4px", cursor: "pointer",
+      background: "rgba(255,255,255,0.15)", color: "white",
+      border: "1px solid rgba(255,255,255,0.3)", borderRadius: "3px",
+      fontFamily: "monospace", fontSize: "12px", padding: "2px 6px",
+      width: "100%", boxSizing: "border-box",
+    });
+    btn.addEventListener("click", () => {
+      this.fsm.setView({ ...DEFAULT_VIEW });
+      this.scheduleDispatch();
+    });
+    return btn;
   }
 
   private buildDprToggle(canvas: HTMLCanvasElement): HTMLButtonElement {
@@ -662,6 +726,12 @@ export class FractalSession {
           rootsRe: Array.from(this.newtonParams.rootsRe),
           rootsIm: Array.from(this.newtonParams.rootsIm),
         } : undefined;
+        const exponent =
+          this.fractalKind === "multibrot" ? this.multibrotExponent :
+          this.fractalKind === "julia"     ? this.juliaExponent :
+          undefined;
+        const juliaCRe = this.fractalKind === "julia" ? this.juliaC.re : undefined;
+        const juliaCIm = this.fractalKind === "julia" ? this.juliaC.im : undefined;
 
         this.pendingTiles.push({
           deltaRe, deltaIm, step, maxIter,
@@ -673,6 +743,9 @@ export class FractalSession {
           cyRef,
           fractalKind: this.fractalKind,
           newton,
+          exponent,
+          juliaCRe,
+          juliaCIm,
         });
       }
     }

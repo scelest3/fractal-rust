@@ -95,6 +95,9 @@ export class PaletteEditor {
   private currentNewtonDegree = 3;
   // Preset strip ref for Rainbow swatch update
   private presetRow!: HTMLElement;
+  // Distance-shading controls (for setDistanceEnabled)
+  private distanceToggleEl!: HTMLInputElement;
+  private distanceRowEl!: HTMLElement;
 
   constructor(
     initial: Palette,
@@ -610,6 +613,8 @@ export class PaletteEditor {
 
     this.mandelbrotSections = [exteriorSection, trapSection, interiorSection];
     this.newtonSections = [basinsSection, convSection, unresolvedSection];
+    this.distanceToggleEl = distanceToggle;
+    this.distanceRowEl = distanceRow;
 
     panel.append(barCanvas, handleRow, stopListEl, cycleLenRow, presetRow,
       exteriorSection, trapSection, interiorSection,
@@ -619,9 +624,14 @@ export class PaletteEditor {
   }
 
   setFractalKind(kind: "mandelbrot" | "newton" | "multibrot" | "julia"): void {
-    const isMandelbrot = kind === "mandelbrot";
-    for (const s of this.mandelbrotSections) s.style.display = isMandelbrot ? "" : "none";
-    for (const s of this.newtonSections)     s.style.display = isMandelbrot ? "none" : "";
+    const isNewton = kind === "newton";
+    for (const s of this.mandelbrotSections) s.style.display = isNewton ? "none" : "";
+    for (const s of this.newtonSections)     s.style.display = isNewton ? "" : "none";
+  }
+
+  setDistanceEnabled(enabled: boolean): void {
+    this.distanceToggleEl.disabled = !enabled;
+    this.distanceRowEl.style.opacity = enabled ? "" : "0.4";
   }
 
   setNewtonDegree(degree: number): void {
