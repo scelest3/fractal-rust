@@ -1,9 +1,10 @@
 import { pixelStep } from "./viewport.ts";
 import type { GlPipeline } from "./gl-pipeline.ts";
 
-// 256 MB of f32 pixels (4 bytes each) per strip — keeps the Float32Array that
-// wasm-bindgen copies into WASM linear memory well within the 4 GB address space.
-const MAX_STRIP_FLOATS = 64 * 1024 * 1024; // 64 M floats = 256 MB
+// 1 GB of f32 pixels per strip — keeps wasm-bindgen's copy well within WASM's
+// 4 GB address space. 8K (7680w) = ~132 M floats, safely under budget.
+// 16K (15360w) = ~530 M floats per strip, so it splits into 2 strips.
+const MAX_STRIP_FLOATS = 256 * 1024 * 1024; // 256 M floats = 1 GB
 
 /**
  * Height of each render strip in pixels.
@@ -80,7 +81,7 @@ export interface ExportParams {
   dpi: number;
   coloringState: ColoringState;
   view: { cx: string; cy: string; zoom_exp: number };
-  fractalKind: "mandelbrot" | "newton";
+  fractalKind: "mandelbrot" | "newton" | "multibrot" | "julia";
   maxIter: number;
   useF64x2: boolean;
   cxRef: number;
@@ -512,8 +513,12 @@ export class ExportSession {
 
       if (this.cancelled) { await this.abortEncode(); return null; }
 
-      // Encode this strip immediately — no allRaw accumulation.
-      await this.appendStrip(raw, actualH);
+      // GL tiles are placed at the top of the FBO (y near stripHeight).
+      // For the last strip where actualH < stripHeight, the content sits at
+      // the end of the bottom-up raw buffer; slice to the right rows.
+      const rowOffset = (stripHeight - actualH) * width * 4;
+      const rawSlice = rowOffset > 0 ? raw.subarray(rowOffset) : raw;
+      await this.appendStrip(rawSlice, actualH);
     }
 
     if (this.cancelled) { await this.abortEncode(); return null; }

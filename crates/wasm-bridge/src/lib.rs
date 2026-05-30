@@ -169,6 +169,10 @@ const TILE_PIXELS: usize = TILE_SIZE * TILE_SIZE;
 /// `delta_re` / `delta_im` are the fractal coordinates of the tile's
 /// top-left pixel center. `pixel_step` is fractal units per pixel (same
 /// for both axes). `slot_index` selects the ring buffer slot to write into.
+///
+/// `fractal_kind`: 0 = Mandelbrot, 1 = Newton, 2 = Multibrot, 3 = Julia.
+/// `exponent` is used by Multibrot and Julia (ignored for Mandelbrot/Newton).
+/// `julia_c_re` / `julia_c_im` are the fixed parameter c for Julia (ignored otherwise).
 #[wasm_bindgen]
 pub struct TileJob {
     pub delta_re: f64,
@@ -176,6 +180,10 @@ pub struct TileJob {
     pub pixel_step: f64,
     pub max_iter: u32,
     pub slot_index: u32,
+    pub fractal_kind: u32,
+    pub exponent: f64,
+    pub julia_c_re: f64,
+    pub julia_c_im: f64,
 }
 
 /// Result returned to the Tile Worker after rendering.
@@ -187,22 +195,32 @@ pub struct TileResult {
 
 /// Render a 256×256 tile into the WASM heap buffer at `ptr`.
 ///
+/// Unified entry point for all four fractal kinds:
+///   0 = Mandelbrot, 1 = Newton, 2 = Multibrot, 3 = Julia.
+///
+/// For Newton (kind=1) call `install_newton_params` before dispatching tiles.
+/// `exponent` is used by Multibrot and Julia. `julia_c_re`/`julia_c_im` set
+/// the fixed parameter c for Julia. Both are ignored for Mandelbrot/Newton.
+///
 /// `ptr` must be a byte offset returned by `alloc_tile_buf()`. After this
 /// call, the Tile Worker copies the data from WASM linear memory into the
 /// shared SAB slot using `Uint8Array.prototype.set`.
-///
-/// This is the Phase 1 entry point: it avoids the Phase 2 shared-memory path
-/// (which requires `-Z build-std` nightly to inject a `SharedArrayBuffer` as
-/// WASM linear memory) while still producing real escape-time tile data.
 #[wasm_bindgen]
-pub fn render_tile_to_ptr(
+pub fn render_tile_unified_to_ptr(
     delta_re: f64,
     delta_im: f64,
     pixel_step: f64,
     max_iter: u32,
+    fractal_kind: u32,
+    exponent: f64,
+    julia_c_re: f64,
+    julia_c_im: f64,
     ptr: u32,
 ) {
-    let job = TileJob { delta_re, delta_im, pixel_step, max_iter, slot_index: 0 };
+    let job = TileJob {
+        delta_re, delta_im, pixel_step, max_iter, slot_index: 0,
+        fractal_kind, exponent, julia_c_re, julia_c_im,
+    };
     // Safety: ptr is from alloc_tile_buf() — a valid heap allocation of
     // exactly TILE_PIXELS * size_of::<PixelData>() bytes.
     let out =
@@ -211,8 +229,9 @@ pub fn render_tile_to_ptr(
 }
 
 /// Inner implementation: render one 256×256 tile into a caller-supplied
-/// `PixelData` slice. Separated from the wasm export so integration tests
-/// can pass a heap-allocated buffer without requiring shared memory layout.
+/// `PixelData` slice. Dispatches on `job.fractal_kind`:
+///   0 = Mandelbrot, 1 = Newton (requires pre-installed NEWTON_STATE),
+///   2 = Multibrot, 3 = Julia.
 pub fn render_tile_impl(job: &TileJob, out: &mut [kernel::PixelData]) -> TileResult {
     debug_assert_eq!(out.len(), TILE_PIXELS);
 
@@ -226,7 +245,29 @@ pub fn render_tile_impl(job: &TileJob, out: &mut [kernel::PixelData]) -> TileRes
         }
     }
 
-    kernel::render_tile_escape(&kernel::MandelbrotMap, &coords, job.max_iter, out);
+    match job.fractal_kind {
+        0 => kernel::render_tile_escape(&kernel::MandelbrotMap, &coords, job.max_iter, out),
+        1 => NEWTON_STATE.with(|s| {
+            if let Some((degree, coeffs, rre, rim)) = *s.borrow() {
+                render_tile_newton_impl(
+                    degree, &coeffs, &rre, &rim,
+                    job.delta_re, job.delta_im, job.pixel_step, job.max_iter, out,
+                );
+            }
+        }),
+        2 => kernel::render_tile_escape(
+            &kernel::maps::MultibroMap::new(job.exponent),
+            &coords, job.max_iter, out,
+        ),
+        3 => {
+            let c = arith::Complex::new(job.julia_c_re, job.julia_c_im);
+            kernel::render_tile_julia(
+                &kernel::maps::JuliaMap::new(job.exponent, c),
+                &coords, job.max_iter, out,
+            );
+        }
+        _ => {}
+    }
     TileResult { glitch_count: 0 }
 }
 
@@ -351,32 +392,6 @@ pub fn render_tile_newton_impl(
     }
 }
 
-/// Render a 256×256 Newton tile into the WASM heap buffer at `ptr`.
-///
-/// `ptr` must be a byte offset returned by `alloc_tile_buf()`.
-/// `coeffs` is ascending by degree; `roots_re` / `roots_im` come from
-/// `compute_roots()`. Called once per tile by the Tile Worker.
-#[wasm_bindgen]
-pub fn render_tile_newton_to_ptr(
-    degree: u32,
-    coeffs: &[f64],
-    roots_re: &[f64],
-    roots_im: &[f64],
-    delta_re: f64,
-    delta_im: f64,
-    pixel_step: f64,
-    max_iter: u32,
-    ptr: u32,
-) {
-    // Safety: ptr is from alloc_tile_buf() — a valid TILE_PIXELS-sized heap buffer.
-    let out = unsafe {
-        core::slice::from_raw_parts_mut(ptr as *mut kernel::PixelData, TILE_PIXELS)
-    };
-    render_tile_newton_impl(
-        degree, coeffs, roots_re, roots_im,
-        delta_re, delta_im, pixel_step, max_iter, out,
-    );
-}
 
 // ── Phase 2: reference orbit + perturbation rendering ─────────────────────
 
@@ -386,6 +401,26 @@ pub fn render_tile_newton_to_ptr(
 thread_local! {
     static ORBIT: RefCell<Vec<arith::Complex<f64>>> = const { RefCell::new(Vec::new()) };
     static BLA:   RefCell<Vec<kernel::BlaEntry>>    = const { RefCell::new(Vec::new()) };
+    /// Newton polynomial params installed once per polynomial change.
+    /// Stored as (degree, coeffs[11], roots_re[10], roots_im[10]).
+    static NEWTON_STATE: RefCell<Option<(u32, [f64; 11], [f64; 10], [f64; 10])>> =
+        const { RefCell::new(None) };
+}
+
+/// Install Newton polynomial params into WASM thread-local storage.
+///
+/// Must be called before dispatching Newton tiles (`fractal_kind = 1`).
+/// Called once per polynomial change; cheap enough to repeat per-tile if needed.
+#[wasm_bindgen]
+pub fn install_newton_params(degree: u32, coeffs: &[f64], roots_re: &[f64], roots_im: &[f64]) {
+    let mut full_coeffs = [0.0f64; 11];
+    for (i, &c) in coeffs.iter().take(11).enumerate() { full_coeffs[i] = c; }
+    let mut rre = [0.0f64; 10];
+    let mut rim = [0.0f64; 10];
+    let n = (degree as usize).min(10).min(roots_re.len()).min(roots_im.len());
+    rre[..n].copy_from_slice(&roots_re[..n]);
+    rim[..n].copy_from_slice(&roots_im[..n]);
+    NEWTON_STATE.with(|s| *s.borrow_mut() = Some((degree, full_coeffs, rre, rim)));
 }
 
 /// Compute the reference orbit and BLA table for a deep-zoom render.
@@ -796,6 +831,50 @@ mod tests {
         let coeffs = vec![1.0_f64; 12];
         let (_, _, degree) = compute_roots_inner(&coeffs);
         assert_eq!(degree, 10);
+    }
+
+    // ── render_tile_impl unified dispatch ─────────────────────────────────────
+
+    fn make_job(delta_re: f64, delta_im: f64, pixel_step: f64, max_iter: u32,
+                fractal_kind: u32, exponent: f64, julia_c_re: f64, julia_c_im: f64) -> TileJob {
+        TileJob { delta_re, delta_im, pixel_step, max_iter, slot_index: 0,
+                  fractal_kind, exponent, julia_c_re, julia_c_im }
+    }
+
+    #[test]
+    fn unified_kind0_mandelbrot_produces_escaped_pixels() {
+        // Tile at (-2, -1.5) step=1/256 is mostly exterior — escaped pixels expected.
+        let job = make_job(-2.0, -1.5, 1.0 / 256.0, 64, 0, 0.0, 0.0, 0.0);
+        let mut out = vec![kernel::PixelData::default(); TILE_PIXELS];
+        render_tile_impl(&job, &mut out);
+        // Escaped pixels have ch3 == 1.0; interior have ch3 == 0.0.
+        assert!(out.iter().any(|p| p.0[3] == 1.0), "kind=0 must produce escaped pixels");
+    }
+
+    #[test]
+    fn unified_kind2_multibrot_origin_interior() {
+        // Tile centered on origin with tiny step — origin (c=0) is always interior.
+        let job = make_job(-128e-6, -128e-6, 1e-6, 200, 2, 3.0, 0.0, 0.0);
+        let mut out = vec![kernel::PixelData::default(); TILE_PIXELS];
+        render_tile_impl(&job, &mut out);
+        // Center pixel (row=128, col=128) = coordinate (0+1e-10, 0+1e-10) ≈ origin — interior.
+        let center = out[128 * TILE_SIZE + 128];
+        assert_eq!(center.0[3], 0.0, "center pixel near origin must be interior for Multibrot");
+        // Far-corner pixel (row=255, col=255) = (127e-6, 127e-6) — still small; check render ran.
+        assert!(out.iter().any(|p| p.0[1] > 0.0 || p.0[0] > 0.0),
+            "kind=2 render must produce non-zero orbit_min_r or period");
+    }
+
+    #[test]
+    fn unified_kind3_julia_has_escaped_and_interior_pixels() {
+        // Classic Julia c=-0.7+0.27i, tile covering boundary region.
+        let job = make_job(-0.5, -0.5, 1.0 / 256.0, 500, 3, 2.0, -0.7, 0.27);
+        let mut out = vec![kernel::PixelData::default(); TILE_PIXELS];
+        render_tile_impl(&job, &mut out);
+        let escaped  = out.iter().any(|p| p.0[3] == 1.0);
+        let interior = out.iter().any(|p| p.0[3] == 0.0 && p.0[1] > 0.0); // orbit_min_r > 0
+        assert!(escaped,  "kind=3 Julia tile must contain escaped pixels");
+        assert!(interior, "kind=3 Julia tile must contain interior pixels");
     }
 }
 

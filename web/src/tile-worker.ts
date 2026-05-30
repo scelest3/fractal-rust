@@ -63,7 +63,10 @@ interface RenderTileMsg {
   useF64x2: boolean;
   cxRef: number;
   cyRef: number;
-  fractalKind: "mandelbrot" | "newton";
+  fractalKind: "mandelbrot" | "newton" | "multibrot" | "julia";
+  exponent?: number;
+  juliaCRe?: number;
+  juliaCIm?: number;
   newton?: NewtonRenderParams;
 }
 
@@ -143,11 +146,15 @@ interface WasmExports {
   memory: WebAssembly.Memory;
   alloc_tile_buf: () => number;
   free_tile_buf: (ptr: number) => void;
-  render_tile_to_ptr: (
+  render_tile_unified_to_ptr: (
     deltaRe: number,
     deltaIm: number,
     pixelStep: number,
     maxIter: number,
+    fractalKind: number,
+    exponent: number,
+    juliaCRe: number,
+    juliaCIm: number,
     ptr: number,
   ) => void;
   render_tile_f64x2: (
@@ -173,16 +180,11 @@ interface WasmExports {
 interface WasmGlue {
   install_orbit: (orbitF64: Float64Array, blaBytes: Uint8Array) => void;
   // Slice parameters (&[f64]) require the JS glue wrapper, not the raw WASM export.
-  render_tile_newton_to_ptr: (
+  install_newton_params: (
     degree: number,
     coeffs: Float64Array,
     rootsRe: Float64Array,
     rootsIm: Float64Array,
-    deltaRe: number,
-    deltaIm: number,
-    pixelStep: number,
-    maxIter: number,
-    ptr: number,
   ) => void;
   encode_png: (
     pixels: Float32Array,
@@ -304,6 +306,11 @@ function handleOrbitReady(msg: OrbitReadyMsg): void {
   glueModule.install_orbit(orbitF64, blaLocal);
 }
 
+function fractalKindToU32(kind: RenderTileMsg["fractalKind"]): number {
+  const map: Record<string, number> = { mandelbrot: 0, newton: 1, multibrot: 2, julia: 3 };
+  return map[kind] ?? 0;
+}
+
 function handleRenderTile(msg: RenderTileMsg): void {
   if (!wasm || !tileSab) {
     console.error("[TileWorker] render_tile before init");
@@ -316,19 +323,25 @@ function handleRenderTile(msg: RenderTileMsg): void {
 
   const ptr = wasm.alloc_tile_buf();
 
+  // Install Newton params into WASM thread-local before dispatching tiles.
   if (fractalKind === "newton" && msg.newton && glueModule) {
     const { degree, coeffs, rootsRe, rootsIm } = msg.newton;
-    glueModule.render_tile_newton_to_ptr(
+    glueModule.install_newton_params(
       degree,
       new Float64Array(coeffs),
       new Float64Array(rootsRe),
       new Float64Array(rootsIm),
-      deltaRe, deltaIm, step, maxIter, ptr,
     );
-  } else if (useF64x2) {
+  }
+
+  if (useF64x2) {
     wasm.render_tile_f64x2(cxRef, cyRef, deltaRe, deltaIm, step, maxIter, ptr);
   } else {
-    wasm.render_tile_to_ptr(deltaRe, deltaIm, step, maxIter, ptr);
+    const kindNum = fractalKindToU32(fractalKind);
+    wasm.render_tile_unified_to_ptr(
+      deltaRe, deltaIm, step, maxIter,
+      kindNum, msg.exponent ?? 2.0, msg.juliaCRe ?? 0.0, msg.juliaCIm ?? 0.0, ptr,
+    );
   }
 
   // Copy WASM heap → tileSab slot. Re-read memory.buffer in case WASM grew.

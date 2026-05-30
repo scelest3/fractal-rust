@@ -7,7 +7,7 @@
 //! reference orbit path (Phase 2).
 
 pub mod maps;
-pub use maps::MandelbrotMap;
+pub use maps::{JuliaMap, MandelbrotMap, MultibroMap};
 
 use arith::{Complex, DeltaC, Precision};
 
@@ -542,6 +542,62 @@ pub fn render_tile_escape<M: IterationMap>(
     debug_assert_eq!(coords.len(), out.len());
     for (c, slot) in coords.iter().zip(out.iter_mut()) {
         *slot = PixelData::from(escape_time(map, *c, max_iter));
+    }
+}
+
+// ── escape_time_julia ─────────────────────────────────────────────────────────
+
+/// Compute the escape-time result for one Julia-set pixel.
+///
+/// The pixel coordinate is used as `z₀`; `map.c` is the fixed Julia parameter.
+/// Distance-estimate tracking is omitted — `JuliaMap::supports_distance_estimate`
+/// returns `false`, so `log_dist` is always 0.0.
+pub fn escape_time_julia(map: &JuliaMap, z0: Complex<f64>, max_iter: u32) -> EscapeResult {
+    let mut z = z0;
+    let mut orbit_min_r = f64::MAX;
+    let mut orbit_min_z = Complex::<f64>::zero();
+    let c_zero = Complex::<f64>::zero(); // ignored by JuliaMap::step
+
+    for iter in 0..max_iter {
+        let step   = map.step(z, c_zero);
+        let z_new  = step.z;
+        let z_prev = z;
+
+        let r = z_new.norm_sqr().sqrt();
+        if r < orbit_min_r { orbit_min_r = r; orbit_min_z = z_new; }
+
+        z = z_new;
+
+        if step.escaped {
+            let norm     = z.norm_sqr().sqrt();
+            let smooth_t = (iter as f64 + 1.0) - (norm.ln().ln() / map.log_exponent());
+            return EscapeResult::Escaped { iter, smooth_t, orbit_min_r, orbit_min_z,
+                log_dist: 0.0 };
+        }
+
+        if let Some(p) = map.converged(z, z_prev) {
+            return EscapeResult::Interior { orbit_min_r, orbit_min_z, period: p };
+        }
+    }
+
+    EscapeResult::Interior { orbit_min_r, orbit_min_z, period: 0 }
+}
+
+// ── render_tile_julia ─────────────────────────────────────────────────────────
+
+/// Fill `out` with escape-time results for a Julia map.
+///
+/// Each entry in `coords` is the pixel's complex coordinate used as `z₀`.
+/// `coords` and `out` must have the same length (asserted in debug builds).
+pub fn render_tile_julia(
+    map: &JuliaMap,
+    coords: &[Complex<f64>],
+    max_iter: u32,
+    out: &mut [PixelData],
+) {
+    debug_assert_eq!(coords.len(), out.len());
+    for (z0, slot) in coords.iter().zip(out.iter_mut()) {
+        *slot = PixelData::from(escape_time_julia(map, *z0, max_iter));
     }
 }
 
@@ -1439,5 +1495,21 @@ mod tests {
             tile_pixels_match(et_px, pp_px),
             "secondary-corrected result must match escape_time: et={et_px:?} pp={pp_px:?}"
         );
+    }
+
+    // ── render_tile_julia ─────────────────────────────────────────────────────
+
+    #[test]
+    fn render_tile_julia_mixed_tile() {
+        // c=-0.5+0.5i is inside the main Mandelbrot cardioid, so z₀=0 is interior.
+        // c=-0.7+0.27i is just outside M; use a clearly-exterior z₀=1+0i to escape fast.
+        let map = JuliaMap::new(2.0, Complex::new(-0.5, 0.5));
+        // z₀=0+0i is interior; z₀=1.5+0i escapes quickly.
+        let coords = [Complex::new(0.0_f64, 0.0), Complex::new(1.5_f64, 0.0)];
+        let mut out = [PixelData::default(); 2];
+        render_tile_julia(&map, &coords, 500, &mut out);
+        // Channel 3 (index [3]) is 0.0 for interior, 1.0 for escaped.
+        assert_eq!(out[0].0[3], 0.0, "z₀=0 should be interior (channel 3 = 0)");
+        assert_eq!(out[1].0[3], 1.0, "z₀=1 should be escaped (channel 3 = 1)");
     }
 }

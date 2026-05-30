@@ -618,7 +618,7 @@ export class PaletteEditor {
     return { panel, barCanvas, handleRow, stopListEl };
   }
 
-  setFractalKind(kind: "mandelbrot" | "newton"): void {
+  setFractalKind(kind: "mandelbrot" | "newton" | "multibrot" | "julia"): void {
     const isMandelbrot = kind === "mandelbrot";
     for (const s of this.mandelbrotSections) s.style.display = isMandelbrot ? "" : "none";
     for (const s of this.newtonSections)     s.style.display = isMandelbrot ? "none" : "";

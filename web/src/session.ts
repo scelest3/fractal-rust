@@ -28,9 +28,11 @@ import { PANEL_GAP, SELECT_CSS } from "./ui-constants.ts";
 
 const BASE_ITER = 256;
 
-const ZOOM_RANGES: Record<"mandelbrot" | "newton", [number, number]> = {
+const ZOOM_RANGES: Record<"mandelbrot" | "newton" | "multibrot" | "julia", [number, number]> = {
   mandelbrot: [-7, 17],
   newton:     [-7, 14],
+  multibrot:  [-7, 14],
+  julia:      [-7, 14],
 };
 const ITER_PER_DECADE = 64;
 const TILE_SIZE = 256;
@@ -83,7 +85,10 @@ interface TileDesc {
   useF64x2: boolean;
   cxRef: number;
   cyRef: number;
-  fractalKind: "mandelbrot" | "newton";
+  fractalKind: "mandelbrot" | "newton" | "multibrot" | "julia";
+  exponent?: number;
+  juliaCRe?: number;
+  juliaCIm?: number;
   newton?: { degree: number; coeffs: number[]; rootsRe: number[]; rootsIm: number[] };
 }
 
@@ -165,7 +170,7 @@ export class FractalSession {
   };
 
   // Fractal kind + Newton state
-  private fractalKind: "mandelbrot" | "newton" = "mandelbrot";
+  private fractalKind: "mandelbrot" | "newton" | "multibrot" | "julia" = "mandelbrot";
   private newtonParams: NewtonParams = defaultNewtonParams();
   private readonly fractalParamsPanel: FractalParamsPanel;
   private modeSelectEl!: HTMLSelectElement;
