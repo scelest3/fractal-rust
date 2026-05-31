@@ -1,11 +1,11 @@
 {
   "name": "fractal-rust-web",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc && vite build && find dist/pkg dist/pkg-nosimd -name '*.d.ts' -o -name '.gitignore' | xargs rm -f",
     "preview": "vite preview",
     "test": "vitest",
     "test:e2e": "playwright test",

@@ -21,7 +21,8 @@ export function detectSimd(): boolean {
  * Called once at startup before instantiation.
  */
 export function wasmBundleUrl(): string {
+  const base = import.meta.env.BASE_URL;
   return detectSimd()
-    ? "/pkg/wasm_bridge_bg.wasm"
-    : "/pkg-nosimd/wasm_bridge_bg.wasm";
+    ? `${base}pkg/wasm_bridge_bg.wasm`
+    : `${base}pkg-nosimd/wasm_bridge_bg.wasm`;
 }

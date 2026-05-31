@@ -17,24 +17,24 @@ wasm-pack build crates/wasm-bridge \
   --target web \
   --no-pack \
   $DEV \
-  --out-dir ../../web/pkg \
+  --out-dir ../../web/public/pkg \
   -- --features simd
 
 echo "==> wasm-opt pass (SIMD + threads)..."
-wasm-opt web/pkg/wasm_bridge_bg.wasm \
+wasm-opt web/public/pkg/wasm_bridge_bg.wasm \
   -O3 --enable-threads --enable-simd \
-  -o web/pkg/wasm_bridge_bg.wasm
+  -o web/public/pkg/wasm_bridge_bg.wasm
 
 echo "==> Building non-SIMD bundle..."
 wasm-pack build crates/wasm-bridge \
   --target web \
   --no-pack \
   $DEV \
-  --out-dir ../../web/pkg-nosimd
+  --out-dir ../../web/public/pkg-nosimd
 
 echo "==> wasm-opt pass (threads only)..."
-wasm-opt web/pkg-nosimd/wasm_bridge_bg.wasm \
+wasm-opt web/public/pkg-nosimd/wasm_bridge_bg.wasm \
   -O3 --enable-threads \
-  -o web/pkg-nosimd/wasm_bridge_bg.wasm
+  -o web/public/pkg-nosimd/wasm_bridge_bg.wasm
 
-echo "==> Done. Bundles in web/pkg/ and web/pkg-nosimd/"
+echo "==> Done. Bundles in web/public/pkg/ and web/public/pkg-nosimd/"
