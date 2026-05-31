@@ -1,13 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
   <defs>
     <radialGradient id="body" cx="68%" cy="48%" r="55%">
-      <stop offset="0%"   stop-color="#60e8ff"/>
-      <stop offset="45%"  stop-color="#1888ff"/>
-      <stop offset="100%" stop-color="#0428a0"/>
+      <stop offset="0%"   stop-color="#ff8040"/>
+      <stop offset="45%"  stop-color="#CE422B"/>
+      <stop offset="100%" stop-color="#6b1508"/>
     </radialGradient>
     <radialGradient id="bulb" cx="40%" cy="48%" r="60%">
-      <stop offset="0%"   stop-color="#40ccff"/>
-      <stop offset="100%" stop-color="#0040d0"/>
+      <stop offset="0%"   stop-color="#ffaa60"/>
+      <stop offset="100%" stop-color="#9a1a08"/>
     </radialGradient>
     <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
       <feGaussianBlur in="SourceGraphic" stdDeviation="0.8" result="blur"/>
@@ -22,8 +22,6 @@
   <rect width="32" height="32" rx="5" ry="5" fill="#06060f"/>
 
   <!-- Mandelbrot silhouette: main cardioid + period-2 bulb -->
-  <!-- Cardioid computed from c = e^(iθ)/2 − e^(2iθ)/4, mapped to viewBox -->
-  <!-- Fractal range [-2.1, 0.6] × [-1.35, 1.35] → scale ≈ 11.85, offset (2.1, 1.35) -->
   <g filter="url(#glow)">
     <circle cx="13" cy="16" r="3.1" fill="url(#bulb)"/>
     <polygon fill="url(#body)" points="
