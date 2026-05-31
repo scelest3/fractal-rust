@@ -915,6 +915,9 @@ pub fn begin_png_encode(
     zoom_exp: f64,
     max_iter: u32,
     newton_degree_meta: i32,
+    exponent: f64,
+    julia_c_re: f64,
+    julia_c_im: f64,
     creation_time: &str,
 ) -> Result<(), JsValue> {
     let params = ColorParams {
@@ -941,10 +944,18 @@ pub fn begin_png_encode(
         cx,
         cy,
         zoom_exp,
-        fractal_kind: if fractal_kind == 1 { "newton" } else { "mandelbrot" },
+        fractal_kind: match fractal_kind {
+            1 => "newton",
+            2 => "multibrot",
+            3 => "julia",
+            _ => "mandelbrot",
+        },
         max_iter,
         newton_degree: if newton_degree_meta >= 0 { Some(newton_degree_meta as u32) } else { None },
         creation_time: if creation_time.is_empty() { None } else { Some(creation_time) },
+        exponent:   if fractal_kind == 2 || fractal_kind == 3 { Some(exponent) } else { None },
+        julia_c_re: if fractal_kind == 3 { Some(julia_c_re) } else { None },
+        julia_c_im: if fractal_kind == 3 { Some(julia_c_im) } else { None },
     };
     let encoder = encoding::StreamingPngEncoder::new(width, height, lut, params, fractal_kind, &meta)
         .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
@@ -1008,6 +1019,9 @@ pub fn encode_png(
     zoom_exp: f64,
     max_iter: u32,
     newton_degree_meta: i32,
+    exponent: f64,
+    julia_c_re: f64,
+    julia_c_im: f64,
     creation_time: &str,
 ) -> Result<Vec<u8>, JsValue> {
     let _ = (strip_y_offset, strip_height); // reserved for future stateful API
@@ -1035,10 +1049,18 @@ pub fn encode_png(
         cx,
         cy,
         zoom_exp,
-        fractal_kind: if fractal_kind == 1 { "newton" } else { "mandelbrot" },
+        fractal_kind: match fractal_kind {
+            1 => "newton",
+            2 => "multibrot",
+            3 => "julia",
+            _ => "mandelbrot",
+        },
         max_iter,
         newton_degree: if newton_degree_meta >= 0 { Some(newton_degree_meta as u32) } else { None },
         creation_time: if creation_time.is_empty() { None } else { Some(creation_time) },
+        exponent:   if fractal_kind == 2 || fractal_kind == 3 { Some(exponent) } else { None },
+        julia_c_re: if fractal_kind == 3 { Some(julia_c_re) } else { None },
+        julia_c_im: if fractal_kind == 3 { Some(julia_c_im) } else { None },
     };
     encoding::encode_png(pixels, width, height, lut, &params, fractal_kind, &meta)
         .map_err(|e| JsValue::from_str(&format!("{e:?}")))

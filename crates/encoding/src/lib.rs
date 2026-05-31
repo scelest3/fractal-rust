@@ -34,13 +34,19 @@ pub struct PngMetadata<'a> {
     pub cx: &'a str,
     pub cy: &'a str,
     pub zoom_exp: f64,
-    pub fractal_kind: &'a str, // "mandelbrot" or "newton"
+    pub fractal_kind: &'a str, // "mandelbrot" | "newton" | "multibrot" | "julia"
     pub max_iter: u32,
     pub newton_degree: Option<u32>,
     /// ISO 8601 UTC creation timestamp. `None` omits the tEXt chunk.
     /// On WASM pass `new Date().toISOString()` from the caller; on native
     /// use `SystemTime::now()` formatted by the caller.
     pub creation_time: Option<&'a str>,
+    /// Non-integer exponent for Multibrot (z^n) and Julia (z^n + c). `None` for Mandelbrot/Newton.
+    pub exponent: Option<f64>,
+    /// Real part of the Julia set's fixed parameter c. `None` for non-Julia kinds.
+    pub julia_c_re: Option<f64>,
+    /// Imaginary part of the Julia set's fixed parameter c. `None` for non-Julia kinds.
+    pub julia_c_im: Option<f64>,
 }
 
 // ── encode_png ────────────────────────────────────────────────────────────────
@@ -89,6 +95,15 @@ pub fn encode_png(
     encoder.add_text_chunk("fractal:max_iter".into(), format!("{}", metadata.max_iter))?;
     if let Some(deg) = metadata.newton_degree {
         encoder.add_text_chunk("fractal:newton_degree".into(), format!("{deg}"))?;
+    }
+    if let Some(e) = metadata.exponent {
+        encoder.add_text_chunk("fractal:exponent".into(), format!("{e}"))?;
+    }
+    if let Some(re) = metadata.julia_c_re {
+        encoder.add_text_chunk("fractal:julia_c_re".into(), format!("{re}"))?;
+    }
+    if let Some(im) = metadata.julia_c_im {
+        encoder.add_text_chunk("fractal:julia_c_im".into(), format!("{im}"))?;
     }
 
     // ── Pixel data ────────────────────────────────────────────────────────────
@@ -215,6 +230,15 @@ impl StreamingPngEncoder {
         if let Some(deg) = metadata.newton_degree {
             encoder.add_text_chunk("fractal:newton_degree".into(), format!("{deg}"))?;
         }
+        if let Some(e) = metadata.exponent {
+            encoder.add_text_chunk("fractal:exponent".into(), format!("{e}"))?;
+        }
+        if let Some(re) = metadata.julia_c_re {
+            encoder.add_text_chunk("fractal:julia_c_re".into(), format!("{re}"))?;
+        }
+        if let Some(im) = metadata.julia_c_im {
+            encoder.add_text_chunk("fractal:julia_c_im".into(), format!("{im}"))?;
+        }
 
         // into_stream_writer consumes the Writer and returns StreamWriter<'static, W>,
         // so no borrow lifetime escapes — stream can be stored alongside output.
@@ -318,6 +342,9 @@ mod tests {
             max_iter: 256,
             newton_degree: None,
             creation_time: Some("2025-01-01T00:00:00Z"),
+            exponent: None,
+            julia_c_re: None,
+            julia_c_im: None,
         }
     }
 
@@ -401,6 +428,47 @@ mod tests {
             out.windows(b"fractal:newton_degree".len())
                 .any(|w| w == b"fractal:newton_degree"),
             "newton_degree key missing",
+        );
+    }
+
+    #[test]
+    fn text_exponent_present_for_multibrot() {
+        let pixels = vec![0.0, 0.0, 0.0, 1.0f32];
+        let m = PngMetadata { fractal_kind: "multibrot", exponent: Some(3.0), ..meta(300) };
+        let out = encode_png(&pixels, 1, 1, &white_lut(), &default_params(), 2, &m).unwrap();
+        assert!(
+            out.windows(b"fractal:exponent".len()).any(|w| w == b"fractal:exponent"),
+            "fractal:exponent key missing for multibrot",
+        );
+    }
+
+    #[test]
+    fn text_julia_chunks_present_for_julia() {
+        let pixels = vec![0.0, 0.0, 0.0, 1.0f32];
+        let m = PngMetadata {
+            fractal_kind: "julia",
+            exponent: Some(2.0),
+            julia_c_re: Some(-0.7),
+            julia_c_im: Some(0.27),
+            ..meta(300)
+        };
+        let out = encode_png(&pixels, 1, 1, &white_lut(), &default_params(), 3, &m).unwrap();
+        for key in &[b"fractal:exponent" as &[u8], b"fractal:julia_c_re", b"fractal:julia_c_im"] {
+            assert!(
+                out.windows(key.len()).any(|w| w == *key),
+                "missing key: {}",
+                std::str::from_utf8(key).unwrap_or("?"),
+            );
+        }
+    }
+
+    #[test]
+    fn text_exponent_absent_for_mandelbrot() {
+        let pixels = vec![0.0, 0.0, 0.0, 1.0f32];
+        let out = encode_png(&pixels, 1, 1, &white_lut(), &default_params(), 0, &meta(300)).unwrap();
+        assert!(
+            !out.windows(b"fractal:exponent".len()).any(|w| w == b"fractal:exponent"),
+            "fractal:exponent should be absent for mandelbrot",
         );
     }
 

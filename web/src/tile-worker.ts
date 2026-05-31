@@ -97,6 +97,9 @@ interface EncodePngMsg {
   zoomExp: number;
   maxIter: number;
   newtonDegreeMeta: number;
+  exponent: number;
+  juliaCRe: number;
+  juliaCIm: number;
   creationTime: string;
 }
 
@@ -126,6 +129,9 @@ interface BeginPngEncodeMsg {
   zoomExp: number;
   maxIter: number;
   newtonDegreeMeta: number;
+  exponent: number;
+  juliaCRe: number;
+  juliaCIm: number;
   creationTime: string;
 }
 
@@ -214,6 +220,7 @@ interface WasmGlue {
     zoomExp: number,
     maxIter: number,
     newtonDegreeMeta: number,
+    exponent: number, juliaCRe: number, juliaCIm: number,
     creationTime: string,
   ) => Uint8Array;
   begin_png_encode: (
@@ -232,7 +239,9 @@ interface WasmGlue {
     unresolvedColorR: number, unresolvedColorG: number, unresolvedColorB: number,
     dpi: number,
     cx: string, cy: string, zoomExp: number,
-    maxIter: number, newtonDegreeMeta: number, creationTime: string,
+    maxIter: number, newtonDegreeMeta: number,
+    exponent: number, juliaCRe: number, juliaCIm: number,
+    creationTime: string,
   ) => void;
   append_png_strip: (pixels: Float32Array, stripHeight: number) => void;
   finish_png_encode: () => Uint8Array;
@@ -387,7 +396,9 @@ function handleBeginPngEncode(msg: BeginPngEncodeMsg): void {
       ur, ug, ub,
       msg.dpi,
       msg.cx, msg.cy, msg.zoomExp,
-      msg.maxIter, msg.newtonDegreeMeta, msg.creationTime,
+      msg.maxIter, msg.newtonDegreeMeta,
+      msg.exponent, msg.juliaCRe, msg.juliaCIm,
+      msg.creationTime,
     );
     (self as unknown as Worker).postMessage({ type: "begin_encode_done" });
   } catch (e) {
@@ -456,6 +467,7 @@ function handleEncodePng(msg: EncodePngMsg): void {
       msg.cx, msg.cy, msg.zoomExp,
       msg.maxIter,
       msg.newtonDegreeMeta,
+      msg.exponent, msg.juliaCRe, msg.juliaCIm,
       msg.creationTime,
     );
     (self as unknown as Worker).postMessage({ type: "encode_done", bytes }, [bytes.buffer]);

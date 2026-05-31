@@ -341,12 +341,11 @@ export class ExportDialog {
     }
 
     if (blob) {
-      const cx = parseFloat(params.view.cx).toFixed(6);
       const zoom = params.view.zoom_exp.toFixed(2);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `fractal-${cx}-zoom${zoom}.png`;
+      a.download = `${params.fractalKind}-zoom${zoom}.png`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 0);
       this.dialog.close();
@@ -442,6 +441,9 @@ interface BeginEncodeWorkerMsg {
   zoomExp: number;
   maxIter: number;
   newtonDegreeMeta: number;
+  exponent: number;
+  juliaCRe: number;
+  juliaCIm: number;
   creationTime: string;
 }
 
@@ -580,6 +582,9 @@ export class ExportSession {
       maxIter:          params.maxIter,
       newtonDegreeMeta: params.fractalKind === "newton" && params.newton
                         ? params.newton.degree : -1,
+      exponent:         params.exponent ?? 2.0,
+      juliaCRe:         params.juliaCRe ?? 0.0,
+      juliaCIm:         params.juliaCIm ?? 0.0,
       creationTime:     new Date().toISOString(),
     };
     return this.sendEncodeMsg(msg);
