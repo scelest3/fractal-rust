@@ -179,13 +179,16 @@ export function deserializeViewState(fragment: string): {
 
 // ── ZoomPanFSM ────────────────────────────────────────────────────────────────
 
-export type FsmState = "IDLE" | "PANNING" | "ZOOMING";
+export type FsmState = "IDLE" | "PANNING" | "ZOOMING" | "PINCHING";
 
 /**
  * Pan and zoom sensitivity. One typical mouse-wheel tick (deltaY ≈ 100)
  * produces a 0.1 change in zoom_exp — one tenth of a decade.
  */
 const ZOOM_SPEED = 0.001;
+
+/** Pinch zoom sensitivity multiplier relative to wheel zoom. */
+const PINCH_SENSITIVITY = 8;
 
 /** Default precision cap: F64x2 renders cleanly to zoom_exp ≈ 17. */
 const DEFAULT_MAX_ZOOM_EXP = 17;
@@ -226,9 +229,9 @@ export class ZoomPanFSM {
   private minZoomExp = DEFAULT_MIN_ZOOM_EXP;
   private maxZoomExp = DEFAULT_MAX_ZOOM_EXP;
 
-  // Pan tracking
-  private panStartPx = 0;
-  private panStartPy = 0;
+  // Pointer tracking (pan + pinch)
+  private pointers: Map<number, { x: number; y: number }> = new Map();
+  private pinchLastDist = 0;
 
   // Zoom debounce
   private zoomDebounceId: ReturnType<typeof setTimeout> | null = null;
@@ -310,15 +313,16 @@ export class ZoomPanFSM {
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return; // ignore right-click (used by BoxZoom)
       canvas.setPointerCapture(e.pointerId);
-      this.handlePointerDown(e.offsetX * this.pixelScale, e.offsetY * this.pixelScale);
+      this.handlePointerDown(e.pointerId, e.offsetX * this.pixelScale, e.offsetY * this.pixelScale);
     };
     const onPointerMove = (e: PointerEvent) => {
-      if ((e.buttons & 1) === 0) return; // only track primary button
-      this.handlePointerMove(e.offsetX * this.pixelScale, e.offsetY * this.pixelScale);
+      if (!this.pointers.has(e.pointerId)) return;
+      if (this.state === "PANNING" && (e.buttons & 1) === 0) return;
+      this.handlePointerMove(e.pointerId, e.offsetX * this.pixelScale, e.offsetY * this.pixelScale);
     };
     const onPointerUp = (e: PointerEvent) => {
       if (e.button !== 0) return;
-      this.handlePointerUp();
+      this.handlePointerUp(e.pointerId);
     };
 
     canvas.addEventListener("wheel", onWheel, { passive: false });
@@ -338,29 +342,46 @@ export class ZoomPanFSM {
 
   // ── Event handlers (public for testing) ─────────────────────────────────────
 
-  handlePointerDown(px: number, py: number): void {
-    this.state = "PANNING";
-    this.panStartPx = px;
-    this.panStartPy = py;
+  handlePointerDown(pointerId: number, px: number, py: number): void {
+    this.pointers.set(pointerId, { x: px, y: py });
+    if (this.pointers.size === 1) {
+      this.state = "PANNING";
+    } else if (this.pointers.size === 2) {
+      this.state = "PINCHING";
+      this.pinchLastDist = this.activePinchDist();
+    }
   }
 
-  handlePointerMove(px: number, py: number): void {
-    if (this.state !== "PANNING") return;
-
-    const step = pixelStep(this.view.zoom_exp, this.canvasHeight);
-    // Dragging right (px increases) means canvas moves right → fractal center moves left.
-    const cx = parseFloat(this.view.cx) - (px - this.panStartPx) * step;
-    const cy = parseFloat(this.view.cy) - (py - this.panStartPy) * step;
-
-    this.panStartPx = px;
-    this.panStartPy = py;
-
-    this.view = { ...this.view, cx: cx.toString(), cy: cy.toString() };
-    this.notifyChange(this.view);
-  }
-
-  handlePointerUp(): void {
+  handlePointerMove(pointerId: number, px: number, py: number): void {
     if (this.state === "PANNING") {
+      const prev = this.pointers.get(pointerId);
+      if (!prev) return;
+      // Dragging right (px increases) means canvas moves right → fractal center moves left.
+      const step = pixelStep(this.view.zoom_exp, this.canvasHeight);
+      const cx = parseFloat(this.view.cx) - (px - prev.x) * step;
+      const cy = parseFloat(this.view.cy) - (py - prev.y) * step;
+      this.view = { ...this.view, cx: cx.toString(), cy: cy.toString() };
+      this.pointers.set(pointerId, { x: px, y: py });
+      this.notifyChange(this.view);
+    } else if (this.state === "PINCHING") {
+      this.pointers.set(pointerId, { x: px, y: py });
+      const dist = this.activePinchDist();
+      if (dist > 0 && this.pinchLastDist > 0) {
+        const mid = this.activePinchMidpoint();
+        // Spreading fingers (dist > lastDist) → log10 > 0 → negative deltaY → zoom in.
+        const deltaY = -PINCH_SENSITIVITY * Math.log10(dist / this.pinchLastDist) / ZOOM_SPEED;
+        this.applyZoomAtPoint(deltaY, mid.x, mid.y);
+        this.notifyChange(this.view);
+      }
+      this.pinchLastDist = dist;
+    }
+  }
+
+  handlePointerUp(pointerId: number): void {
+    this.pointers.delete(pointerId);
+    if (this.state === "PINCHING") {
+      this.state = this.pointers.size >= 1 ? "PANNING" : "IDLE";
+    } else if (this.state === "PANNING" && this.pointers.size === 0) {
       this.state = "IDLE";
     }
   }
@@ -370,28 +391,11 @@ export class ZoomPanFSM {
    * The fractal point under (px, py) stays fixed on screen after the zoom.
    */
   handleWheel(deltaY: number, px: number, py: number): void {
-    // Fractal point under the cursor — must stay at (px, py) after zoom.
-    const { fx, fy } = pixelToFractal(
-      px,
-      py,
-      this.view,
-      this.canvasWidth,
-      this.canvasHeight,
-    );
-
-    // Scroll down (deltaY > 0) = zoom out = zoom_exp decreases.
-    const zoom_exp = this.clampZoom(this.view.zoom_exp - deltaY * ZOOM_SPEED);
-
-    // Recompute center so that (fx, fy) remains at pixel (px, py).
-    const newStep = pixelStep(zoom_exp, this.canvasHeight);
-    const cx = fx - (px - this.canvasWidth / 2) * newStep;
-    const cy = fy - (py - this.canvasHeight / 2) * newStep;
-
-    this.view = { cx: cx.toString(), cy: cy.toString(), zoom_exp };
+    this.applyZoomAtPoint(deltaY, px, py);
     this.state = "ZOOMING";
     this.notifyChange(this.view);
 
-    // Restart the 300 ms settle debounce.
+    // Restart the 150 ms settle debounce.
     if (this.zoomDebounceId !== null) {
       clearTimeout(this.zoomDebounceId);
     }
@@ -400,5 +404,32 @@ export class ZoomPanFSM {
       this.state = "IDLE";
       this.notifySettled(this.view);
     }, ZOOM_SETTLE_MS);
+  }
+
+  // ── Private helpers ──────────────────────────────────────────────────────────
+
+  /** Zoom math shared by handleWheel and pinch — updates view, does not touch state or debounce. */
+  private applyZoomAtPoint(deltaY: number, px: number, py: number): void {
+    const { fx, fy } = pixelToFractal(px, py, this.view, this.canvasWidth, this.canvasHeight);
+    // Scroll down (deltaY > 0) = zoom out = zoom_exp decreases.
+    const zoom_exp = this.clampZoom(this.view.zoom_exp - deltaY * ZOOM_SPEED);
+    // Recompute center so that (fx, fy) remains at pixel (px, py).
+    const newStep = pixelStep(zoom_exp, this.canvasHeight);
+    const cx = fx - (px - this.canvasWidth / 2) * newStep;
+    const cy = fy - (py - this.canvasHeight / 2) * newStep;
+    this.view = { cx: cx.toString(), cy: cy.toString(), zoom_exp };
+  }
+
+  private activePinchDist(): number {
+    const pts = [...this.pointers.values()];
+    if (pts.length < 2) return 0;
+    const dx = pts[1].x - pts[0].x;
+    const dy = pts[1].y - pts[0].y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  private activePinchMidpoint(): { x: number; y: number } {
+    const pts = [...this.pointers.values()];
+    return { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
   }
 }

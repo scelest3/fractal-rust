@@ -308,13 +308,13 @@ describe("ZoomPanFSM", () => {
   // ── Pan state transitions ───────────────────────────────────────────────────
 
   it("IDLE → PANNING on pointerdown", () => {
-    fsm.handlePointerDown(400, 200);
+    fsm.handlePointerDown(1, 400, 200);
     expect(fsm.getState()).toBe("PANNING");
   });
 
   it("PANNING → IDLE on pointerup", () => {
-    fsm.handlePointerDown(400, 200);
-    fsm.handlePointerUp();
+    fsm.handlePointerDown(1, 400, 200);
+    fsm.handlePointerUp(1);
     expect(fsm.getState()).toBe("IDLE");
   });
 
@@ -322,7 +322,7 @@ describe("ZoomPanFSM", () => {
     const onChange = vi.fn();
     fsm = new ZoomPanFSM(DEFAULT_VIEW, { onViewChange: onChange });
     fsm.setCanvasSize(W, H);
-    fsm.handlePointerMove(100, 100);
+    fsm.handlePointerMove(1, 100, 100);
     expect(onChange).not.toHaveBeenCalled();
   });
 
@@ -333,25 +333,25 @@ describe("ZoomPanFSM", () => {
     fsm = new ZoomPanFSM({ cx: "0.0", cy: "0.0", zoom_exp: 0 }, { onViewChange: onChange });
     fsm.setCanvasSize(W, H);
 
-    fsm.handlePointerDown(400, 200);
-    fsm.handlePointerMove(600, 200); // drag 200 px right
+    fsm.handlePointerDown(1, 400, 200);
+    fsm.handlePointerMove(1, 600, 200); // drag 200 px right
 
     expect(onChange).toHaveBeenCalled();
     expect(parseFloat(fsm.getView().cx)).toBeLessThan(0);
   });
 
   it("dragging down decreases cy", () => {
-    fsm.handlePointerDown(400, 200);
-    fsm.handlePointerMove(400, 400); // drag 200 px down
+    fsm.handlePointerDown(1, 400, 200);
+    fsm.handlePointerMove(1, 400, 400); // drag 200 px down
     expect(parseFloat(fsm.getView().cy)).toBeLessThan(0);
   });
 
   it("pan updates start position incrementally (each move delta is relative)", () => {
-    fsm.handlePointerDown(400, 200);
-    fsm.handlePointerMove(300, 200); // move 100 left → cx +100*step
+    fsm.handlePointerDown(1, 400, 200);
+    fsm.handlePointerMove(1, 300, 200); // move 100 left → cx +100*step
     const cx1 = parseFloat(fsm.getView().cx);
 
-    fsm.handlePointerMove(200, 200); // move another 100 left → cx +100*step more
+    fsm.handlePointerMove(1, 200, 200); // move another 100 left → cx +100*step more
     const cx2 = parseFloat(fsm.getView().cx);
 
     const step = pixelStep(0, H);
@@ -443,5 +443,79 @@ describe("ZoomPanFSM", () => {
   it("zoom_exp changes by ~0.1 per 100-unit wheel tick", () => {
     fsm.handleWheel(-100, W / 2, H / 2);
     expect(fsm.getView().zoom_exp).toBeCloseTo(0.1, 5);
+  });
+
+  // ── Pinch-to-zoom ─────────────────────────────────────────────────────────
+
+  it("second pointerdown transitions to PINCHING", () => {
+    fsm.handlePointerDown(1, 300, 200);
+    fsm.handlePointerDown(2, 500, 200);
+    expect(fsm.getState()).toBe("PINCHING");
+  });
+
+  it("spreading fingers increases zoom_exp (zooms in)", () => {
+    // fingers 200 px apart horizontally, centered at (400, 200)
+    fsm.handlePointerDown(1, 300, 200);
+    fsm.handlePointerDown(2, 500, 200);
+    const zoom0 = fsm.getView().zoom_exp;
+
+    // spread: move finger 1 left, finger 2 right → 400 px apart
+    fsm.handlePointerMove(1, 200, 200);
+    fsm.handlePointerMove(2, 600, 200);
+    expect(fsm.getView().zoom_exp).toBeGreaterThan(zoom0);
+  });
+
+  it("squeezing fingers decreases zoom_exp (zooms out)", () => {
+    fsm.handlePointerDown(1, 300, 200);
+    fsm.handlePointerDown(2, 500, 200);
+    const zoom0 = fsm.getView().zoom_exp;
+
+    // squeeze: move fingers closer → 100 px apart
+    fsm.handlePointerMove(1, 350, 200);
+    fsm.handlePointerMove(2, 450, 200);
+    expect(fsm.getView().zoom_exp).toBeLessThan(zoom0);
+  });
+
+  it("pinch keeps the focal midpoint fractal coordinate fixed", () => {
+    // fingers at (300,200) and (500,200); midpoint = (400,200) = canvas center
+    fsm.handlePointerDown(1, 300, 200);
+    fsm.handlePointerDown(2, 500, 200);
+
+    // Move finger 2 to (700,200). After updating the pointer map, the midpoint
+    // used as the focal point is ((300+700)/2, 200) = (500, 200).
+    const focalPx = 500,
+      focalPy = 200;
+    const before = pixelToFractal(focalPx, focalPy, fsm.getView(), W, H);
+
+    fsm.handlePointerMove(2, 700, 200);
+    const after = pixelToFractal(focalPx, focalPy, fsm.getView(), W, H);
+
+    expect(after.fx).toBeCloseTo(before.fx, 5);
+    expect(after.fy).toBeCloseTo(before.fy, 5);
+  });
+
+  it("releasing one finger during PINCHING transitions to PANNING", () => {
+    fsm.handlePointerDown(1, 300, 200);
+    fsm.handlePointerDown(2, 500, 200);
+    fsm.handlePointerUp(2);
+    expect(fsm.getState()).toBe("PANNING");
+  });
+
+  it("releasing both fingers during PINCHING transitions to IDLE", () => {
+    fsm.handlePointerDown(1, 300, 200);
+    fsm.handlePointerDown(2, 500, 200);
+    fsm.handlePointerUp(1);
+    fsm.handlePointerUp(2);
+    expect(fsm.getState()).toBe("IDLE");
+  });
+
+  it("single-finger pan works normally after a pinch ends", () => {
+    fsm.handlePointerDown(1, 300, 200);
+    fsm.handlePointerDown(2, 500, 200);
+    fsm.handlePointerUp(2); // back to PANNING with finger 1 still down
+
+    const cx0 = parseFloat(fsm.getView().cx);
+    fsm.handlePointerMove(1, 200, 200); // drag finger 1 left
+    expect(parseFloat(fsm.getView().cx)).toBeGreaterThan(cx0);
   });
 });
