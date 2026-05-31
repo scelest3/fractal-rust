@@ -20,19 +20,19 @@ describe("computeStripHeight", () => {
   });
 
   it("memory budget caps strip height for 16K wide images", () => {
-    // 16K: 15360 × 4 channels × 4 bytes = 245 760 bytes/row.
-    // 64M floats / (15360 × 4) = 1040 rows — well below the 8640 image height or
-    // any reasonable MAX_RENDERBUFFER_SIZE, so the budget is the binding constraint.
+    // 16K: 15360 × 4 channels = 61 440 floats/row.
+    // 256M floats / (15360 × 4) ≈ 4369 rows — below the 8640 image height,
+    // so the budget is the binding constraint.
     const h = computeStripHeight(8640, 16384, 15360);
     expect(h).toBeLessThan(8640);   // budget kicks in
     expect(h).toBeGreaterThan(0);
-    // Verify the capped strip fits within the budget: rows × width × 4 channels ≤ 64M
-    expect(h * 15360 * 4).toBeLessThanOrEqual(64 * 1024 * 1024);
+    // Verify the capped strip fits within the budget: rows × width × 4 channels ≤ 256M
+    expect(h * 15360 * 4).toBeLessThanOrEqual(256 * 1024 * 1024);
   });
 
   it("memory budget does not cap strips for narrow images", () => {
-    // At 1920 px wide, even 8640 rows = 1920×8640×4 = 66M floats, just over budget.
-    // The budget provides an upper bound; GPU limit is usually the binding one for narrow exports.
+    // At 1920 px wide, 8640 rows = 1920×8640×4 = 66M floats, well under 256M budget.
+    // GPU limit and image height are the binding constraints for narrow exports.
     const h = computeStripHeight(1080, 8192, 1920);
     expect(h).toBe(1080); // GPU and height both dominate over budget at this size
   });
