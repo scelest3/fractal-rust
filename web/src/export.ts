@@ -1,4 +1,5 @@
 import { pixelStep } from "./viewport.ts";
+import { NARROW_PX } from "./ui-constants.ts";
 import type { GlPipeline } from "./gl-pipeline.ts";
 
 // 1 GB of f32 pixels per strip — keeps wasm-bindgen's copy well within WASM's
@@ -285,7 +286,7 @@ export class ExportDialog {
       (this.presetRadios[i].parentElement as HTMLElement).style.opacity = exceeds ? "0.4" : "1";
     }
 
-    if (window.innerWidth < 500) {
+    if (window.innerWidth < NARROW_PX) {
       // On mobile default to the physical screen pixels (viewport × devicePixelRatio).
       const dpr = window.devicePixelRatio || 1;
       const w = Math.min(this.maxRbs, Math.round(window.innerWidth  * dpr));

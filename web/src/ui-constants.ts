@@ -10,6 +10,7 @@ export const PANEL_STYLE = {
 } as const;
 
 export const PANEL_GAP = 4; // px — gap between stats overlay and palette panel
+export const NARROW_PX = 500; // viewport width threshold for compact/mobile layout
 
 export const INPUT_CSS =
   "background:#222;color:#eee;border:1px solid #555;border-radius:3px;" +

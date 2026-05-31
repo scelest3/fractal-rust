@@ -25,7 +25,7 @@ import {
 import { FractalParamsPanel } from "./fractal-params-panel.ts";
 import { ExportDialog, type WorkerLease, type ColoringState } from "./export.ts";
 import { AboutPanel } from "./about-panel.ts";
-import { PANEL_GAP, SELECT_CSS } from "./ui-constants.ts";
+import { PANEL_GAP, SELECT_CSS, NARROW_PX } from "./ui-constants.ts";
 
 const BASE_ITER = 256;
 
@@ -371,6 +371,7 @@ export class FractalSession {
     this.overlay.appendChild(this.buildDprToggle(canvas));
     this.overlay.appendChild(this.buildResetZoomButton());
     this.overlay.appendChild(this.paletteEditor.getToggleButton());
+    this.overlay.appendChild(this.buildExportButton());
 
     this.exportDialog = new ExportDialog(
       this.gl,
@@ -779,14 +780,30 @@ export class FractalSession {
 
   private updateOverlay(): void {
     const v = this.fsm.getView();
-    const state = this.fsm.getState();
     const mode = v.zoom_exp > F64X2_ZOOM_THRESHOLD ? "f64x2" : "f64";
-    this.statsEl.innerHTML =
-      `state: ${state} [${mode}]<br>` +
-      `cx: ${parseFloat(v.cx).toFixed(8)}<br>` +
-      `cy: ${parseFloat(v.cy).toFixed(8)}<br>` +
-      `zoom: 10^${v.zoom_exp.toFixed(3)}<br>` +
-      `gen: ${this.generation} | workers: ${N_WORKERS}`;
+    const narrow = window.innerWidth < NARROW_PX;
+    this.statsEl.innerHTML = narrow
+      ? `zoom: 10^${v.zoom_exp.toFixed(3)} [${mode}]<br>` +
+        `gen: ${this.generation} | workers: ${N_WORKERS}`
+      : `state: ${this.fsm.getState()} [${mode}]<br>` +
+        `cx: ${parseFloat(v.cx).toFixed(8)}<br>` +
+        `cy: ${parseFloat(v.cy).toFixed(8)}<br>` +
+        `zoom: 10^${v.zoom_exp.toFixed(3)}<br>` +
+        `gen: ${this.generation} | workers: ${N_WORKERS}`;
+  }
+
+  private buildExportButton(): HTMLButtonElement {
+    const btn = document.createElement("button");
+    btn.textContent = "Export PNG  [E]";
+    Object.assign(btn.style, {
+      display: "block", marginTop: "4px", cursor: "pointer",
+      background: "rgba(255,255,255,0.15)", color: "white",
+      border: "1px solid rgba(255,255,255,0.3)", borderRadius: "3px",
+      fontFamily: "monospace", fontSize: "12px", padding: "2px 6px",
+      width: "100%", boxSizing: "border-box",
+    });
+    btn.addEventListener("click", () => this.exportDialog.open());
+    return btn;
   }
 
   private debouncedDispatch(delayMs: number): void {

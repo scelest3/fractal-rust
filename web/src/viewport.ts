@@ -188,7 +188,7 @@ export type FsmState = "IDLE" | "PANNING" | "ZOOMING" | "PINCHING";
 const ZOOM_SPEED = 0.001;
 
 /** Pinch zoom sensitivity multiplier relative to wheel zoom. */
-const PINCH_SENSITIVITY = 8;
+const PINCH_SENSITIVITY = 2;
 
 /** Default precision cap: F64x2 renders cleanly to zoom_exp ≈ 17. */
 const DEFAULT_MAX_ZOOM_EXP = 17;

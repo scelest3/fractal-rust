@@ -12,7 +12,7 @@
  */
 
 import { buildLut, makeNewtonPalette, ALL_PRESETS, type ColorStop, type Palette } from "./palette.ts";
-import { PANEL_STYLE, SECTION_HEADER_CSS, SELECT_CSS } from "./ui-constants.ts";
+import { PANEL_STYLE, SECTION_HEADER_CSS, SELECT_CSS, NARROW_PX } from "./ui-constants.ts";
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -147,7 +147,7 @@ export class PaletteEditor {
     const hidden = this.panel.style.display === "none";
     this.panel.style.display = hidden ? "block" : "none";
     this.toggleBtn.textContent = hidden ? "Palette ▴  [C]" : "Palette ▾  [C]";
-    if (hidden) this.applyCompact(window.innerWidth < 500);
+    if (hidden) this.applyCompact(window.innerWidth < NARROW_PX);
   }
 
   // ── Internal ────────────────────────────────────────────────────────────────

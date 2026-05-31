@@ -1,5 +1,5 @@
 import { NEWTON_PRESETS, type NewtonParams } from "./newton.ts";
-import { PANEL_STYLE, INPUT_CSS, SELECT_CSS, SECTION_HEADER_CSS } from "./ui-constants.ts";
+import { PANEL_STYLE, INPUT_CSS, SELECT_CSS, SECTION_HEADER_CSS, NARROW_PX } from "./ui-constants.ts";
 
 type FractalKind = "mandelbrot" | "newton" | "multibrot" | "julia";
 
@@ -275,7 +275,7 @@ export class FractalParamsPanel {
         this.requestMini(true);
       }
       const stored = sessionStorage.getItem("julia-preview-collapsed");
-      const collapsed = stored !== null ? stored === "true" : window.innerWidth <= 500;
+      const collapsed = stored !== null ? stored === "true" : window.innerWidth <= NARROW_PX;
       this.setMiniCollapsed(collapsed);
     }
 
