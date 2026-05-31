@@ -87,6 +87,9 @@ export interface ExportParams {
   cxRef: number;
   cyRef: number;
   newton?: { degree: number; coeffs: number[]; rootsRe: number[]; rootsIm: number[] };
+  exponent?: number;
+  juliaCRe?: number;
+  juliaCIm?: number;
 }
 
 // ── ExportDialog ──────────────────────────────────────────────────────────────
@@ -666,6 +669,9 @@ export class ExportSession {
             cxRef,
             cyRef,
             fractalKind: params.fractalKind,
+            exponent:    params.exponent,
+            juliaCRe:    params.juliaCRe,
+            juliaCIm:    params.juliaCIm,
             newton: params.newton,
           });
         }
