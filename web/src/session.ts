@@ -416,10 +416,10 @@ export class FractalSession {
       if (e.key === "+" || e.key === "=") this.keyboardZoom(-1);
       if (e.key === "-" || e.key === "_") this.keyboardZoom(+1);
       // Arrow keys pan by 20% of the viewport per press.
-      if (e.key === "ArrowRight") { e.preventDefault(); this.keyboardPan(+1,  0); }
-      if (e.key === "ArrowLeft")  { e.preventDefault(); this.keyboardPan(-1,  0); }
-      if (e.key === "ArrowUp")    { e.preventDefault(); this.keyboardPan( 0, -1); }
-      if (e.key === "ArrowDown")  { e.preventDefault(); this.keyboardPan( 0, +1); }
+      if (e.key === "ArrowRight") { e.preventDefault(); this.keyboardPan(-1,  0); }
+      if (e.key === "ArrowLeft")  { e.preventDefault(); this.keyboardPan(+1,  0); }
+      if (e.key === "ArrowUp")    { e.preventDefault(); this.keyboardPan( 0, +1); }
+      if (e.key === "ArrowDown")  { e.preventDefault(); this.keyboardPan( 0, -1); }
     });
 
     this.fsm = new ZoomPanFSM(restoredView, {
