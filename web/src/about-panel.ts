@@ -7,28 +7,50 @@
 
 const REPO_URL = "https://github.com/scelest3/fractal-rust";
 
-const HINTS: { keys: string; desc: string }[] = [
-  { keys: "Scroll wheel",      desc: "Zoom in / out at cursor" },
-  { keys: "+ / −",             desc: "Zoom in / out at center" },
-  { keys: "Left-drag",         desc: "Pan" },
-  { keys: "Arrow keys",        desc: "Pan (20% of viewport per press)" },
-  { keys: "Right-drag",        desc: "Box zoom — draw region to fill viewport" },
-  { keys: "R",                 desc: "Reset view to default" },
-  { keys: "C",                 desc: "Toggle color editor" },
-  { keys: "H",                 desc: "Toggle HiDPI rendering" },
-  { keys: "E",                 desc: "Export image as PNG" },
-  { keys: "?",                 desc: "Toggle this panel" },
+const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+
+const TOUCH_HINTS: { keys: string; desc: string }[] = [
+  { keys: "Drag",              desc: "Pan" },
+  { keys: "Pinch",             desc: "Zoom in / out" },
+  { keys: "Long-press + drag", desc: "Box zoom — draw region to fill viewport" },
   { keys: "URL hash",          desc: "Bookmark · share the current view" },
+];
+
+const KEYBOARD_ONLY_HINTS: { keys: string; desc: string }[] = [
+  { keys: "+ / −",      desc: "Zoom in / out at center" },
+  { keys: "Arrow keys", desc: "Pan (20% of viewport per press)" },
+  { keys: "R",          desc: "Reset view to default" },
+  { keys: "C",          desc: "Toggle color editor" },
+  { keys: "H",          desc: "Toggle HiDPI rendering" },
+  { keys: "E",          desc: "Export image as PNG" },
+  { keys: "?",          desc: "Toggle this panel" },
+];
+
+const KEYBOARD_HINTS: { keys: string; desc: string }[] = [
+  { keys: "Scroll wheel", desc: "Zoom in / out at cursor" },
+  { keys: "+ / −",        desc: "Zoom in / out at center" },
+  { keys: "Left-drag",    desc: "Pan" },
+  { keys: "Arrow keys",   desc: "Pan (20% of viewport per press)" },
+  { keys: "Right-drag",   desc: "Box zoom — draw region to fill viewport" },
+  { keys: "R",            desc: "Reset view to default" },
+  { keys: "C",            desc: "Toggle color editor" },
+  { keys: "H",            desc: "Toggle HiDPI rendering" },
+  { keys: "E",            desc: "Export image as PNG" },
+  { keys: "?",            desc: "Toggle this panel" },
+  { keys: "URL hash",     desc: "Bookmark · share the current view" },
 ];
 
 export class AboutPanel {
   private readonly backdrop: HTMLDivElement;
   private readonly dialog: HTMLDivElement;
+  private readonly hintsContainer: HTMLDivElement;
   private open = false;
 
   constructor() {
     this.backdrop = this.makeBackdrop();
     this.dialog   = this.makeDialog();
+    this.hintsContainer = this.makeHintsContainer();
+    this.dialog.appendChild(this.hintsContainer);
     this.backdrop.appendChild(this.dialog);
     document.body.appendChild(this.backdrop);
 
@@ -42,6 +64,9 @@ export class AboutPanel {
 
   show(): void {
     this.open = true;
+    this.hintsContainer.replaceChildren(
+      ...Array.from(this.makeHintsContainer().childNodes),
+    );
     this.backdrop.style.display = "flex";
   }
 
@@ -112,6 +137,8 @@ export class AboutPanel {
       lineHeight: "1.6",
       boxShadow: "0 8px 40px rgba(0,0,0,0.7)",
       position: "relative",
+      maxHeight: "calc(100vh - 48px)",
+      overflowY: "auto",
     });
 
     // Close button
@@ -181,29 +208,6 @@ export class AboutPanel {
     });
     el.appendChild(hintsHeader);
 
-    // Hints table
-    const table = document.createElement("table");
-    Object.assign(table.style, {
-      width: "100%", borderCollapse: "collapse", fontSize: "12px",
-    });
-    for (const { keys, desc } of HINTS) {
-      const row = table.insertRow();
-      const keyCell = row.insertCell();
-      keyCell.textContent = keys;
-      Object.assign(keyCell.style, {
-        color: "#60e8ff", paddingRight: "16px",
-        paddingBottom: "5px", whiteSpace: "nowrap",
-        verticalAlign: "top",
-      });
-      const descCell = row.insertCell();
-      descCell.textContent = desc;
-      Object.assign(descCell.style, {
-        color: "rgba(255,255,255,0.75)",
-        paddingBottom: "5px",
-      });
-    }
-    el.appendChild(table);
-
     // Tip
     const tip = document.createElement("div");
     tip.textContent = "Tip: copy the URL to bookmark or share any view.";
@@ -215,5 +219,62 @@ export class AboutPanel {
     el.appendChild(tip);
 
     return el;
+  }
+
+  private makeHintsContainer(): HTMLDivElement {
+    const wrap = document.createElement("div");
+
+    const isJulia = /[#&?]f=julia/.test(decodeURIComponent(window.location.hash));
+
+    if (isTouch) {
+      const hints = isJulia
+        ? [
+            ...TOUCH_HINTS.slice(0, 3),
+            { keys: "Tap", desc: "Place Julia c parameter" },
+            TOUCH_HINTS[3],
+          ]
+        : TOUCH_HINTS;
+
+      wrap.appendChild(this.makeTable(hints));
+
+      const details = document.createElement("details");
+      Object.assign(details.style, {
+        marginTop: "12px", fontSize: "12px",
+        color: "rgba(255,255,255,0.45)",
+      });
+      const summary = document.createElement("summary");
+      summary.textContent = "Keyboard shortcuts";
+      Object.assign(summary.style, { cursor: "pointer", marginBottom: "8px" });
+      details.appendChild(summary);
+      details.appendChild(this.makeTable(KEYBOARD_ONLY_HINTS));
+      wrap.appendChild(details);
+    } else {
+      wrap.appendChild(this.makeTable(KEYBOARD_HINTS));
+    }
+
+    return wrap;
+  }
+
+  private makeTable(hints: { keys: string; desc: string }[]): HTMLTableElement {
+    const table = document.createElement("table");
+    Object.assign(table.style, {
+      width: "100%", borderCollapse: "collapse", fontSize: "12px",
+    });
+    for (const { keys, desc } of hints) {
+      const row = table.insertRow();
+      const keyCell = row.insertCell();
+      keyCell.textContent = keys;
+      Object.assign(keyCell.style, {
+        color: "#60e8ff", paddingRight: "16px",
+        paddingBottom: "5px", whiteSpace: "nowrap",
+        verticalAlign: "top",
+      });
+      const descCell = row.insertCell();
+      descCell.textContent = desc;
+      Object.assign(descCell.style, {
+        color: "rgba(255,255,255,0.75)", paddingBottom: "5px",
+      });
+    }
+    return table;
   }
 }
