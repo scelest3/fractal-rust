@@ -250,6 +250,12 @@ export class ZoomPanFSM {
     return this.state;
   }
 
+  /** Abort the current pan or pinch without changing the view. */
+  cancel(): void {
+    this.pointers.clear();
+    this.state = "IDLE";
+  }
+
   /** Snapshot of the current view (immutable copy). */
   getView(): ViewState {
     return { ...this.view };

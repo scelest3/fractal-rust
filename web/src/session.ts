@@ -435,10 +435,13 @@ export class FractalSession {
     this.fsm.setZoomExpRange(...ZOOM_RANGES[this.fractalKind]);
     this.fsm.attach(canvas);
 
-    new BoxZoom(canvas, () => this.fsm.getView(), (view) => {
-      this.fsm.setView(view);
-      this.scheduleDispatch();
-    }, () => this.hiDpi ? (window.devicePixelRatio || 1) : 1);
+    new BoxZoom(
+      canvas,
+      () => this.fsm.getView(),
+      (view) => { this.fsm.setView(view); this.scheduleDispatch(); },
+      () => this.hiDpi ? (window.devicePixelRatio || 1) : 1,
+      () => this.fsm.cancel(),
+    );
 
     const wasmUrl = wasmBundleUrl();
 

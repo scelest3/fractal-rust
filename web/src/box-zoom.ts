@@ -1,5 +1,6 @@
 /**
- * BoxZoom — right-click drag to zoom into a selected region.
+ * BoxZoom — right-click drag (desktop) or long-press drag (touch) to zoom into
+ * a selected region.
  *
  * The user draws a free-form rectangle; on release the shorter dimension is
  * expanded to match the canvas aspect ratio so the result fills the viewport.
@@ -9,6 +10,8 @@
 import { pixelToFractal, type ViewState } from "./viewport.ts";
 
 const MIN_BOX_PX = 8;
+const LONG_PRESS_MS = 450;
+const LONG_PRESS_CANCEL_PX = 10;
 
 export class BoxZoom {
   private readonly box: HTMLDivElement;
@@ -16,11 +19,17 @@ export class BoxZoom {
   private startClient = { x: 0, y: 0 };
   private active = false;
 
+  // Long-press touch state
+  private longPressTimer: ReturnType<typeof setTimeout> | null = null;
+  private longPressPointerId = -1;
+  private longPressStart = { x: 0, y: 0 };
+
   constructor(
     private readonly canvas: HTMLCanvasElement,
     private readonly getView: () => ViewState,
     private readonly onZoom: (view: ViewState) => void,
     private readonly getPixelScale: () => number = () => 1,
+    private readonly onLongPressActivate?: () => void,
   ) {
     this.box = this.makeBox();
 
@@ -47,16 +56,41 @@ export class BoxZoom {
   }
 
   private onDown(e: PointerEvent): void {
-    if (e.button !== 2) return;
-    e.preventDefault();
-    this.canvas.setPointerCapture(e.pointerId);
-    const s = this.getPixelScale();
-    this.startOffset = { x: e.offsetX * s, y: e.offsetY * s };
-    this.startClient = { x: e.clientX, y: e.clientY };
-    this.active = true;
+    if (e.button === 2) {
+      // Desktop right-click drag
+      e.preventDefault();
+      this.canvas.setPointerCapture(e.pointerId);
+      const s = this.getPixelScale();
+      this.startOffset = { x: e.offsetX * s, y: e.offsetY * s };
+      this.startClient = { x: e.clientX, y: e.clientY };
+      this.active = true;
+    } else if (e.pointerType === "touch") {
+      // Touch: start long-press timer; activate box zoom if held still long enough
+      this.longPressPointerId = e.pointerId;
+      this.longPressStart = { x: e.clientX, y: e.clientY };
+      const startOffset = { x: e.offsetX * this.getPixelScale(), y: e.offsetY * this.getPixelScale() };
+      const startClient = { x: e.clientX, y: e.clientY };
+      this.longPressTimer = setTimeout(() => {
+        this.longPressTimer = null;
+        this.canvas.setPointerCapture(this.longPressPointerId);
+        this.startOffset = startOffset;
+        this.startClient = startClient;
+        this.active = true;
+        this.onLongPressActivate?.();
+      }, LONG_PRESS_MS);
+    }
   }
 
   private onMove(e: PointerEvent): void {
+    // Cancel long-press if the finger strays beyond the threshold
+    if (this.longPressTimer !== null && e.pointerId === this.longPressPointerId) {
+      const dx = e.clientX - this.longPressStart.x;
+      const dy = e.clientY - this.longPressStart.y;
+      if (dx * dx + dy * dy > LONG_PRESS_CANCEL_PX * LONG_PRESS_CANCEL_PX) {
+        clearTimeout(this.longPressTimer);
+        this.longPressTimer = null;
+      }
+    }
     if (!this.active) return;
     const x = Math.min(this.startClient.x, e.clientX);
     const y = Math.min(this.startClient.y, e.clientY);
@@ -72,13 +106,24 @@ export class BoxZoom {
   }
 
   private onUp(e: PointerEvent): void {
-    if (e.button !== 2 || !this.active) return;
+    // Clear timer if touch lifts before long-press activates
+    if (this.longPressTimer !== null && e.pointerId === this.longPressPointerId) {
+      clearTimeout(this.longPressTimer);
+      this.longPressTimer = null;
+    }
+    const committed = e.button === 2 ||
+      (e.pointerType === "touch" && e.pointerId === this.longPressPointerId);
+    if (!committed || !this.active) return;
     this.cancel();
     const s = this.getPixelScale();
     this.commit({ x: e.offsetX * s, y: e.offsetY * s });
   }
 
   private cancel(): void {
+    if (this.longPressTimer !== null) {
+      clearTimeout(this.longPressTimer);
+      this.longPressTimer = null;
+    }
     this.active = false;
     this.box.style.display = "none";
   }

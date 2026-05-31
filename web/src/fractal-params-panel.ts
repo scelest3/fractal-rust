@@ -223,7 +223,7 @@ export class FractalParamsPanel {
     this.miniCanvas = document.createElement("canvas");
     this.miniCanvas.width = 210;
     this.miniCanvas.height = 150;
-    this.miniCanvas.style.cssText = "display:block;cursor:crosshair;border:1px solid rgba(255,255,255,0.15);";
+    this.miniCanvas.style.cssText = "display:block;cursor:crosshair;border:1px solid rgba(255,255,255,0.15);touch-action:none;";
     this.miniWrapper.appendChild(this.miniCanvas);
     this.juliaCSection.appendChild(this.miniWrapper);
     this.updateMiniCLabel();
