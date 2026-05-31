@@ -166,10 +166,12 @@ is a silent correctness bug that produces faint false banding in smooth regions.
      entry size; Tile Workers read it from there — don't hardcode the stride.
 3. Implement `OrbitData` for the coloring data the orbit produces
 4. Add a `ColoringAlgorithm` impl in `crates/coloring/src/` for the new `OrbitData` type
-5. Register in `fractal_registry!` macro in `crates/wasm-bridge/src/registry.rs` — the
-   TypeScript `FractalKind` union type is generated automatically by `wasm-pack`; no manual
-   sync needed
-6. Add parameter panel in `web/src/ui-overlay.ts` if the fractal has user-configurable params
+5. Add a `match` arm for the new kind in the `render_tile_impl` dispatch in
+   `crates/wasm-bridge/src/lib.rs`; assign it the next `fractal_kind: u8` integer.
+   Update the corresponding TypeScript string literal mapping in `session.ts`.
+   (A `fractal_registry!` macro is planned for v2 — see ARCHITECTURE.md §10.5.)
+6. Add a parameter panel in `web/src/fractal-params-panel.ts` or a dedicated panel file
+   if the fractal has user-configurable params
 7. Add golden render test in `web/e2e/`
 
 See [ARCHITECTURE.md §10](./ARCHITECTURE.md#10-adding-new-fractal-types) for the full

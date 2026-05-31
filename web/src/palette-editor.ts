@@ -140,6 +140,12 @@ export class PaletteEditor {
   getToggleButton(): HTMLButtonElement { return this.toggleBtn; }
   getPanel(): HTMLElement { return this.panel; }
 
+  togglePanel(): void {
+    const hidden = this.panel.style.display === "none";
+    this.panel.style.display = hidden ? "block" : "none";
+    this.toggleBtn.textContent = hidden ? "Palette ▴  [C]" : "Palette ▾  [C]";
+  }
+
   // ── Internal ────────────────────────────────────────────────────────────────
 
   private notifyChange(): void {
@@ -157,7 +163,7 @@ export class PaletteEditor {
 
   private buildToggleBtn(): HTMLButtonElement {
     const btn = document.createElement("button");
-    btn.textContent = "Palette ▾";
+    btn.textContent = "Palette ▾  [C]";
     Object.assign(btn.style, {
       display: "block", marginTop: "6px", cursor: "pointer",
       background: "rgba(255,255,255,0.15)", color: "white",
@@ -165,11 +171,7 @@ export class PaletteEditor {
       fontFamily: "monospace", fontSize: "12px", padding: "2px 6px",
       width: "100%", boxSizing: "border-box",
     });
-    btn.addEventListener("click", () => {
-      const hidden = this.panel.style.display === "none";
-      this.panel.style.display = hidden ? "block" : "none";
-      btn.textContent = hidden ? "Palette ▴" : "Palette ▾";
-    });
+    btn.addEventListener("click", () => this.togglePanel());
     return btn;
   }
 

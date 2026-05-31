@@ -24,6 +24,7 @@ import {
 } from "./newton.ts";
 import { FractalParamsPanel } from "./fractal-params-panel.ts";
 import { ExportDialog, type WorkerLease, type ColoringState } from "./export.ts";
+import { AboutPanel } from "./about-panel.ts";
 import { PANEL_GAP, SELECT_CSS } from "./ui-constants.ts";
 
 const BASE_ITER = 256;
@@ -118,6 +119,7 @@ function makeOverlay(): HTMLElement {
 export class FractalSession {
   private readonly fsm: ZoomPanFSM;
   readonly gl: GlPipeline;
+  private readonly canvas: HTMLCanvasElement;
   private readonly workers: Worker[];
   private readonly tileSab: SharedArrayBuffer;
   private readonly orbitSab: SharedArrayBuffer;
@@ -125,7 +127,9 @@ export class FractalSession {
   private readonly overlay: HTMLElement;
   private readonly statsEl: HTMLElement;
   private readonly paletteEditor: PaletteEditor;
+  private readonly aboutPanel: AboutPanel;
   private hiDpi: boolean;
+  private dprBtn!: HTMLButtonElement;
 
   private readonly busyWorkers = new Set<number>();
   private workerInitCount = 0;
@@ -184,6 +188,7 @@ export class FractalSession {
   private modeSelectEl!: HTMLSelectElement;
 
   constructor(canvas: HTMLCanvasElement) {
+    this.canvas = canvas;
     this.overlay = makeOverlay();
 
     // Fractal mode selector — sits above the stats readout.
@@ -359,6 +364,9 @@ export class FractalSession {
       }
     }
 
+    this.aboutPanel = new AboutPanel();
+    this.overlay.insertBefore(this.aboutPanel.makeTitleHeader(), this.overlay.firstChild);
+
     this.hiDpi = (window.devicePixelRatio ?? 1) > 1;
     this.overlay.appendChild(this.buildDprToggle(canvas));
     this.overlay.appendChild(this.buildResetZoomButton());
@@ -394,9 +402,24 @@ export class FractalSession {
     );
 
     document.addEventListener("keydown", (e: KeyboardEvent) => {
-      if ((e.key === "e" || e.key === "E") && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        this.exportDialog.open();
-      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      // Skip shortcuts when typing into an input or select.
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+
+      if (e.key === "e" || e.key === "E") this.exportDialog.open();
+      if (e.key === "?") this.aboutPanel.toggle();
+      if (e.key === "r" || e.key === "R") this.resetView();
+      if (e.key === "c" || e.key === "C") this.paletteEditor.togglePanel();
+      if (e.key === "h" || e.key === "H") this.toggleHiDpi();
+      // +/= zooms in, - zooms out (one half-decade step each press).
+      if (e.key === "+" || e.key === "=") this.keyboardZoom(-1);
+      if (e.key === "-" || e.key === "_") this.keyboardZoom(+1);
+      // Arrow keys pan by 20% of the viewport per press.
+      if (e.key === "ArrowRight") { e.preventDefault(); this.keyboardPan(+1,  0); }
+      if (e.key === "ArrowLeft")  { e.preventDefault(); this.keyboardPan(-1,  0); }
+      if (e.key === "ArrowUp")    { e.preventDefault(); this.keyboardPan( 0, -1); }
+      if (e.key === "ArrowDown")  { e.preventDefault(); this.keyboardPan( 0, +1); }
     });
 
     this.fsm = new ZoomPanFSM(restoredView, {
@@ -674,9 +697,56 @@ export class FractalSession {
     }
   }
 
+  private resetView(): void {
+    this.fsm.setView({ ...DEFAULT_VIEW });
+    this.scheduleDispatch();
+  }
+
+  private toggleHiDpi(): void {
+    this.hiDpi = !this.hiDpi;
+    const scale = this.hiDpi ? (window.devicePixelRatio || 1) : 1;
+    this.canvas.width  = Math.round(window.innerWidth  * scale);
+    this.canvas.height = Math.round(window.innerHeight * scale);
+    this.canvas.style.width  = window.innerWidth  + "px";
+    this.canvas.style.height = window.innerHeight + "px";
+    this.gl.resize(this.canvas.width, this.canvas.height);
+    this.fsm.setCanvasSize(this.canvas.width, this.canvas.height);
+    this.fsm.setPixelScale(scale);
+    this.updateDprBtn();
+    this.scheduleDispatch();
+  }
+
+  private updateDprBtn(): void {
+    const dpr = window.devicePixelRatio || 1;
+    this.dprBtn.textContent = this.hiDpi
+      ? `HiDPI ${dpr.toFixed(1)}×  [H]`
+      : "HiDPI off  [H]";
+  }
+
+  // Pan by 20% of the viewport. dx/dy are −1, 0, or +1 in fractal axis direction.
+  private keyboardPan(dx: number, dy: number): void {
+    const v = this.fsm.getView();
+    const step = pixelStep(v.zoom_exp, this.canvas.height);
+    const cx = parseFloat(v.cx) + dx * this.canvas.width  * step * 0.20;
+    const cy = parseFloat(v.cy) + dy * this.canvas.height * step * 0.20;
+    this.fsm.setView({ ...v, cx: cx.toString(), cy: cy.toString() });
+    this.updateOverlay();
+    this.debouncedWriteUrl(500);
+    this.debouncedDispatch(80);
+  }
+
+  // One keyboard zoom step ≈ half a decade. Positive direction = zoom out.
+  private keyboardZoom(direction: 1 | -1): void {
+    const cx = this.canvas.width  / 2;
+    const cy = this.canvas.height / 2;
+    // deltaY = 500 → 0.5 zoom_exp change (ZOOM_SPEED = 0.001). Zoom in = negative deltaY.
+    this.fsm.handleWheel(direction * 500, cx, cy);
+    this.debouncedDispatch(0);
+  }
+
   private buildResetZoomButton(): HTMLButtonElement {
     const btn = document.createElement("button");
-    btn.textContent = "Reset zoom";
+    btn.textContent = "Reset zoom  [R]";
     Object.assign(btn.style, {
       display: "block", marginTop: "4px", cursor: "pointer",
       background: "rgba(255,255,255,0.15)", color: "white",
@@ -684,20 +754,15 @@ export class FractalSession {
       fontFamily: "monospace", fontSize: "12px", padding: "2px 6px",
       width: "100%", boxSizing: "border-box",
     });
-    btn.addEventListener("click", () => {
-      this.fsm.setView({ ...DEFAULT_VIEW });
-      this.scheduleDispatch();
-    });
+    btn.addEventListener("click", () => this.resetView());
     return btn;
   }
 
   private buildDprToggle(canvas: HTMLCanvasElement): HTMLButtonElement {
+    void canvas; // stored as this.canvas; parameter kept for call-site clarity
     const btn = document.createElement("button");
-    const update = () => {
-      const dpr = window.devicePixelRatio || 1;
-      btn.textContent = this.hiDpi ? `HiDPI ${dpr.toFixed(1)}×` : "HiDPI off";
-    };
-    update();
+    this.dprBtn = btn;
+    this.updateDprBtn();
     Object.assign(btn.style, {
       display: "block", marginTop: "4px", cursor: "pointer",
       background: "rgba(255,255,255,0.15)", color: "white",
@@ -705,19 +770,7 @@ export class FractalSession {
       fontFamily: "monospace", fontSize: "12px", padding: "2px 6px",
       width: "100%", boxSizing: "border-box",
     });
-    btn.addEventListener("click", () => {
-      this.hiDpi = !this.hiDpi;
-      const scale = this.hiDpi ? (window.devicePixelRatio || 1) : 1;
-      canvas.width  = Math.round(window.innerWidth  * scale);
-      canvas.height = Math.round(window.innerHeight * scale);
-      canvas.style.width  = window.innerWidth  + "px";
-      canvas.style.height = window.innerHeight + "px";
-      this.gl.resize(canvas.width, canvas.height);
-      this.fsm.setCanvasSize(canvas.width, canvas.height);
-      this.fsm.setPixelScale(scale);
-      update();
-      this.scheduleDispatch();
-    });
+    btn.addEventListener("click", () => this.toggleHiDpi());
     return btn;
   }
 

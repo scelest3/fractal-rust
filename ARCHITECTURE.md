@@ -1,4 +1,4 @@
-# Fractal Explorer — Architecture
+# Fractal Rust — Architecture
 
 > High-resolution fractal renderer · Rust / WASM / WebGL 2  
 > Extended precision · Perturbation theory · GPU tile pipeline
@@ -32,7 +32,7 @@
 
 Browser-based, high-resolution fractal explorer targeting sustained 60 fps interaction at viewport resolution and export quality up to 16 384 × 16 384 px. Supports zoom depths of 10⁻³⁰⁰ via perturbation theory with arbitrary-precision reference orbit computation. Zoom beyond 10⁻³⁰⁰ is a v2 goal requiring extended-precision `DeltaC` (see §8).
 
-**Fractal families in scope (v1):** Mandelbrot / filled-Julia, Newton-method fractals over polynomial roots.
+**Fractal families shipped (v1):** Mandelbrot, Julia / Multibrot (non-integer exponents via principal branch), Newton-method fractals over real polynomials.
 
 | Layer | Language / Target | Responsibility |
 |---|---|---|
@@ -47,17 +47,17 @@ Browser-based, high-resolution fractal explorer targeting sustained 60 fps inter
 
 ### Goals
 
-- Correct deep-zoom rendering to zoom_exp ≈ 20 via F64x2 double-double arithmetic (v1 cap; see §8)
+- Correct deep-zoom rendering to zoom_exp ≈ 17 (Mandelbrot) via F64x2 double-double arithmetic (v1 cap; see §8)
 - Smooth ≥ 60 fps pan / zoom via progressive tile streaming
 - PNG image export at user-defined resolution (up to 16K × 16K), 16-bit RGB, with DPI metadata; EXR is v2
 - Interactive color palette editor (gradient stops, iteration-space mapping, orbit-trap overlay)
-- Julia set as a new fractal type with configurable parameter `c`; Mandelbrot hover preview (pointer position drives Julia `c`) follows as a second step
+- Julia set with configurable parameter `c` and exponent; Multibrot with non-integer exponent (v1, shipped; Mandelbrot hover preview deferred to v2)
 - Newton fractal with configurable polynomial and root coloring
 - Web Worker offload — main thread never blocked
 
 ### Non-Goals (v1)
 
-- Zoom beyond zoom_exp ≈ 20 (v2 — perturbation theory + BigFloat required; see §8)
+- Zoom beyond zoom_exp ≈ 17 for Mandelbrot, ≈ 14 for Julia / Newton / Multibrot (v2 — perturbation theory + BigFloat required; see §8)
 - Perturbation theory, BLA, and glitch correction (v2 — architecture is prepared but deferred)
 - Zoom beyond 10⁻³⁰⁰ (planned v2 — `DeltaC` opaque type is the upgrade path)
 - 3D fractal rendering (Mandelbox, Menger sponge)
@@ -66,7 +66,7 @@ Browser-based, high-resolution fractal explorer targeting sustained 60 fps inter
 - WebGPU backend (planned v2 — architecture is abstraction-ready)
 - EXR export (v2 — `exportFBO` is RGBA32F so no pipeline change is required when added; see §12)
 - Complex polynomial coefficients for Newton (v2 — interesting in the context of Julia/Mandelbrot variants)
-- Transcendental Newton fractals (v2 — `sin(z)`, `exp(z)`, etc. require a different solver)
+- Transcendental and rational maps (v2 — `c·sin(z)`, `sin(z²) + c`, `eᶻ + c`, `z² + z²/c`, etc. require `sin`/`exp`/`ln` in `arith` for all precision tiers; transcendental Newton requires a different solver)
 - Per-root hue pickers and root re-ordering UI for Newton (v2 — auto-assigned hues ship in v1)
 
 ---
@@ -150,7 +150,7 @@ Key `kernel` entry points:
 ```rust
 // Phase 1: plain escape-time render for one tile
 pub fn render_tile_escape<M: IterationMap>(
-    map: &M, coords: &[Complex<f64>], max_iter: u32, out: &mut [TilePixel]);
+    map: &M, coords: &[Complex<f64>], max_iter: u32, out: &mut [PixelData]);
 
 // Phase 2: compute reference orbit at precision T (generic; wasm-bridge monomorphises for N=2,4,8).
 // Returns the number of non-escaped entries written to `out`.
@@ -210,7 +210,7 @@ pub enum NewtonResult {
 }
 ```
 
-**Tile channel packing.** `r = convergence_t` (convergence_iter normalised to [0,1]), `g = 0.0` (unused), `b = root_index` (f32), `a = 1.0` if Converged else `0.0`. The GPU shader branches on `a` to choose between Newton HSL coloring and the unresolved uniform.
+**Tile channel packing.** `r = convergence_iter as f32` (raw count; shader divides by `uCycleLen`), `g = ln|p(z_N)|` at the final iterate (used for smooth sub-iteration when `uNewtonSmooth=1`), `b = root_index as f32`, `a = 1.0` if Converged else `0.0`. The GPU shader branches on `a` to choose between Newton HSL coloring and the unresolved uniform.
 
 Newton fractals do not require perturbation theory — they are not deep-zoom targets. Standard f64 is sufficient.
 
@@ -232,27 +232,29 @@ pub enum EscapeResult {
         smooth_t:    f64,      // fractional escape for band-free coloring
         orbit_min_r: f64,      // orbit-trap: min |z| over {z_1, z_2, …}
         orbit_min_z: Complex<f64>,
-        angle_final: f64,      // arg(z) at escape
+        log_dist:    f64,      // ln(|dz/dc| / (2|z|·ln|z|)) at escape — exterior distance estimate
     },
     /// Orbit did not escape (interior or convergent point).
     Interior {
         orbit_min_r: f64,
         orbit_min_z: Complex<f64>,
+        period:      u32,      // detected period (1 = fixed point, 2 = 2-cycle, 0 = hit max_iter)
     },
     /// Pixel needs re-rendering with a better reference orbit.
-    /// `From<EscapeResult> for TilePixel` panics on this variant —
+    /// `From<EscapeResult> for PixelData` panics on this variant —
     /// glitched pixels must be resolved before GPU upload.
     Glitched,
 }
 ```
 
-`orbit_min_r` and `orbit_min_z` are populated for both `Escaped` and `Interior` so the coloring crate can apply orbit-trap overlays to all pixels. `Interior` deliberately omits `iter` — the coloring crate does not need it, and removing it makes the type harder to misuse.
+`orbit_min_r` and `orbit_min_z` are populated for both `Escaped` and `Interior` so the coloring crate can apply orbit-trap overlays to all pixels. `Interior` omits `iter` but includes `period` for period-coloring; `log_dist` enables exterior distance-estimate shading for `Escaped` pixels.
 
 | Algorithm | Formula | Notes |
 |---|---|---|
 | Smooth iteration | `iter + 1 − log₂(log\|z\|)` | Removes banding; maps to gradient via LUT |
 | Orbit trap (circle) | `min \|zₙ\|` over orbit | Reveals internal structure; configurable trap shape |
-| Angle (argument) | `arg(z)` at escape | Domain coloring flavor; good for Newton |
+| Exterior distance estimate | `ln(\|dz/dc\| / (2\|z\|·ln\|z\|))` at escape | Edge-glow shading; stored in `log_dist` channel |
+| Period coloring (interior) | detected cycle length | Stored in `period` channel of `Interior` variant |
 | Root index (Newton) | which root attracted orbit | Base hue per root; convergence speed = lightness |
 | Stripe average | `∑ sin(arg(zₙ)) / n` | Psychedelic banding; computationally cheap |
 
@@ -301,7 +303,6 @@ pub fn layout(n_workers: u32, max_iter: u32) -> MemoryLayout;
 /// kernel is generic over T: Precision; wasm-bridge supplies the concrete N.
 #[wasm_bindgen]
 pub fn compute_reference_orbit(
-    kind: FractalKind,
     cx: &str,           // BigDecimal string
     cy: &str,           // BigDecimal string
     zoom_exp: f64,      // log₁₀ of magnification
@@ -326,7 +327,7 @@ pub fn build_lut(palette: JsValue) -> Float32Array;
 pub fn compute_roots(coeffs: &[f64]) -> RootResult;
 ```
 
-`FractalKind` is a `#[wasm_bindgen]` enum. `wasm-pack` automatically emits the corresponding TypeScript union type in the generated `.d.ts` — no custom codegen required.
+`TileJob` carries `fractal_kind: u8` (0 = Mandelbrot, 1 = Newton, 2 = Multibrot, 3 = Julia); TypeScript maps string literals to integers before posting. There is no named `FractalKind` enum — see §10.5 for the future registry macro design.
 
 ### 5.2 Shared Memory Model
 
@@ -435,7 +436,7 @@ The `simd` feature activates `wasm-simd128` intrinsics for `F64x2` hot loops (2�
 
 **Pass 1 — Tile Upload**
 
-When the Scheduler forwards a `READY` tile, the main thread calls `gl.texSubImage3D` to write the raw iteration-count tile from the shared `WebAssembly.Memory` ring slot into the texture array layer. Raw data only — no color mapping here. Channels: `r = smooth_t`, `g = orbit_min_r`, `b = angle`, `a = escaped flag`.
+When the Scheduler forwards a `READY` tile, the main thread calls `gl.texSubImage3D` to write the raw iteration-count tile from the shared `WebAssembly.Memory` ring slot into the texture array layer. Raw data only — no color mapping here. Mandelbrot/Julia/Multibrot channels: `r = smooth_t`, `g = orbit_min_r`, `b = log_dist` (exterior distance estimate), `a = 1.0` (escaped) / `0.0` (interior). Newton channels: `r = convergence_iter`, `g = ln|p(z)|`, `b = root_index`, `a = 1.0` (converged) / `0.0` (unresolved).
 
 **Pass 2 — Smooth-Color Accumulation**
 
@@ -496,13 +497,21 @@ The GPU scale step reuses the previous `accumFBO` so the user sees something coh
 
 | Module | Key exports | Responsibility |
 |---|---|---|
-| `session.ts` | `FractalSession` | Pure TypeScript orchestrator — no WASM instance; manages ref orbit lifecycle; routes commands between Orbit Worker, Scheduler, and GL pipeline |
-| `viewport.ts` | `ViewState`, `ZoomPanFSM` | Coordinate transforms; FSM for pointer / wheel input |
-| `workers.ts` | `WorkerPool` | Spawns N workers; manages `MessageChannel` ports; collects tile completions |
+| `session.ts` | `FractalSession` | Pure TypeScript orchestrator — no WASM instance; manages ref orbit lifecycle; routes commands between Orbit Worker, Scheduler, and GL pipeline; owns fractal-kind selector UI and keyboard shortcuts |
+| `viewport.ts` | `ViewState`, `ZoomPanFSM` | Coordinate transforms; FSM for pointer / wheel input; view state serialisation / deserialisation |
+| `box-zoom.ts` | `BoxZoom` | Click-and-drag rubber-band zoom; emits target `ViewState` to session |
+| `layout.ts` | `MemoryLayout`, `computeLayout` | Shared memory layout calculation (mirrors wasm-bridge constants); used on the main thread before any WASM instance exists |
 | `gl-pipeline.ts` | `GlPipeline` | WebGL2 context; FBO setup; all render passes; reads tile data from shared memory via `MemoryLayout` |
 | `palette-editor.ts` | `PaletteEditor` | Gradient stop UI; LUT generation; palette preset management |
-| `export.ts` | `ExportDialog`, `ExportSession`, `WorkerLease` | Resolution picker (PNG-only, DPI input, physical size hint); `ExportSession` drives strip render loop via `WorkerLease`; raw RGBA32F PBO readback; streaming PNG encode via `begin_png_encode`/`append_png_strip`/`finish_png_encode` in a Tile Worker |
-| `ui-overlay.ts` | `OverlayController` | Coordinates panel, info bar, keyboard shortcuts, Julia preview |
+| `palette.ts` | `Palette`, `CLASSIC`, `palettesEqual` | Palette data types and built-in presets |
+| `newton.ts` | `NewtonParams`, `newtonParamsZ3`, `serializeNewtonState`, … | Newton polynomial state, preset library, serialisation helpers |
+| `newton-panel.ts` | `NewtonPanel` | Preset picker + collapsible coefficient inputs; calls back on polynomial change |
+| `fractal-params-panel.ts` | `FractalParamsPanel` | Exponent slider (Multibrot / Julia) and Julia `c` picker including mini Mandelbrot canvas |
+| `export.ts` | `ExportDialog`, `ExportSession`, `WorkerLease`, `ColoringState` | Resolution picker (PNG-only, DPI input, physical size hint); `ExportSession` drives strip render loop via `WorkerLease`; raw RGBA32F PBO readback; streaming PNG encode via `begin_png_encode`/`append_png_strip`/`finish_png_encode` in a Tile Worker |
+| `detect-simd.ts` | `wasmBundleUrl` | Synchronous SIMD probe; returns correct WASM bundle URL |
+| `ui-constants.ts` | `PANEL_GAP`, `SELECT_CSS` | Shared CSS constants for inline panel styles |
+| `tile-worker.ts` | _(worker entry point)_ | Tile Worker — loads WASM, handles render-tile messages, copies output into `tileSab` slot |
+| `math-worker.ts` | _(worker entry point)_ | Orbit Worker — loads WASM, computes BigFloat reference orbit + BLA table into `orbitSab` |
 
 ### 7.2 Input Handling — ZoomPanFSM
 
@@ -544,12 +553,12 @@ Standard `f64` gives ~15–16 significant decimal digits. The strategy at each d
 
 | Zoom depth | Precision mode | Rust type | Status |
 |---|---|---|---|
-| zoom_exp < 15 | Native f64 escape-time | `Complex<f64>` | ✅ v1 — implemented |
-| zoom_exp 15–20 | Double-double escape-time | `Complex<F64x2>` | 🔨 v1 — in progress |
-| zoom_exp 20–300 | Perturbation + BigFloat<N> | `BigFloat<N>` ref, `DeltaC` probe | 🔜 v2 — deferred |
+| zoom_exp ≤ 14 | Native f64 escape-time | `Complex<f64>` | ✅ v1 — shipped |
+| zoom_exp 14–17 | Double-double escape-time | `Complex<F64x2>` | ✅ v1 — shipped (Mandelbrot only; Julia / Newton / Multibrot cap at 14) |
+| zoom_exp 17–300 | Perturbation + BigFloat<N> | `BigFloat<N>` ref, `DeltaC` probe | 🔜 v2 — deferred |
 | zoom_exp > 300 | Rescaled `DeltaC` | extended `DeltaC` internals | 🔜 v2 — deferred |
 
-**v1 zoom cap: zoom_exp ≈ 20.** F64x2 (double-double, ~30 decimal digits) covers this range with pure escape-time — no perturbation theory, no reference orbits, no glitch correction. Each pixel's coordinate is computed as `Complex<F64x2>` by adding the viewport center (parsed from the BigDecimal string) to the pixel offset (an exact f64 integer multiple of `pixel_step`). The arithmetic cost is ~3–4× f64 per iteration, acceptable for this zoom range.
+**v1 zoom cap: zoom_exp ≈ 17 (Mandelbrot), zoom_exp ≈ 14 (Julia / Newton / Multibrot).** F64x2 is activated when `zoom_exp > F64X2_ZOOM_THRESHOLD` (= 14). It covers the full Mandelbrot range up to 17 with pure escape-time — no perturbation theory, no reference orbits, no glitch correction. Each pixel's coordinate is computed as `Complex<F64x2>` by adding the viewport center (parsed from the BigDecimal string) to the pixel offset (an exact f64 integer multiple of `pixel_step`). The arithmetic cost is ~3–4× f64 per iteration, acceptable for this zoom range.
 
 Precision tier is selected automatically at runtime. `zoom_exp` is the log₁₀ of the magnification (e.g. `zoom_exp = 15` for 10⁻¹⁵ depth).
 
@@ -583,7 +592,7 @@ Every pixel `C = C_ref + ΔC`. The perturbation `δₙ = Zₙ − Z_ref,n` evolv
 The perturbation loop uses a **pre-step escape check**: escape is tested on `z_n = Z_n + δz_n`
 (the current full orbit value) _before_ computing `δz_{n+1}`. This aligns with `escape_time`'s
 post-step convention when the smooth-t formula uses `n` instead of `n + 1` — the same escaped
-z is used in both cases, so `TilePixel` output is bit-for-bit identical when `c_ref = 0`
+z is used in both cases, so `PixelData` output is bit-for-bit identical when `c_ref = 0`
 (verified by the 16×16 grid test and three golden-coordinate regression tests).
 
 `orbit_min_r` is tracked over `{z_1, z_2, …}`, excluding z_0 = 0, to match `escape_time`'s
@@ -623,7 +632,7 @@ pub fn perturb_pixel<M: PerturbationSupport>(
             let smooth_t = n as f64 - r_sq.sqrt().ln().ln() / LN_2;
             return EscapeResult::Escaped {
                 iter: n as u32, smooth_t, orbit_min_r, orbit_min_z,
-                angle_final: z_n.im.atan2(z_n.re),
+                log_dist: /* exterior distance estimate */ 0.0,
             };
         }
 
@@ -829,7 +838,7 @@ pub enum NewtonResult {
 }
 ```
 
-`NewtonResult` is packed into the standard 4-channel `TilePixel` by a Newton-specific packing function (not `From<EscapeResult>`):
+`NewtonResult` is packed into the standard 4-channel `PixelData` by a Newton-specific packing function (not `From<EscapeResult>`):
 
 | Channel | Value |
 |---|---|
@@ -842,7 +851,9 @@ The GPU shader maps `(root_index, convergence_iter)` into a LUT coordinate via `
 
 ### 10.5 Registration
 
-New types are registered via a compile-time macro that generates the `match` dispatch in `FractalSession::new()` and the JS enum variants. The TypeScript union type is generated automatically by `wasm-bindgen` from the `#[wasm_bindgen]` enum — no custom codegen step:
+**Current implementation:** Fractal dispatch in `wasm-bridge` is a manual `match` on `fractal_kind: u8` (0 = Mandelbrot, 1 = Newton, 2 = Multibrot, 3 = Julia). TypeScript uses string literals (`"mandelbrot"`, `"newton"`, etc.) and maps them to the corresponding integer before posting a `TileJob`. There is no named `FractalKind` enum on either side.
+
+**Future work:** Replace the manual match with a `fractal_registry!` macro that generates dispatch automatically from trait implementations. The intended shape is:
 
 ```rust
 fractal_registry! {
@@ -853,7 +864,7 @@ fractal_registry! {
 }
 ```
 
-Adding a new fractal type is: one registry line + trait implementations for the three axes. The scheduler, shared memory model, and GL pipeline are unaffected.
+When the macro exists, adding a new fractal type would be: one registry line + trait implementations for the three axes. The scheduler, shared memory model, and GL pipeline would remain unaffected.
 
 ---
 
@@ -1018,17 +1029,32 @@ This runs before `fetch`, so non-SIMD browsers never request the SIMD bundle. Sh
 
 ## 16. Phased Roadmap
 
-| Phase | Deliverable | Crates / modules in scope |
+All v1 phases are complete. The app is stable and ready for release.
+
+| Phase | Deliverable | Status |
 |---|---|---|
-| 0 — Scaffold | Workspace, CI, shared-memory WASM hello-world renders to canvas | `wasm-bridge` (stub), shared memory init |
-| 1 — Mandelbrot f64 | Basic escape-time Mandelbrot, smooth coloring, pan/zoom | `kernel`, `coloring`, `gl-pipeline`, `viewport.ts` |
-| 2 — Deep Zoom (v1) | F64x2 escape-time for zoom_exp 15–20; automatic precision dispatch | `arith` (F64x2), `wasm-bridge` (F64x2 dispatch), `session.ts` |
-| 2b — Deep Zoom (v2) | Perturbation theory; BigFloat<N>; BLA; glitch correction / rebasing | `arith` (BigFloat), `kernel` (perturb, BLA), `scheduler` |
-| 3 — Newton | Newton fractal: `NewtonResult` type, Durand-Kerner root-finding, Newton params shared memory slot, HSL shader branch, preset picker (`z³−1` default) with advanced coefficient overrides, `compute_roots` wasm-bridge entry point | `kernel` (newton), `wasm-bridge` (compute_roots, newton_params_offset), `gl-pipeline.ts` (shader branch), `session.ts` (polynomial change → compute_roots → tile dispatch) |
-| 4 — Color Editor | Full palette editor, orbit trap, LUT, preset library | `coloring`, `color-editor.ts` |
-| 5 — Export | PNG export pipeline (16-bit RGB, DPI, metadata); `ColoringState` accumulation; `WorkerLease` pause/resume; `ExportSession` strip loop; raw RGBA32F PBO readback; streaming `begin_png_encode`/`append_png_strip`/`finish_png_encode` via Tile Worker (peak JS heap = one strip). EXR deferred to v2. | `crates/coloring`, `crates/encoding`, `wasm-bridge`, `export.ts`, `gl-pipeline.ts`, `session.ts` |
-| 6 — Polish | ✅ UI polish pass (layout, spacing, keyboard shortcut discoverability); URL bookmark support for full view state including palette (`p=<json>` param); Newton LUT coloring (palette applies to Newton renders via `uNewtonColorMode`/`uNewtonPhase`); Playwright golden tests — Mandelbrot default, deep-zoom (zoom_exp=17 elephant valley), palette URL round-trip, Newton + custom palette | `web/src/`, `web/e2e/` |
-| 7 — Julia + Multibrot | **Julia** (`JuliaMap { exponent, c }`) — pixel coord as z₀, fixed c; exponent=2.0 is classic Julia, exponent≠2 is Multibrot-Julia. **Multibrot** (`MultibroMap { exponent }`) — pixel coord as c, z₀=0; non-integer exponents via principal branch `exp(n·ln(z))`; escape radius `max(2, 2^(1/(n-1)))`; no perturbation (v2). Unified `TileJob` with `fractal_kind`, `exponent`, `julia_c_re/im`. `log_exponent()` method on `IterationMap` for correct smooth_t. `supports_distance_estimate()` returns false for Multibrot. Julia param UI: Re/Im inputs + 200×200 mini Mandelbrot canvas picker (lazy, cached). Multibrot UI: slider + number input [1.5, 8.0], soft integer snapping. URL: `f=julia`/`f=multibrot`, `exp=3.0`, `jre=-0.7`/`jim=0.27` defaults. No shader changes — both use `uFractalKind=0`. Hover preview (Mandelbrot pointer → Julia c) deferred to v2. | `kernel` (julia, multibrot maps), `wasm-bridge` (unified TileJob dispatch), `web/src/fractal-params-panel.ts`, `web/src/session.ts`, `web/src/viewport.ts` |
+| 0 — Scaffold | Workspace, CI, shared-memory WASM hello-world renders to canvas | ✅ |
+| 1 — Mandelbrot f64 | Basic escape-time Mandelbrot, smooth coloring, pan/zoom | ✅ |
+| 2 — Deep Zoom (v1) | F64x2 escape-time for zoom_exp > 14; automatic precision dispatch | ✅ |
+| 3 — Newton | Newton fractal: `NewtonResult` type, Durand-Kerner root-finding, Newton params shared memory slot, HSL shader branch, preset picker (`z³−1` default) with advanced coefficient overrides | ✅ |
+| 4 — Color Editor | Full palette editor, orbit trap, LUT, preset library | ✅ |
+| 5 — Export | PNG export pipeline (16-bit RGB, DPI, metadata); `WorkerLease` pause/resume; strip loop; PBO readback; streaming PNG encode via Tile Worker | ✅ |
+| 6 — Polish | UI polish; URL bookmark support; Newton LUT coloring; Playwright golden tests | ✅ |
+| 7 — Julia + Multibrot | Julia (`JuliaMap`) and Multibrot (`MultibroMap`) with non-integer exponents; mini Mandelbrot canvas picker for Julia c; unified `TileJob` dispatch | ✅ |
+
+### Future Work (v2)
+
+| Item | Description |
+|---|---|
+| Deep zoom (perturbation + BLA) | BigFloat<N> reference orbit; glitch correction; zoom_exp 17–300 for Mandelbrot; see §9 for the prepared architecture |
+| `fractal_registry!` macro | Replace manual `fractal_kind: u8` match with a compile-time registry macro; see §10.5 |
+| Mandelbrot hover → Julia preview | Live Julia preview driven by pointer position over the Mandelbrot set |
+| EXR export | 32-bit float export; `exportFBO` is already RGBA32F so no GL pipeline change required |
+| Mobile touch | Pinch-zoom and two-finger pan |
+| WebGPU backend | Compute shaders for tile rendering; architecture is abstraction-ready |
+| Palette–GL depth | Extract a dedicated `ColoringState` module to eliminate the 5-callback pass-through in `session.ts`; see architecture review notes |
+| Fractal kind dispatch depth | Once the registry macro exists, add Burning Ship, Phoenix, Lyapunov as one-line registrations |
+| Transcendental and rational maps | Families requiring non-polynomial iteration: `c·sin(z)`, `sin(z²) + c`, `eᶻ + c` and their filled Julia sets; rational maps such as `z² + z²/c`. These require significant `arith` work — transcendental functions (`sin`, `exp`, `ln`) must be implemented for `F64x2` and `BigFloat<N>`, and convergence / bailout criteria differ from polynomial escape-time. Perturbation theory for transcendentals (e.g. Burning Ship `sin` variants) is an open research area. |
 
 ---
 
