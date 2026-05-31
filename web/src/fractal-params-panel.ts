@@ -21,6 +21,9 @@ export class FractalParamsPanel {
   private readonly juliaCReInput: HTMLInputElement;
   private readonly juliaCImInput: HTMLInputElement;
   private readonly miniCanvas: HTMLCanvasElement;
+  private readonly miniWrapper: HTMLElement;
+  private readonly miniCollapseChevron: HTMLElement;
+  private readonly miniCLabel: HTMLElement;
   private miniPixels: ImageData | null = null;
   private miniRendered = false;
   private currentKind: FractalKind = "mandelbrot";
@@ -197,15 +200,33 @@ export class FractalParamsPanel {
     this.juliaCReInput.addEventListener("keydown", (e) => { if (e.key === "Enter") commitC(); });
     this.juliaCImInput.addEventListener("keydown", (e) => { if (e.key === "Enter") commitC(); });
 
+    // Collapse header: chevron + "c = …" label
+    const miniHeader = document.createElement("div");
+    miniHeader.style.cssText =
+      "display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer;user-select:none;";
+    this.miniCollapseChevron = document.createElement("span");
+    this.miniCollapseChevron.textContent = "▼";
+    this.miniCLabel = document.createElement("span");
+    this.miniCLabel.style.cssText = "color:#aaa;font-size:0.85em;";
+    miniHeader.appendChild(this.miniCollapseChevron);
+    miniHeader.appendChild(this.miniCLabel);
+    miniHeader.addEventListener("click", () => {
+      const collapsed = this.miniWrapper.style.display !== "none";
+      this.setMiniCollapsed(collapsed);
+      sessionStorage.setItem("julia-preview-collapsed", String(collapsed));
+    });
+    this.juliaCSection.appendChild(miniHeader);
+
     // Mini Mandelbrot picker — 210×150 matches the 3.5:2.5 (7:5) view aspect ratio
-    const miniWrapper = document.createElement("div");
-    miniWrapper.style.cssText = "margin-top:8px;";
+    this.miniWrapper = document.createElement("div");
+    this.miniWrapper.style.cssText = "margin-top:4px;";
     this.miniCanvas = document.createElement("canvas");
     this.miniCanvas.width = 210;
     this.miniCanvas.height = 150;
     this.miniCanvas.style.cssText = "display:block;cursor:crosshair;border:1px solid rgba(255,255,255,0.15);";
-    miniWrapper.appendChild(this.miniCanvas);
-    this.juliaCSection.appendChild(miniWrapper);
+    this.miniWrapper.appendChild(this.miniCanvas);
+    this.juliaCSection.appendChild(this.miniWrapper);
+    this.updateMiniCLabel();
 
     let miniDragTimer: ReturnType<typeof setTimeout> | null = null;
     const pickC = (e: PointerEvent) => {
@@ -217,6 +238,7 @@ export class FractalParamsPanel {
       const im = -1.25 + py * step;
       this.juliaCReInput.value = re.toFixed(4);
       this.juliaCImInput.value = im.toFixed(4);
+      this.updateMiniCLabel();
       this.drawMiniCanvas();
       if (miniDragTimer !== null) clearTimeout(miniDragTimer);
       miniDragTimer = setTimeout(() => { miniDragTimer = null; this.onJuliaCChange(re, im); }, 50);
@@ -247,9 +269,14 @@ export class FractalParamsPanel {
 
     this.currentKind = kind;
 
-    if (isJulia && !this.miniRendered) {
-      this.miniRendered = true;
-      this.requestMini(true);
+    if (isJulia) {
+      if (!this.miniRendered) {
+        this.miniRendered = true;
+        this.requestMini(true);
+      }
+      const stored = sessionStorage.getItem("julia-preview-collapsed");
+      const collapsed = stored !== null ? stored === "true" : window.innerWidth <= 500;
+      this.setMiniCollapsed(collapsed);
     }
 
     const titles: Record<string, string> = {
@@ -278,7 +305,22 @@ export class FractalParamsPanel {
   setJuliaC(re: number, im: number): void {
     this.juliaCReInput.value = String(re);
     this.juliaCImInput.value = String(im);
+    this.updateMiniCLabel();
     if (this.miniPixels) this.drawMiniCanvas();
+  }
+
+  private setMiniCollapsed(collapsed: boolean): void {
+    this.miniWrapper.style.display = collapsed ? "none" : "";
+    this.miniCollapseChevron.textContent = collapsed ? "▶" : "▼";
+  }
+
+  private updateMiniCLabel(): void {
+    const re = parseFloat(this.juliaCReInput.value);
+    const im = parseFloat(this.juliaCImInput.value);
+    if (!isNaN(re) && !isNaN(im)) {
+      const sign = im >= 0 ? "+" : "";
+      this.miniCLabel.textContent = `c = ${re.toPrecision(4)}${sign}${im.toPrecision(4)}i`;
+    }
   }
 
   private requestMini(immediate = false): void {
