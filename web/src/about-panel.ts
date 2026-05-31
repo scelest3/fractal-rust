@@ -103,7 +103,10 @@ export class AboutPanel {
     });
     icon.addEventListener("mouseover", () => icon.style.color = "rgba(255,255,255,0.85)");
     icon.addEventListener("mouseout",  () => icon.style.color = "rgba(255,255,255,0.45)");
-    icon.addEventListener("click", () => this.show());
+
+    // Whole title row is the tap/click target — icon click bubbles up naturally.
+    row.style.cursor = "pointer";
+    row.addEventListener("click", () => this.toggle());
 
     row.appendChild(title);
     row.appendChild(icon);

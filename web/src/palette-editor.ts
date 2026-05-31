@@ -95,6 +95,9 @@ export class PaletteEditor {
   private currentNewtonDegree = 3;
   // Preset strip ref for Rainbow swatch update
   private presetRow!: HTMLElement;
+  private cycleLenRow!: HTMLElement;
+  private currentFractalKind: "mandelbrot" | "newton" | "multibrot" | "julia" = "mandelbrot";
+  private isCompact = false;
   // Distance-shading controls (for setDistanceEnabled)
   private distanceToggleEl!: HTMLInputElement;
   private distanceRowEl!: HTMLElement;
@@ -144,6 +147,7 @@ export class PaletteEditor {
     const hidden = this.panel.style.display === "none";
     this.panel.style.display = hidden ? "block" : "none";
     this.toggleBtn.textContent = hidden ? "Palette ▴  [C]" : "Palette ▾  [C]";
+    if (hidden) this.applyCompact(window.innerWidth < 500);
   }
 
   // ── Internal ────────────────────────────────────────────────────────────────
@@ -201,7 +205,7 @@ export class PaletteEditor {
     const stopListEl = document.createElement("div");
 
     // ── Cycle-len row ─────────────────────────────────────────────────────────
-    const cycleLenRow = document.createElement("div");
+    const cycleLenRow = this.cycleLenRow = document.createElement("div");
     cycleLenRow.style.cssText = "margin-top:6px; display:flex; align-items:center; gap:6px;";
 
     const cycleLenSlider = document.createElement("input");
@@ -626,9 +630,24 @@ export class PaletteEditor {
   }
 
   setFractalKind(kind: "mandelbrot" | "newton" | "multibrot" | "julia"): void {
+    this.currentFractalKind = kind;
+    if (this.isCompact) return; // compact mode hides all sections; re-applied on panel open
     const isNewton = kind === "newton";
     for (const s of this.mandelbrotSections) s.style.display = isNewton ? "none" : "";
     for (const s of this.newtonSections)     s.style.display = isNewton ? "" : "none";
+  }
+
+  private applyCompact(compact: boolean): void {
+    this.isCompact = compact;
+    const hide = (el: HTMLElement) => { el.style.display = compact ? "none" : ""; };
+    hide(this.barCanvas);
+    hide(this.handleRow);
+    hide(this.stopListEl);
+    for (const s of [...this.mandelbrotSections, ...this.newtonSections]) hide(s);
+    if (!compact) {
+      // Restore kind-based section visibility
+      this.setFractalKind(this.currentFractalKind);
+    }
   }
 
   setDistanceEnabled(enabled: boolean): void {

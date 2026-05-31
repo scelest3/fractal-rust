@@ -124,6 +124,7 @@ export class ExportDialog {
   private readonly warningEl: HTMLSpanElement;
 
   private presetRadios: HTMLInputElement[] = [];
+  private customRadio!: HTMLInputElement;
   private activeSession: ExportSession | null = null;
   private maxRbs = 16384;
 
@@ -171,6 +172,7 @@ export class ExportDialog {
     }
 
     const { radio: customR, wrapper: customW } = this.makeRadioWidget("preset", "Custom", "custom");
+    this.customRadio = customR;
     customR.addEventListener("change", () => {
       if (customR.checked) { this.widthInput.focus(); }
     });
@@ -282,6 +284,19 @@ export class ExportDialog {
       this.presetRadios[i].disabled = exceeds;
       (this.presetRadios[i].parentElement as HTMLElement).style.opacity = exceeds ? "0.4" : "1";
     }
+
+    if (window.innerWidth < 500) {
+      // On mobile default to the physical screen pixels (viewport × devicePixelRatio).
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.min(this.maxRbs, Math.round(window.innerWidth  * dpr));
+      const h = Math.min(this.maxRbs, Math.round(window.innerHeight * dpr));
+      this.applyPreset(w, h);
+      this.customRadio.checked = true;
+    } else {
+      this.applyPreset(1920, 1080);
+      this.presetRadios[0].checked = true;
+    }
+
     this.setRendering(false);
     this.dialog.showModal();
   }
