@@ -20,6 +20,11 @@ export class FractalParamsPanel {
   private readonly juliaCSection: HTMLElement;
   private readonly juliaCReInput: HTMLInputElement;
   private readonly juliaCImInput: HTMLInputElement;
+  private readonly miniCanvas: HTMLCanvasElement;
+  private miniPixels: ImageData | null = null;
+  private miniRendered = false;
+  private currentKind: FractalKind = "mandelbrot";
+  private miniRenderDebounceId: ReturnType<typeof setTimeout> | null = null;
 
   // Newton-specific sections
   private readonly newtonPresetSection: HTMLElement;
@@ -29,6 +34,7 @@ export class FractalParamsPanel {
     private readonly onPolynomialChange: (coeffs: Float64Array, degree: number) => void,
     private readonly onExponentChange: (exponent: number) => void,
     private readonly onJuliaCChange: (re: number, im: number) => void,
+    private readonly onMiniRenderRequest: (exponent: number) => Promise<ImageData>,
   ) {
     this.el = document.createElement("div");
     this.el.className = "fractal-params-panel";
@@ -128,6 +134,7 @@ export class FractalParamsPanel {
       v = snapToInteger(v);
       this.exponentNumber.value = String(v);
       this.onExponentChange(v);
+      if (this.currentKind === "julia") this.requestMini();
     });
     this.exponentNumber.addEventListener("change", () => {
       let v = parseFloat(this.exponentNumber.value);
@@ -135,6 +142,7 @@ export class FractalParamsPanel {
       v = Math.max(1.0, Math.min(13.0, v));
       this.exponentSlider.value = String(v);
       this.onExponentChange(v);
+      if (this.currentKind === "julia") this.requestMini();
     });
 
     expRow.appendChild(expLabel);
@@ -189,6 +197,37 @@ export class FractalParamsPanel {
     this.juliaCReInput.addEventListener("keydown", (e) => { if (e.key === "Enter") commitC(); });
     this.juliaCImInput.addEventListener("keydown", (e) => { if (e.key === "Enter") commitC(); });
 
+    // Mini Mandelbrot picker — 210×150 matches the 3.5:2.5 (7:5) view aspect ratio
+    const miniWrapper = document.createElement("div");
+    miniWrapper.style.cssText = "margin-top:8px;";
+    this.miniCanvas = document.createElement("canvas");
+    this.miniCanvas.width = 210;
+    this.miniCanvas.height = 150;
+    this.miniCanvas.style.cssText = "display:block;cursor:crosshair;border:1px solid rgba(255,255,255,0.15);";
+    miniWrapper.appendChild(this.miniCanvas);
+    this.juliaCSection.appendChild(miniWrapper);
+
+    let miniDragTimer: ReturnType<typeof setTimeout> | null = null;
+    const pickC = (e: PointerEvent) => {
+      const rect = this.miniCanvas.getBoundingClientRect();
+      const px = Math.max(0, Math.min(209, Math.round(e.clientX - rect.left)));
+      const py = Math.max(0, Math.min(149, Math.round(e.clientY - rect.top)));
+      const step = 3.5 / 210;
+      const re = -2.5 + px * step;
+      const im = -1.25 + py * step;
+      this.juliaCReInput.value = re.toFixed(4);
+      this.juliaCImInput.value = im.toFixed(4);
+      this.drawMiniCanvas();
+      if (miniDragTimer !== null) clearTimeout(miniDragTimer);
+      miniDragTimer = setTimeout(() => { miniDragTimer = null; this.onJuliaCChange(re, im); }, 50);
+    };
+    this.miniCanvas.addEventListener("pointerdown", (e) => {
+      this.miniCanvas.setPointerCapture(e.pointerId);
+      pickC(e);
+    });
+    this.miniCanvas.addEventListener("pointermove", (e) => { if (e.buttons) pickC(e); });
+    this.miniCanvas.addEventListener("pointerup", pickC);
+
     this.el.appendChild(this.juliaCSection);
   }
 
@@ -205,6 +244,13 @@ export class FractalParamsPanel {
     this.newtonAdvancedSection.style.display = isNewton ? "" : "none";
     this.exponentSection.style.display = isExponent ? "" : "none";
     this.juliaCSection.style.display = isJulia ? "" : "none";
+
+    this.currentKind = kind;
+
+    if (isJulia && !this.miniRendered) {
+      this.miniRendered = true;
+      this.requestMini(true);
+    }
 
     const titles: Record<string, string> = {
       newton: "Newton", multibrot: "Multibrot", julia: "Julia",
@@ -232,6 +278,40 @@ export class FractalParamsPanel {
   setJuliaC(re: number, im: number): void {
     this.juliaCReInput.value = String(re);
     this.juliaCImInput.value = String(im);
+    if (this.miniPixels) this.drawMiniCanvas();
+  }
+
+  private requestMini(immediate = false): void {
+    if (this.miniRenderDebounceId !== null) clearTimeout(this.miniRenderDebounceId);
+    const dispatch = () => {
+      this.miniRenderDebounceId = null;
+      const exponent = parseFloat(this.exponentNumber.value) || 2.0;
+      this.onMiniRenderRequest(exponent).then(img => {
+        this.miniPixels = img;
+        this.drawMiniCanvas();
+      });
+    };
+    if (immediate) { dispatch(); } else { this.miniRenderDebounceId = setTimeout(dispatch, 150); }
+  }
+
+  private drawMiniCanvas(): void {
+    const ctx = this.miniCanvas.getContext("2d")!;
+    if (this.miniPixels) ctx.putImageData(this.miniPixels, 0, 0);
+    this.drawCrosshair(ctx);
+  }
+
+  private drawCrosshair(ctx: CanvasRenderingContext2D): void {
+    const re = parseFloat(this.juliaCReInput.value);
+    const im = parseFloat(this.juliaCImInput.value);
+    const step = 3.5 / 210;
+    const cx = Math.max(0, Math.min(209, Math.round((re + 2.5) / step)));
+    const cy = Math.max(0, Math.min(149, Math.round((im + 1.25) / step)));
+    ctx.strokeStyle = "rgba(255,255,255,0.85)";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx - 7, cy); ctx.lineTo(cx + 7, cy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx, cy - 7); ctx.lineTo(cx, cy + 7); ctx.stroke();
+    ctx.fillStyle = "#ffe040";
+    ctx.fillRect(cx - 1, cy - 1, 3, 3);
   }
 
   private rebuildCoeffInputs(degree: number, coeffs: Float64Array): void {

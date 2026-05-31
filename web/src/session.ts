@@ -145,6 +145,11 @@ export class FractalSession {
   private orbitReady = false;
   private pendingOrbitDispatch = false; // waiting for orbit_ready before dispatching
 
+  private resolveMiniRender: ((img: ImageData) => void) | null = null;
+  private miniRenderPending = false;
+  private miniRenderExponent = 2.0;
+  private miniRenderSeq = 0;
+
   private readonly exportDialog: ExportDialog;
 
   private coloringState: ColoringState = {
@@ -284,6 +289,7 @@ export class FractalSession {
         this.writeUrlHash();
         this.scheduleDispatch();
       },
+      (exponent) => this.renderMiniMandelbrot(exponent),
     );
     document.body.appendChild(this.fractalParamsPanel.getElement());
 
@@ -446,6 +452,62 @@ export class FractalSession {
     });
   }
 
+  renderMiniMandelbrot(exponent: number): Promise<ImageData> {
+    return new Promise(resolve => {
+      this.resolveMiniRender = resolve;
+      this.miniRenderExponent = exponent;
+      if (this.workerInitCount < N_WORKERS) {
+        // Workers still loading WASM — dispatch once they're ready.
+        this.miniRenderPending = true;
+        return;
+      }
+      this.dispatchMiniRender(exponent);
+    });
+  }
+
+  private dispatchMiniRender(exponent: number): void {
+    const workerIdx = this.workers.length - 1;
+    const slotIndex = workerIdx;
+    const seq = ++this.miniRenderSeq;
+    this.busyWorkers.add(workerIdx);
+    this.workers[workerIdx].postMessage({
+      type: "render_tile",
+      fractalKind: "multibrot",
+      exponent,
+      deltaRe: -2.5,
+      deltaIm: -1.25,
+      step: 3.5 / 210,
+      maxIter: 64,
+      useF64x2: false,
+      cxRef: 0, cyRef: 0,
+      slotIndex,
+      tileX: seq, tileY: -1,
+      generation: -1,
+    });
+  }
+
+  private readMiniPixels(slotIndex: number): ImageData {
+    const MINI_W = 210, MINI_H = 150;
+    const f32 = new Float32Array(this.tileSab, slotIndex * TILE_SLOT_BYTES, 256 * 256 * 4);
+    const out = new ImageData(MINI_W, MINI_H);
+    for (let py = 0; py < MINI_H; py++) {
+      for (let px = 0; px < MINI_W; px++) {
+        const src = (py * 256 + px) * 4;
+        const smoothT = f32[src];
+        const escaped = f32[src + 3];
+        const dst = (py * MINI_W + px) * 4;
+        if (escaped < 0.5) {
+          out.data[dst] = 15; out.data[dst + 1] = 15; out.data[dst + 2] = 25; out.data[dst + 3] = 255;
+        } else {
+          const t = (smoothT % 64) / 64;
+          const [r, g, b] = hslToRgb((t + 0.6) % 1, 0.8, 0.5);
+          out.data[dst] = r; out.data[dst + 1] = g; out.data[dst + 2] = b; out.data[dst + 3] = 255;
+        }
+      }
+    }
+    return out;
+  }
+
   private switchFractalKind(kind: "mandelbrot" | "newton" | "multibrot" | "julia"): void {
     if (kind === this.fractalKind) return;
     this.fractalKind = kind;
@@ -456,10 +518,10 @@ export class FractalSession {
     const view = this.fsm.getView();
     this.fsm.setView({ ...view, zoom_exp: 0 });
 
-    this.fractalParamsPanel.setKind(kind);
     this.fractalParamsPanel.setExponent(
       kind === "julia" ? this.juliaExponent : this.multibrotExponent,
     );
+    this.fractalParamsPanel.setKind(kind);
     this.fractalParamsPanel.setJuliaC(this.juliaC.re, this.juliaC.im);
     this.paletteEditor.setFractalKind(kind);
     this.paletteEditor.setDistanceEnabled(kind !== "julia" && kind !== "multibrot");
@@ -593,8 +655,21 @@ export class FractalSession {
       if (this.workerInitCount === N_WORKERS) {
         this.lutReady = true;
         this.scheduleDispatch();
+        if (this.miniRenderPending) {
+          this.miniRenderPending = false;
+          this.dispatchMiniRender(this.miniRenderExponent);
+        }
       }
     } else if (msg.type === "tile_ready") {
+      if (msg.generation === -1) {
+        if (msg.tileX !== this.miniRenderSeq) return; // stale — newer render still queued
+        const img = this.readMiniPixels(msg.slotIndex);
+        this.busyWorkers.delete(workerIndex);
+        this.resolveMiniRender?.(img);
+        this.resolveMiniRender = null;
+        this.dispatchPending();
+        return;
+      }
       this.onTileReady(workerIndex, msg);
     }
   }
@@ -826,4 +901,10 @@ export class FractalSession {
 
     this.dispatchPending();
   }
+}
+
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  const a = s * Math.min(l, 1 - l);
+  const f = (n: number) => { const k = (n + h * 12) % 12; return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); };
+  return [Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255)];
 }
