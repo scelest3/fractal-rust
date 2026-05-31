@@ -139,7 +139,7 @@ export class ExportDialog {
       border: "1px solid #444",
       borderRadius: "8px",
       padding: "20px 24px",
-      minWidth: "340px",
+      width: "min(340px, calc(100vw - 16px))",
       fontFamily: "monospace",
       fontSize: "13px",
     });

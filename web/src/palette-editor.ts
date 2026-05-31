@@ -179,7 +179,7 @@ export class PaletteEditor {
     const panel = document.createElement("div");
     Object.assign(panel.style, PANEL_STYLE, {
       position: "fixed", left: "8px", top: "200px", // overridden by ResizeObserver in session.ts
-      width: "316px", display: "none",
+      width: "min(316px, calc(100vw - 16px))", display: "none",
     });
 
     // ── Title ─────────────────────────────────────────────────────────────────
