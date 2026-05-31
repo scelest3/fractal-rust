@@ -160,6 +160,14 @@ export const SHANNON: Palette = {
   cycleLen: 64,
 };
 
+export const RUST: Palette = {
+  stops: [S(0.00, 0.082, 0.031, 0.024),  // deep iron shadow (#150806)
+          S(0.25, 0.478, 0.102, 0.031),  // dark rust (#7a1a08)
+          S(0.50, 0.808, 0.259, 0.169),  // bright rust (#CE422B)
+          S(0.75, 0.910, 0.753, 0.439)], // aged-metal highlight (#E8C070) → wraps to shadow
+  cycleLen: 64,
+};
+
 // ── Newton palette generator ──────────────────────────────────────────────────
 
 /**
@@ -193,5 +201,6 @@ export const ALL_PRESETS: { name: string; palette: Palette; isNewton?: boolean }
   { name: "Electric",  palette: ELECTRIC },
   { name: "Grayscale", palette: GRAYSCALE },
   { name: "Shannon",   palette: SHANNON },
+  { name: "Rust",      palette: RUST },
   { name: "Rainbow",   palette: makeNewtonPalette(6), isNewton: true },
 ];
